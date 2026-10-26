@@ -10,7 +10,7 @@ swiftc -parse-as-library -O -swift-version 5 \
   -Xlinker -rpath -Xlinker "$framework_path" \
   Sources/OrbitDisk/AppUpdater.swift Sources/OrbitDisk/DiskModel.swift \
   Sources/OrbitDisk/PointingCursor.swift \
-  Sources/OrbitDisk/DiskChangeMonitor.swift Sources/OrbitDisk/CollectionCoverage.swift \
+  Sources/OrbitDisk/DiskChangeMonitor.swift Sources/OrbitDisk/CollectionCoverage.swift Sources/OrbitDisk/PreparedMapHoverGroup.swift \
   Sources/OrbitDisk/IndexRefreshPlanner.swift Tests/OrbitUpdaterChecks.swift \
   "$build_path/OrbitCore.build/"*.swift.o -o "$build_path/OrbitUpdaterChecks"
 temp_root=${TMPDIR:-/tmp}

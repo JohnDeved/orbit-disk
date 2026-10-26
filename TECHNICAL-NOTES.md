@@ -98,3 +98,20 @@ The location and actions use separate native toolbar items in a unified title ba
 Each Contents list shares one hover tracker attached to its native scroll view. Wheel input, clip-origin changes and live scrolling clear hover once, then suppress row callbacks through the gesture and momentum. A common-run-loop timer waits 180 ms after the last movement before resolving the visible row under the actual pointer. Restoration requires a visible key window without an attached sheet. Selection is independent and stays visible. Row references and model callbacks are weak; view teardown removes observers, the local wheel monitor and the timer. Scroll events do not publish a per-frame model state.
 
 The native hover checks exercise wheel, gesture, momentum, scrollbar, pointer restoration, scope and teardown behavior. The layout harness uses a titled AppKit window with a real SwiftUI toolbar, checking traffic-light alignment and visible controls as well as content frames. These checks do not measure physical-device frame rate.
+
+
+## Large Contents lists (0.9.4)
+
+Contents rows now use a dedicated SwiftUI view so only mounted row bodies perform formatting and build native interaction adapters. The enclosing `ForEach` supplies each row's identity; a redundant explicit `.id` was forcing expensive list-wide work during hover and selection. Selection still uses the same String tag, and graph hover still scrolls to that identity.
+
+`DiskModel.displayedItems` stores each path identifier once for the current folder or search result. This avoids repeatedly decoding `URL.path` while SwiftUI gathers list identities. It shares the existing displayed-node cache's invalidation for navigation, sorting, search and refreshed metadata, including replacements whose paths remain the same. The scanner's full tree does not retain an extra identifier for every file.
+
+The native layout suite includes a 10,000-item folder and counts actual row-body evaluations through twelve hover, selection, ordering and distant-scroll phases. It checks the full native row count, visible target rows and their rendered selection/hover state, so an unrendered list cannot pass by doing no work. Timing measurements and platform limits are recorded in VERIFICATION.md.
+
+
+Dense graph hover uses prepared group metadata as well as cached drawing geometry. Each grouped segment records its actual parent and builds an exact member-ID set while preparing the current map. Hover reuses that set for a root-level group, or resolves one direct ancestor row for a deeper group. Indexed search checks its bounded results for exact members or ancestors of the group parent. Root/revision checks reject stale graph metadata; navigation, refresh and direct hover changes invalidate it. Single-member groups retain their file-path description. Collection payloads and validation continue to use the original nodes.
+
+In three alternating optimized trials with 100,000 grouped files, cold root-group relationships improved from a median 359.9 ms to 0.012 ms; a deeper group improved from 306.7 ms to 0.020 ms. Preparing the chart once increased from 106.5 to 136.3 ms, including the member-ID sets. They reuse the prepared path strings and exist only for the current map. These are helper timings with synthetic metadata, excluding drawing and list scrolling. Native instrumentation at 72 and 768 segments confirmed that hovering does not redraw the base Canvas or rebuild hit regions; only the active outlines change.
+
+
+Linked graph hover uses the existing native table to reveal rows in Contents lists of 1,000 or more items. It validates attachment and row count, finds the earliest related item in the cached displayed order, and avoids scrolling an already visible row. Small lists keep SwiftUI's original scroll path, which measured faster for dense graphs with only 48 direct Contents rows. Missing or stale native tables also retain that fallback. No second index cache or deferred scroll work was added. The tests cover exact visible row identity after same-count sort and search replacements, grouped-hover order, preserved selection, the 999/1,000 boundary, and detached tables.

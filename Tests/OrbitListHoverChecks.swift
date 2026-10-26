@@ -8,8 +8,17 @@ enum OrbitListHoverChecks {
     }
 
     final class Rows: NSObject, NSTableViewDataSource {
-        func numberOfRows(in tableView: NSTableView) -> Int { 40 }
+        var count = 40
+        func numberOfRows(in tableView: NSTableView) -> Int { count }
         func tableView(_ tableView: NSTableView, objectValueFor tableColumn: NSTableColumn?, row: Int) -> Any? { "Item \(row)" }
+    }
+
+    final class RevealTable: NSTableView {
+        var revealCalls = 0
+        override func scrollRowToVisible(_ row: Int) {
+            revealCalls += 1
+            super.scrollRowToVisible(row)
+        }
     }
 
     final class WheelEvent: NSEvent {
@@ -28,7 +37,7 @@ enum OrbitListHoverChecks {
         let window = HoverWindow(contentRect: NSRect(x: 80, y: 80, width: 360, height: 260),
                               styleMask: .borderless, backing: .buffered, defer: false)
         let scroll = NSScrollView(frame: window.contentView!.bounds)
-        let table = NSTableView(frame: NSRect(x: 0, y: 0, width: 340, height: 2_080))
+        let table = RevealTable(frame: NSRect(x: 0, y: 0, width: 340, height: 2_080))
         let dataSource = Rows()
         table.dataSource = dataSource
         table.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("files")))
@@ -172,6 +181,34 @@ enum OrbitListHoverChecks {
         }
         precondition(released == nil)
         print("PASS pending timers and event monitors do not retain a discarded list hover tracker")
+
+        tracking.register(first, id: "first", table: table)
+        var indexLookups = 0
+        precondition(!tracking.revealRow(expectedCount: 40) { indexLookups += 1; return 0 })
+        precondition(!tracking.revealRow(expectedCount: 1_000) { indexLookups += 1; return 0 })
+        precondition(indexLookups == 0 && table.revealCalls == 0)
+        dataSource.count = 999
+        table.reloadData()
+        precondition(!tracking.revealRow(expectedCount: 999) { indexLookups += 1; return 0 })
+        precondition(indexLookups == 0)
+        dataSource.count = 1_000
+        table.reloadData()
+        scroll.contentView.setBoundsOrigin(.zero)
+        precondition(!tracking.revealRow(expectedCount: 1_000) { nil })
+        precondition(!tracking.revealRow(expectedCount: 1_000) { -1 })
+        precondition(!tracking.revealRow(expectedCount: 1_000) { 1_000 })
+        precondition(tracking.revealRow(expectedCount: 1_000) { 0 })
+        precondition(table.revealCalls == 0)
+        precondition(tracking.revealRow(expectedCount: 1_000) { 999 })
+        precondition(table.revealCalls == 1 && NSLocationInRange(999, table.rows(in: table.visibleRect)))
+        precondition(tracking.revealRow(expectedCount: 1_000) { 999 })
+        precondition(table.revealCalls == 1)
+        tracking.detach()
+        precondition(!tracking.revealRow(expectedCount: 1_000) { indexLookups += 1; return 0 })
+        precondition(indexLookups == 0)
+        dataSource.count = 40
+        table.reloadData()
+        print("PASS large-list reveal skips visible rows and falls back for short, stale, missing, or detached rows")
 
         func runLoop(for duration: TimeInterval) {
             let end = Date(timeIntervalSinceNow: duration)

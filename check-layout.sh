@@ -8,13 +8,14 @@ mkdir -p "$checks_path"
 python3 Tests/OrbitLayoutChecks/make-probes.py "$checks_path/ContentView.swift"
 app_sources=(Sources/OrbitDisk/*.swift)
 app_sources=(${app_sources:#*/ContentView.swift})
+app_sources=(${app_sources:#*/FileRowView.swift})
 app_sources=(${app_sources:#*/OrbitDiskApp.swift})
 app_sources=(${app_sources:#*/AppUpdater.swift})
 swiftc -parse-as-library -O -swift-version 5 \
   -target "$(uname -m)-apple-macosx14.0" \
   -module-cache-path "$PWD/.build/module-cache" \
   -I "$build_path/Modules" -I Sources/CSQLite \
-  "${app_sources[@]}" "$checks_path/ContentView.swift" \
+  "${app_sources[@]}" "$checks_path/ContentView.swift" "$checks_path/FileRowView.swift" \
   Tests/OrbitLayoutChecks/LayoutChecks.swift \
   "$build_path/OrbitCore.build/"*.swift.o -o "$checks_path/OrbitLayoutChecks"
 # Collection policy rejects hidden ancestors such as .build.

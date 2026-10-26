@@ -49,6 +49,10 @@ print("PASS collection markings distinguish partial groups, full groups, and col
 let presentationCache = SunburstPresentationCache()
 let mapRevision = UUID()
 let prepared = presentationCache.presentation(root: root, mapRevision: mapRevision, coverage: CollectionCoverage())
+let preparedGroup = prepared.layout.hoverGroup(for: group.id)!
+precondition(preparedGroup.id == group.id && preparedGroup.parentID == root.id && preparedGroup.rootID == root.id)
+precondition(preparedGroup.mapRevision == mapRevision && preparedGroup.memberIDs == Set(group.members.map(\.id)))
+precondition(prepared.layout.hoverGroup(for: large.id) == nil && prepared.layout.hoverGroup(for: nil) == nil)
 precondition(prepared.layout.segment(for: children.last!.id)?.id == group.id)
 precondition(prepared.layout.segment(for: large.id)?.id == large.id)
 precondition(prepared.layout.segment(for: nil) == nil && prepared.layout.segment(for: "/absent") == nil)
@@ -75,6 +79,9 @@ let refreshed = presentationCache.presentation(root: replacedRoot, mapRevision: 
 precondition(refreshed.layout !== prepared.layout)
 precondition(refreshed.layout.segment(for: children.last!.id) == nil)
 precondition(refreshed.layout.segment(for: replacedChildren.last!.id)?.id == group.id)
+let refreshedGroup = refreshed.layout.hoverGroup(for: group.id)!
+precondition(refreshedGroup.mapRevision == replacementRevision && !refreshedGroup.memberIDs.contains(children.last!.id)
+             && refreshedGroup.memberIDs.contains(replacedChildren.last!.id))
 let otherRoot = DiskNode(url: URL(fileURLWithPath: "/other"), name: "other", isDirectory: true,
                          size: root.size, allocatedSize: root.allocatedSize, fileCount: root.fileCount, children: children)
 let other = presentationCache.presentation(root: otherRoot, mapRevision: replacementRevision, coverage: CollectionCoverage())

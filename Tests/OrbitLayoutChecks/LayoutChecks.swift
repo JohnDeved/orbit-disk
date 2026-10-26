@@ -33,6 +33,19 @@ final class LayoutWindow: NSWindow {
     var frames: [String: CGRect] = [:]
     var history: [[String: CGRect]] = []
 }
+@MainActor enum RowEvaluationProbe {
+    struct State { let selected: Bool; let hovered: Bool }
+    static var pathPrefix: String?
+    static var evaluations = 0
+    static var states: [String: State] = [:]
+
+    static func reset() { evaluations = 0; states.removeAll(keepingCapacity: true) }
+    static func record(id: String, selected: Bool, hovered: Bool) {
+        guard let pathPrefix, id.hasPrefix(pathPrefix) else { return }
+        evaluations += 1
+        states[id] = State(selected: selected, hovered: hovered)
+    }
+}
 final class LayoutGate: @unchecked Sendable {
     let lock = NSLock()
     let semaphore = DispatchSemaphore(value: 0)
@@ -293,9 +306,134 @@ final class LayoutGate: @unchecked Sendable {
         model.errorMessage = nil; model.isRemoving = true
         compare("collection/busy", modal, try await capture("collection/busy"), names: modalNames)
         model.isRemoving = false; model.showCollection = false
+
+        let largeURL = base.appendingPathComponent("large-list", isDirectory: true)
+        let largeCount = 10_000
+        let largeNodes = (0..<largeCount).map { index in
+            DiskNode(url: largeURL.appendingPathComponent(String(format: "item-%05d.bin", index)),
+                     name: String(format: "item-%05d.bin", index), isDirectory: false,
+                     size: Int64(largeCount - index), allocatedSize: Int64(largeCount - index), fileCount: 1)
+        }
+        let largeRoot = DiskNode(url: largeURL, name: "Large folder", isDirectory: true,
+                                 size: largeNodes.reduce(0) { $0 + $1.size },
+                                 allocatedSize: largeNodes.reduce(0) { $0 + $1.allocatedSize },
+                                 fileCount: largeCount, children: largeNodes)
+        let largeModel = DiskModel(cacheDirectory: base.appendingPathComponent("large-cache"), preferences: prefs)
+        largeModel.root = largeRoot
+        largeModel.navigation = [largeRoot]
+        RowEvaluationProbe.pathPrefix = largeURL.path + "/"
+        RowEvaluationProbe.reset()
+        install(AnyView(ContentView(model: largeModel)), size: CGSize(width: 1280, height: 810))
+        try await settle()
+        func contentsTable(in view: NSView) -> NSTableView? {
+            if let table = view as? NSTableView, table.numberOfRows == largeCount { return table }
+            for child in view.subviews {
+                if let table = contentsTable(in: child) { return table }
+            }
+            return nil
+        }
+        guard let table = contentsTable(in: host.view), let clip = table.enclosingScrollView?.contentView else {
+            fatalError("The lazy-row fixture must expose all \(largeCount) rows in the native Contents table")
+        }
+        func renderedItemID(in view: NSView) -> String? {
+            if let appearance = view as? SelectionAppearanceView { return appearance.itemID }
+            for child in view.subviews {
+                if let id = renderedItemID(in: child) { return id }
+            }
+            return nil
+        }
+        var lazyReports: [String: [String: Int]] = [:]
+        func checkLazyPhase(_ label: String, row: Int, expectedID: String? = nil,
+                            selected: Bool? = nil, hovered: Bool? = nil) async throws {
+            try await settle()
+            let visible = table.rows(in: table.convert(clip.bounds, from: clip).intersection(table.bounds))
+            let count = RowEvaluationProbe.evaluations
+            let unique = RowEvaluationProbe.states.count
+            // The native viewport currently needs 11 bodies; allow additional AppKit prefetch and update passes.
+            if count > 100 || unique > 100 {
+                failures.append("Lazy rows \(label) rebuilt \(count) bodies / \(unique) distinct rows in a \(largeCount)-row folder")
+            }
+            if table.numberOfRows != largeCount || visible.location == NSNotFound || !NSLocationInRange(row, visible) {
+                failures.append("Lazy rows \(label) did not reveal row \(row): \(visible), table count \(table.numberOfRows)")
+            }
+            let id = expectedID ?? largeNodes[row].id
+            if table.rowView(atRow: row, makeIfNecessary: false).flatMap({ renderedItemID(in: $0) }) != id {
+                failures.append("Lazy rows \(label) displayed a stale item at native row \(row)")
+            }
+            if let selected, RowEvaluationProbe.states[id]?.selected != selected {
+                failures.append("Lazy rows \(label) did not render selection=\(selected) for row \(row)")
+            }
+            if let hovered, RowEvaluationProbe.states[id]?.hovered != hovered {
+                failures.append("Lazy rows \(label) did not render hover=\(hovered) for row \(row)")
+            }
+            lazyReports[label] = ["evaluations": count, "distinctRows": unique,
+                                  "visibleStart": visible.location, "visibleCount": visible.length,
+                                  "totalRows": table.numberOfRows]
+            print("LAZY \(label): \(count) bodies / \(unique) distinct rows; visible \(visible) of \(largeCount)")
+        }
+        try await checkLazyPhase("initial", row: 0, selected: false, hovered: false)
+        RowEvaluationProbe.reset()
+        largeModel.hoveredListID = largeNodes[0].id
+        try await checkLazyPhase("list-hover", row: 0, hovered: true)
+        RowEvaluationProbe.reset()
+        largeModel.hoveredListID = nil
+        try await checkLazyPhase("list-hover-exit", row: 0, hovered: false)
+        RowEvaluationProbe.reset()
+        largeModel.selectedID = largeNodes[0].id
+        try await checkLazyPhase("selection", row: 0, selected: true)
+        RowEvaluationProbe.reset()
+        largeModel.selectedID = nil
+        try await checkLazyPhase("selection-clear", row: 0, selected: false)
+        RowEvaluationProbe.reset()
+        largeModel.setMapHover(nodes: [largeNodes[largeCount - 1]], groupID: nil)
+        try await checkLazyPhase("graph-hover-last", row: largeCount - 1, hovered: true)
+        RowEvaluationProbe.reset()
+        largeModel.setMapHover(nodes: [largeNodes[0]], groupID: nil)
+        try await checkLazyPhase("graph-hover-first", row: 0, hovered: true)
+        RowEvaluationProbe.reset()
+        table.scrollRowToVisible(largeCount - 1)
+        try await checkLazyPhase("scroll-last", row: largeCount - 1)
+        RowEvaluationProbe.reset()
+        table.scrollRowToVisible(0)
+        try await checkLazyPhase("scroll-first", row: 0)
+        RowEvaluationProbe.reset()
+        largeModel.setMapHover(nodes: [largeNodes[largeCount - 1], largeNodes[0], largeNodes[largeCount / 2]], groupID: "group:layout")
+        try await checkLazyPhase("graph-group-first", row: 0, hovered: true)
+
+        largeModel.setMapHover(nodes: nil, groupID: nil)
+        largeModel.navigation = [DiskNode(url: largeURL, name: largeRoot.name, isDirectory: true,
+                                         size: largeRoot.size, allocatedSize: largeRoot.allocatedSize,
+                                         fileCount: largeCount, children: largeNodes.reversed())]
+        largeModel.selectedID = largeNodes[0].id
+        try await settle()
+        RowEvaluationProbe.reset()
+        largeModel.sortByName = true
+        largeModel.setMapHover(nodes: [largeNodes[largeCount - 1]], groupID: nil)
+        try await checkLazyPhase("same-count-sort-hover", row: largeCount - 1, hovered: true)
+        if largeModel.selectedID != largeNodes[0].id { failures.append("Hover after sorting changed selection") }
+
+        largeModel.query = "item"
+        largeModel.searchResults = largeNodes
+        largeModel.searchMatchCount = largeCount
+        try await settle()
+        let replacementNodes = (0..<largeCount).map { index in
+            DiskNode(url: largeURL.appendingPathComponent(String(format: "replacement-%05d.bin", index)),
+                     name: String(format: "replacement-%05d.bin", index), isDirectory: false,
+                     size: Int64(largeCount - index), allocatedSize: Int64(largeCount - index), fileCount: 1)
+        }
+        RowEvaluationProbe.reset()
+        largeModel.searchResults = replacementNodes
+        largeModel.searchMatchCount = largeCount
+        largeModel.setMapHover(nodes: [replacementNodes[largeCount - 1]], groupID: nil)
+        try await checkLazyPhase("same-count-search-hover", row: largeCount - 1,
+                                 expectedID: replacementNodes[largeCount - 1].id, hovered: true)
+        RowEvaluationProbe.pathPrefix = nil
+        largeModel.cancelScan()
+        let lazyReport = try JSONSerialization.data(withJSONObject: lazyReports, options: [.prettyPrinted, .sortedKeys])
+        try lazyReport.write(to: reportDirectory.appendingPathComponent("lazy-rows.json"))
         let report = try JSONSerialization.data(withJSONObject: reports, options: [.prettyPrinted, .sortedKeys])
         try report.write(to: reportDirectory.appendingPathComponent("frames.json"))
-        let summary = "\(reports.count) rendered states; maximum structural delta \(maximumDelta)pt; row heights \(String(describing: rowHeightRange)); \(failures.count) failures\n" + failures.joined(separator: "\n")
+        let summary = "\(reports.count) rendered states; \(lazyReports.count) lazy-row phases at \(largeCount) rows; maximum structural delta \(maximumDelta)pt; row heights \(String(describing: rowHeightRange)); \(failures.count) failures\n" + failures.joined(separator: "\n")
         try summary.write(to: reportDirectory.appendingPathComponent("summary.txt"), atomically: true, encoding: .utf8)
         print(summary)
         if !failures.isEmpty { exit(1) }

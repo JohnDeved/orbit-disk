@@ -25,7 +25,7 @@ final class SunburstPresentationCache {
             if self.coverage == coverage { return prepared }
             layout = prepared.layout
         } else {
-            layout = SunburstPreparedLayout(root: root, colorIndices: colorIndices)
+            layout = SunburstPreparedLayout(root: root, mapRevision: mapRevision, colorIndices: colorIndices)
         }
         let states = coverage.isEmpty
             ? Array(repeating: CollectionState.none, count: layout.segments.count)
@@ -45,19 +45,28 @@ final class SunburstPreparedLayout {
     let segments: [SunburstSegment]
     let memberIDs: [[String]]
     private let segmentIndices: [String: Int]
+    private let hoverGroups: [String: PreparedMapHoverGroup]
 
-    init(root: DiskNode, colorIndices: [String: Int] = [:]) {
+    init(root: DiskNode, mapRevision: UUID, colorIndices: [String: Int] = [:]) {
         let segments = SunburstLayout.make(root: root, colorIndices: colorIndices)
+        let rootID = root.id
         let memberIDs = segments.map { $0.members.map(\.id) }
         var indices: [String: Int] = [:]
+        var hoverGroups: [String: PreparedMapHoverGroup] = [:]
         indices.reserveCapacity(memberIDs.reduce(segments.count) { $0 + $1.count })
         for (index, segment) in segments.enumerated() {
             indices[segment.id] = index
             for memberID in memberIDs[index] { indices[memberID] = index }
+            if let parentID = segment.groupParentID {
+                hoverGroups[segment.id] = PreparedMapHoverGroup(id: segment.id, parentID: parentID,
+                                                               rootID: rootID, mapRevision: mapRevision,
+                                                               memberIDs: Set(memberIDs[index]))
+            }
         }
         self.segments = segments
         self.memberIDs = memberIDs
         self.segmentIndices = indices
+        self.hoverGroups = hoverGroups
     }
 
     func index(for id: String?) -> Int? {
@@ -67,6 +76,10 @@ final class SunburstPreparedLayout {
 
     func segment(for id: String?) -> SunburstSegment? {
         index(for: id).map { segments[$0] }
+    }
+
+    func hoverGroup(for id: String?) -> PreparedMapHoverGroup? {
+        id.flatMap { hoverGroups[$0] }
     }
 }
 
@@ -153,7 +166,7 @@ struct SunburstView: View {
     let onOpen: (DiskNode) -> Void
     let onBack: () -> Void
     let canGoBack: Bool
-    let onHover: ([DiskNode]?, String?) -> Void
+    let onHover: ([DiskNode]?, PreparedMapHoverGroup?) -> Void
     let makeDrag: ([DiskNode], String) -> NSPasteboardItem?
     let onDragEnded: () -> Void
     let onInteractionActive: (Bool) -> Void
@@ -169,7 +182,7 @@ struct SunburstView: View {
          selectedID: String?, hoveredID: String?, collectionCoverage: CollectionCoverage,
          colorIndices: [String: Int] = [:], onSelect: @escaping (DiskNode) -> Void,
          onOpen: @escaping (DiskNode) -> Void, onBack: @escaping () -> Void, canGoBack: Bool,
-         onHover: @escaping ([DiskNode]?, String?) -> Void,
+         onHover: @escaping ([DiskNode]?, PreparedMapHoverGroup?) -> Void,
          makeDrag: @escaping ([DiskNode], String) -> NSPasteboardItem?, onDragEnded: @escaping () -> Void,
          onInteractionActive: @escaping (Bool) -> Void = { _ in }) {
         self.root = root
@@ -219,7 +232,7 @@ struct SunburstView: View {
                                    segments: segments, metrics: metrics, canGoBack: canGoBack,
                                    onHover: { segment in
                                        chartHoveredID = segment?.id
-                                       onHover(segment?.members, segment?.node == nil ? segment?.id : nil)
+                                       onHover(segment?.members, presentation.layout.hoverGroup(for: segment?.id))
                                    }, onActivate: activate,
                                    makeDrag: { makeDrag($0.members, $0.name) }, onDragEnded: onDragEnded,
                                    onInteractionActive: onInteractionActive)
@@ -373,6 +386,7 @@ struct SunburstSegment {
     let depth: Int
     let branchIndex: Int
     var scanState: NodeScanState = .complete
+    var groupParentID: String? = nil
 
     func matches(_ target: String?) -> Bool {
         guard let target else { return false }
@@ -469,7 +483,8 @@ enum SunburstLayout {
                                               name: "\(groupedMembers.count.formatted()) grouped \(groupedMembers.count == 1 ? "item" : "items")", size: groupedSize,
                                               start: cursor, end: cursor + sweep * Double(groupedSize) / denominator,
                                               depth: branch.depth, branchIndex: branch.color ?? Int.min,
-                                              scanState: groupedComplete ? .complete : .scanning))
+                                              scanState: groupedComplete ? .complete : .scanning,
+                                              groupParentID: branch.node.id))
             }
         }
         return result

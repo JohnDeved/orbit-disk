@@ -73,9 +73,9 @@ private final class PreviewGate: @unchecked Sendable {
 
     @MainActor static func checkGroupedHoverCaching(base: URL, preferences: UserDefaults) {
         let rootURL = base.appendingPathComponent("hover-fixture")
-        func leaf(_ name: String, identity: String = "1:1") -> DiskNode {
+        func leaf(_ name: String, identity: String = "1:1", size: Int64 = 1) -> DiskNode {
             DiskNode(url: rootURL.appendingPathComponent(name), name: name, isDirectory: false,
-                     size: 1, allocatedSize: 1, fileCount: 1, fileIdentity: identity)
+                     size: size, allocatedSize: size, fileCount: 1, fileIdentity: identity)
         }
         let zeta = leaf("zeta.bin")
         let alpha = leaf("alpha.bin", identity: "1:2")
@@ -112,6 +112,13 @@ private final class PreviewGate: @unchecked Sendable {
         let model = DiskModel(cacheDirectory: base.appendingPathComponent("hover-cache"), preferences: preferences)
         model.root = root
         model.navigation = [root]
+        let displayedItems = model.displayedItems
+        precondition(displayedItems.map(\.id) == [zeta.id, alpha.id])
+        model.hoveredListID = alpha.id
+        model.selectedID = zeta.id
+        precondition(displayedItems.withUnsafeBufferPointer { previous in
+            model.displayedItems.withUnsafeBufferPointer { previous.baseAddress == $0.baseAddress }
+        }, "Hover and selection must reuse the current list's cached identities")
         model.setMapHover(nodes: members, groupID: groupID)
         precondition(model.mapRelatedRowIDs == [zeta.id, alpha.id])
         model.setMapHover(nodes: nil, groupID: nil)
@@ -122,23 +129,111 @@ private final class PreviewGate: @unchecked Sendable {
         precondition(model.mapRelatedRowIDs == [alpha.id], "Changed group membership must reach the model")
         model.setMapHover(nodes: members, groupID: groupID)
         model.navigation = [folder("Renamed fixture", children: [alpha])]
+        precondition(model.displayedItems.map(\.id) == [alpha.id], "Navigation must replace cached list items")
         precondition(model.mapRelatedRowIDs == [alpha.id] && model.mapHoverDescription == "2 items in Renamed fixture",
                      "Same-path navigation metadata and children must invalidate cached group relations")
         model.navigation = [root]
         model.query = "bin"
         model.searchResults = [zeta]
+        precondition(model.displayedItems.map(\.id) == [zeta.id])
         model.setMapHover(nodes: members, groupID: groupID)
         precondition(model.mapRelatedRowIDs == [zeta.id])
         model.searchResults = [alpha]
+        precondition(model.displayedItems.map(\.id) == [alpha.id], "Search results must replace cached list items")
         precondition(model.mapRelatedRowIDs == [alpha.id], "Equal-count search changes must invalidate group relations")
         model.query = ""
+        precondition(model.displayedItems.map(\.id) == [zeta.id, alpha.id], "Leaving search must restore folder items")
         model.setMapHover(nodes: members, groupID: groupID)
         precondition(model.mapRelatedRowIDs == [zeta.id, alpha.id], "Leaving search must restore folder relations")
         precondition(model.displayedNodes.first { model.mapRelatedRowIDs.contains($0.id) }?.id == zeta.id)
         model.sortByName = true
+        precondition(model.displayedItems.map(\.id) == [alpha.id, zeta.id], "Sorting must reorder cached list items")
         precondition(model.displayedNodes.first { model.mapRelatedRowIDs.contains($0.id) }?.id == alpha.id,
                      "Cached group relations must not pin the scroll target to the previous sort order")
+        model.sortByName = false
+        precondition(model.displayedItems.map(\.id) == [zeta.id, alpha.id])
+        model.navigation = [folder("Fixture", children: [leaf("zeta.bin", identity: "1:99", size: 99), alpha])]
+        precondition(model.displayedItems[0].id == zeta.id && model.displayedItems[0].node.size == 99
+                     && model.displayedItems[0].node.fileIdentity == "1:99",
+                     "A same-ID folder refresh must replace cached row metadata")
+        model.query = "bin"
+        model.searchResults = [alpha]
+        precondition(model.displayedItems[0].node.size == 1)
+        model.searchResults = [leaf("alpha.bin", identity: "1:88", size: 88)]
+        precondition(model.displayedItems[0].id == alpha.id && model.displayedItems[0].node.size == 88,
+                     "A same-ID search refresh must replace cached row metadata")
         print("PASS: grouped hover reuse, equal-count membership and metadata changes, hover exit, navigation, filtering, and sorting")
+        print("PASS: list identity reuse, navigation, search, sort changes, and same-ID metadata refreshes")
+    }
+
+    @MainActor static func checkPreparedGroupHover(base: URL, preferences: UserDefaults) {
+        for rootPath in [base.appendingPathComponent("prepared-hover").path, "/"] {
+            let prefix = rootPath == "/" ? "/" : rootPath + "/"
+            func node(_ path: String, children: [DiskNode] = [], size: Int64 = 1) -> DiskNode {
+                let url = URL(fileURLWithPath: path)
+                return DiskNode(url: url, name: url.lastPathComponent, isDirectory: !children.isEmpty,
+                                size: size, allocatedSize: size, fileCount: 1, children: children)
+            }
+            let descendant = node(prefix + "branch/deep/alpha/inside.bin")
+            let alpha = node(prefix + "branch/deep/alpha", children: [descendant])
+            let beta = node(prefix + "branch/deep/beta.bin")
+            let sibling = node(prefix + "unrelated.bin")
+            let deep = node(prefix + "branch/deep", children: [alpha, beta])
+            let branch = node(prefix + "branch", children: [deep])
+            let root = node(rootPath, children: [branch, sibling])
+            let model = DiskModel(cacheDirectory: base.appendingPathComponent("prepared-hover-cache"), preferences: preferences)
+            model.root = root
+            model.navigation = [root]
+            func prepared(_ members: [DiskNode], parent: DiskNode, revision: UUID? = nil) -> PreparedMapHoverGroup {
+                PreparedMapHoverGroup(id: "group:\(parent.id)", parentID: parent.id, rootID: root.id,
+                                      mapRevision: revision ?? model.mapRevision, memberIDs: Set(members.map(\.id)))
+            }
+            func compare(_ members: [DiskNode], parent: DiskNode) {
+                let group = prepared(members, parent: parent)
+                model.setMapHover(nodes: members, groupID: group.id)
+                let expectedIDs = model.mapRelatedRowIDs
+                let expectedDescription = model.mapHoverDescription
+                model.setMapHover(nodes: members, groupID: group.id, preparedGroup: group)
+                precondition(model.mapRelatedRowIDs == expectedIDs && model.mapHoverDescription == expectedDescription,
+                             "Prepared group relationships must match the member-walk behavior")
+            }
+            compare([branch, sibling], parent: root)
+            precondition(model.mapRelatedRowIDs == [branch.id, sibling.id])
+            compare([alpha, beta], parent: deep)
+            precondition(model.mapRelatedRowIDs == [branch.id])
+            compare([beta], parent: deep)
+            precondition(model.mapHoverDescription == "branch/deep/beta.bin")
+            model.query = "bin"
+            model.searchResults = [root, branch, deep, alpha, beta, descendant, sibling]
+            compare([alpha, beta], parent: deep)
+            precondition(model.mapRelatedRowIDs == [root.id, branch.id, deep.id, alpha.id, beta.id],
+                         "Search must match group members and their ancestors, excluding descendants and unrelated siblings")
+            model.searchResults = [beta, descendant, sibling]
+            precondition(model.mapRelatedRowIDs == [beta.id], "Prepared hover must use fresh search results")
+            let changedAlpha = node(alpha.id, children: [descendant], size: 99)
+            compare([changedAlpha, beta], parent: deep)
+            precondition(model.hoveredMapNodes[0].size == 99, "Same-ID metadata changes must not reuse old members")
+            let stale = prepared([sibling], parent: root, revision: UUID())
+            model.setMapHover(nodes: [sibling], groupID: stale.id, preparedGroup: stale)
+            precondition(model.mapRelatedRowIDs == [beta.id] && model.hoveredMapNodes[0].size == 99,
+                         "A stale graph revision must not replace the current hover")
+            let wrongRoot = PreparedMapHoverGroup(id: "wrong-root", parentID: root.id, rootID: prefix + "other",
+                                                 mapRevision: model.mapRevision, memberIDs: [sibling.id])
+            model.setMapHover(nodes: [sibling], groupID: wrongRoot.id, preparedGroup: wrongRoot)
+            precondition(model.mapRelatedRowIDs == [beta.id], "A different graph root must not replace the current hover")
+            if rootPath != "/" {
+                let outside = PreparedMapHoverGroup(id: "outside", parentID: rootPath + "-sibling", rootID: root.id,
+                                                   mapRevision: model.mapRevision, memberIDs: [sibling.id])
+                model.setMapHover(nodes: [sibling], groupID: outside.id, preparedGroup: outside)
+                precondition(model.mapRelatedRowIDs == [beta.id], "Parent validation must respect path boundaries")
+            }
+            model.hoveredMapGroupID = nil
+            model.hoveredMapNodes = [descendant]
+            precondition(model.mapRelatedRowIDs == [descendant.id], "Direct hover writes must discard prepared membership")
+            model.setMapHover(nodes: nil, groupID: nil)
+            precondition(model.mapRelatedRowIDs.isEmpty && model.mapHoverDescription == nil)
+        }
+        print("PASS: prepared group relationships, root and deep groups, one-member labels, search ancestry, metadata refresh, stale revisions, and slash root")
     }
 
     @MainActor static func checkProgressiveMapping(base: URL, preferences: UserDefaults) async throws {
@@ -611,6 +706,7 @@ private final class PreviewGate: @unchecked Sendable {
         let prefs = UserDefaults(suiteName: suite)!
         defer { prefs.removePersistentDomain(forName: suite) }
         checkGroupedHoverCaching(base: base, preferences: prefs)
+        checkPreparedGroupHover(base: base, preferences: prefs)
         let model = DiskModel(cacheDirectory: cache, preferences: prefs)
         model.scan(root)
         try await wait("first map") { model.root != nil && !model.isScanning }

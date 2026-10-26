@@ -4,6 +4,7 @@ final class ListHoverTracking {
     var onHoverChanged: ((String?) -> Void)?
     private(set) var isSuppressed = false
     private(set) weak var scrollView: NSScrollView?
+    private weak var tableView: NSTableView?
     private var hoveredID: String?
     private var gestureActive = false
     private var momentumActive = false
@@ -26,7 +27,20 @@ final class ListHoverTracking {
     func register(_ row: NSView, id: String, table: NSTableView) {
         guard let scroll = table.enclosingScrollView else { return }
         if scrollView !== scroll { attach(to: scroll) }
+        tableView = table
         rows.setObject(id as NSString, forKey: row)
+    }
+
+    func revealRow(expectedCount: Int, rowIndex: () -> Int?) -> Bool {
+        // Short lists scroll faster through SwiftUI; large lists avoid its ID resolution cost.
+        guard expectedCount >= 1_000, let table = tableView, let scroll = scrollView,
+              table.window != nil, table.numberOfRows == expectedCount,
+              let index = rowIndex(), index >= 0, index < table.numberOfRows else { return false }
+        let visible = table.convert(scroll.contentView.bounds, from: scroll.contentView).intersection(table.bounds)
+        let row = table.rect(ofRow: index)
+        if row.minY >= visible.minY && row.maxY <= visible.maxY { return true }
+        table.scrollRowToVisible(index)
+        return true
     }
 
     func unregister(_ row: NSView) { rows.removeObject(forKey: row) }
@@ -40,6 +54,7 @@ final class ListHoverTracking {
     func detach() {
         removeObservers()
         scrollView = nil
+        tableView = nil
         rows.removeAllObjects()
         cancelScrolling()
     }

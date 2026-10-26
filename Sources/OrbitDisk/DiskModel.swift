@@ -22,6 +22,11 @@ struct MapHoverPresentation {
     let description: String?
 }
 
+struct DiskListItem: Identifiable {
+    let id: String
+    let node: DiskNode
+}
+
 final class GroupedMapHoverCache {
     private struct Entry {
         let members: [DiskNode]
@@ -136,12 +141,13 @@ final class DiskModel: ObservableObject {
         }
     }
     @Published var navigation: [DiskNode] = [] {
-        didSet { invalidateDisplayedNodes() }
+        didSet { preparedMapHoverGroup = nil; invalidateDisplayedNodes() }
     }
     @Published private(set) var mapRevision = UUID() {
         didSet {
             mapHoverPresentationCache = nil
             groupedMapHoverCache.removeAll()
+            preparedMapHoverGroup = nil
         }
     }
     @Published var selectedID: String?
@@ -175,10 +181,12 @@ final class DiskModel: ObservableObject {
     @Published private(set) var draggingItemCount = 0
     @Published private(set) var isValidatingCollection = false
     @Published var hoveredMapNodes: [DiskNode] = [] {
-        didSet { mapHoverPresentationCache = nil }
+        didSet { mapHoverPresentationCache = nil; preparedMapHoverGroup = nil }
     }
     @Published var hoveredMapGroupID: String? {
-        didSet { if hoveredMapGroupID != oldValue { mapHoverPresentationCache = nil } }
+        didSet {
+            if hoveredMapGroupID != oldValue { mapHoverPresentationCache = nil; preparedMapHoverGroup = nil }
+        }
     }
     @Published var hoveredListID: String?
     @Published var showCollection = false
@@ -226,9 +234,13 @@ final class DiskModel: ObservableObject {
     private var collectionValidationCancellation: ScanCancellation?
     private var collectionValidationStatus: String?
     private var removalResultStatus: String?
-    private var displayedNodesCache: [DiskNode]?
+    private var displayedNodesCache: [DiskNode]? {
+        didSet { displayedItemsCache = nil }
+    }
+    private var displayedItemsCache: [DiskListItem]?
     private var displayedIDsCache: Set<String>?
     private var mapHoverPresentationCache: MapHoverPresentation?
+    private var preparedMapHoverGroup: PreparedMapHoverGroup?
     private let groupedMapHoverCache = GroupedMapHoverCache()
     private(set) var childColorIndices: [String: Int] = [:]
 
@@ -254,6 +266,12 @@ final class DiskModel: ObservableObject {
         displayedNodesCache = displayed
         return displayed
     }
+    var displayedItems: [DiskListItem] {
+        if let cached = displayedItemsCache { return cached }
+        let items = displayedNodes.map { DiskListItem(id: $0.id, node: $0) }
+        displayedItemsCache = items
+        return items
+    }
     var collectionSize: Int64 { collection.reduce(0) { $0 + $1.size } }
     var canCollectSelection: Bool {
         selected.map(canCollect) ?? false
@@ -265,17 +283,25 @@ final class DiskModel: ObservableObject {
     var mapRelatedRowIDs: Set<String> { mapHoverPresentation.relatedRowIDs }
     var mapHoverDescription: String? { mapHoverPresentation.description }
 
-    func setMapHover(nodes: [DiskNode]?, groupID: String?) {
+    func setMapHover(nodes: [DiskNode]?, groupID: String?, preparedGroup: PreparedMapHoverGroup? = nil) {
+        if let preparedGroup {
+            guard preparedGroup.id == groupID, preparedGroup.rootID == current?.id,
+                  preparedGroup.mapRevision == mapRevision,
+                  isWithin(preparedGroup.parentID, root: preparedGroup.rootID) else { return }
+        }
         if let nodes { hoveredMapNodes = nodes }
         else if !hoveredMapNodes.isEmpty { hoveredMapNodes = [] }
         if hoveredMapGroupID != groupID { hoveredMapGroupID = groupID }
+        preparedMapHoverGroup = nodes?.isEmpty == false ? preparedGroup : nil
         if nodes != nil, hoveredListID != nil { hoveredListID = nil }
     }
 
     private var mapHoverPresentation: MapHoverPresentation {
         if let cached = mapHoverPresentationCache { return cached }
         let presentation: MapHoverPresentation
-        if let groupID = hoveredMapGroupID, !hoveredMapNodes.isEmpty {
+        if let group = preparedMapHoverGroup {
+            presentation = makePreparedMapHoverPresentation(group)
+        } else if let groupID = hoveredMapGroupID, !hoveredMapNodes.isEmpty {
             presentation = groupedMapHoverCache.presentation(groupID: groupID, members: hoveredMapNodes) {
                 makeMapHoverPresentation()
             }
@@ -284,6 +310,26 @@ final class DiskModel: ObservableObject {
         }
         mapHoverPresentationCache = presentation
         return presentation
+    }
+
+    private func makePreparedMapHoverPresentation(_ group: PreparedMapHoverGroup) -> MapHoverPresentation {
+        let related: Set<String>
+        if isFiltering {
+            related = Set(searchResults.lazy.map(\.id).filter {
+                group.memberIDs.contains($0)
+                    || (isWithin(group.parentID, root: $0) && isWithin($0, root: group.rootID))
+            })
+        } else if group.parentID == group.rootID {
+            related = group.memberIDs
+        } else {
+            let prefix = group.rootID == "/" ? "/" : group.rootID + "/"
+            let child = group.parentID.dropFirst(prefix.count).split(separator: "/", maxSplits: 1).first
+            related = child.map { [prefix + String($0)] } ?? []
+        }
+        let description = group.memberIDs.count == 1 ? group.memberIDs.first.map(relativeHoverPath)
+            : "\(group.memberIDs.count) items in \(relativeHoverPath(group.parentID))"
+        return MapHoverPresentation(relatedRowIDs: related,
+                                    description: description)
     }
 
     private func makeMapHoverPresentation() -> MapHoverPresentation {
