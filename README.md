@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/JohnDeved/orbit-disk/releases/latest"><img src="docs/art/download.svg" width="220" alt="Download Orbit Disk from the latest GitHub release"></a>
+  <a href="https://github.com/JohnDeved/orbit-disk/releases/latest"><img src="docs/art/download.svg" width="220" alt="Download Orbit Disk for Mac from the latest GitHub release"></a>
 </p>
 <p align="center"><sub>macOS 14 or later · Apple silicon &amp; Intel &nbsp; | &nbsp; <a href="docs/GUIDE.md">Read the guide</a></sub></p>
 
