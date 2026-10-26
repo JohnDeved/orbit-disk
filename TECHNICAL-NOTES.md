@@ -91,7 +91,7 @@ Outside-click dismissal keeps native sheets and alerts. A presenter-local mouse 
 
 Layout stability is verified separately from scan throughput. Header and action slots, the breadcrumb row, metrics, inspector, progress footer and collection tray retain their dimensions through content changes. The chart center reserves its title, size, detail and Up slots. Contents rows have a fixed height and size/action columns; collection status shares a line with search context. The local NSTableView appearance adapter keeps its enclosing scroll view's vertical gutter reserved, removing a measured 17-point column jump between overflowing and short lists while retaining the current scroller style. Collection error text occupies a reserved header region, and Quick Look has a fixed content size. Native SwiftUI frame probes measured zero movement in tracked regions/columns across 39 states and 16 additional transition traces; details and limits are in VERIFICATION.md.
 
-## Toolbar and list scrolling (0.9.2)
+## Toolbar and list scrolling (0.9.3)
 
 The location and actions use separate native toolbar items in a unified title bar. Their reserved widths keep content changes from moving the controls, while AppKit supplies the space between them. The header has no logo or wordmark. Only the split background extends through the top safe area; the toolbar background is hidden, and its 40-point content frames fit inside the 52-point native title bar. Body content keeps its normal safe area. Selection uses a warm fill and thick coral outline; temporary hover uses a neutral fill and thin slate outline. The collection footer retains its full drop area with no idle border or inner background.
 

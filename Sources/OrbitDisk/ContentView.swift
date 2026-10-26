@@ -496,7 +496,6 @@ struct ContentView: View {
                             Text("ago")
                         }
                     }.lineLimit(1).frame(width: 172, alignment: .leading)
-                    Text("· File sizes, not reclaimable space").lineLimit(1)
                     if result.skippedCount > 0 {
                         Button("\(result.skippedCount.formatted()) skipped") { model.showIssues = true }
                             .buttonStyle(.link).pointingCursor().fixedSize()
@@ -521,6 +520,7 @@ struct ContentView: View {
         }
         .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted)
         .padding(.horizontal, 28).frame(height: 44, alignment: .top)
+        .padding(.bottom, 12)
     }
 
     private var collectionBar: some View {
