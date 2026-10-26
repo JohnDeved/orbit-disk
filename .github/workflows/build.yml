@@ -25,6 +25,11 @@ jobs:
           swift --version
       - name: Build app
         run: ./build-app.sh --output '.build/ci/Orbit Disk.app'
+      - name: Check disk image packaging
+        run: |
+          ./scripts/package-dmg.sh '.build/ci/Orbit Disk.app' .build/ci/Orbit-Disk.dmg
+          test -s .build/ci/Orbit-Disk.dmg
+          python3 scripts/test-package-dmg.py '.build/ci/Orbit Disk.app'
       - name: Check release metadata validation
         run: python3 scripts/test-release.py
       - name: Check update dialog copy

@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/JohnDeved/orbit-disk/releases/latest"><img src="docs/art/download-mac.svg" width="220" alt="Download Orbit Disk for Mac from the latest GitHub release"></a>
+  <a href="https://github.com/JohnDeved/orbit-disk/releases/latest/download/Orbit-Disk.dmg"><img src="docs/art/download-mac.svg" width="220" alt="Download Orbit Disk for Mac"></a>
 </p>
 <p align="center"><sub>macOS 14 or later · Apple silicon &amp; Intel &nbsp; | &nbsp; <a href="docs/GUIDE.md">Read the guide</a></sub></p>
 
@@ -54,7 +54,7 @@ Start browsing while the first scan is still finding files. Orbit Disk saves com
 
 ## Get started
 
-1. [Download the latest release](https://github.com/JohnDeved/orbit-disk/releases/latest), unzip it, and move **Orbit Disk.app** to Applications.
+1. [Download Orbit Disk](https://github.com/JohnDeved/orbit-disk/releases/latest/download/Orbit-Disk.dmg), open the disk image, and drag **Orbit Disk.app** to Applications.
 2. Open Orbit Disk and choose a location to map.
 
 The app is ad-hoc signed and has not been notarized by Apple. If macOS blocks the first launch, approve it in **System Settings → Privacy & Security**. [Installation and updates](docs/GUIDE.md#app-updates)

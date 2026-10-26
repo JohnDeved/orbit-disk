@@ -2,7 +2,7 @@
 
 A native Swift / SwiftUI disk-space explorer for macOS 14 and later, on Apple silicon and Intel Macs. Inspired by DaisyDisk's visual exploration and the scan-once, search-an-index architecture of instant file-search tools. This is an independent implementation; it bundles Sparkle for app updates.
 
-Download the universal app ZIP from [GitHub Releases](https://github.com/JohnDeved/orbit-disk/releases/latest), extract it, and move **Orbit Disk.app** to Applications before opening it. The current distribution is ad-hoc signed, without an Apple Developer ID signature or notarization. macOS may require initial approval in **System Settings → Privacy & Security**. Version 0.8.3 has no updater: install 0.9.0 or later manually once to enable future in-app updates.
+Download the [universal disk image](https://github.com/JohnDeved/orbit-disk/releases/latest/download/Orbit-Disk.dmg), open it, and drag **Orbit Disk.app** to Applications before opening it. The current distribution is ad-hoc signed, without an Apple Developer ID signature or notarization. macOS may require initial approval in **System Settings → Privacy & Security**. Version 0.8.3 has no updater: install 0.9.0 or later manually once to enable future in-app updates.
 
 Choose a folder or a device, then click a map folder to open it. Click the map center to go up. In the file list, click a row to inspect it; click its arrow or double-click the row to open a folder. The file list also exposes items too small to draw individually.
 

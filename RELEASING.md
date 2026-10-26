@@ -3,10 +3,11 @@
 Push a stable `vX.Y.Z` tag to publish a universal app for macOS 14 or later. The release workflow runs the checks, builds for Apple silicon and Intel, signs the update archive and feed, then publishes a GitHub release with:
 
 - `Orbit-Disk-X.Y.Z-universal.zip`
+- `Orbit-Disk.dmg`
 - `appcast.xml`
 - `SHA256SUMS`
 
-Assets are uploaded to a draft before it becomes the latest public release. The app reads `https://github.com/JohnDeved/orbit-disk/releases/latest/download/appcast.xml`; users do not need GitHub credentials. Existing releases are never overwritten.
+The disk image contains the app and an Applications shortcut. Its stable name supports direct downloads from `https://github.com/JohnDeved/orbit-disk/releases/latest/download/Orbit-Disk.dmg`. Sparkle uses the versioned ZIP, not the disk image. Assets are uploaded to a draft before it becomes the latest public release. The app reads `https://github.com/JohnDeved/orbit-disk/releases/latest/download/appcast.xml`; users do not need GitHub credentials. Existing releases are never overwritten.
 
 Both workflows use the `macos-26` runner and explicitly select Xcode 26.6 through `DEVELOPER_DIR`. They print the Xcode and Swift versions in the job log. This build environment does not raise the app's macOS 14 deployment target.
 
@@ -63,7 +64,9 @@ After committing and creating the local tag, prepare the exact release assets wi
 )
 ```
 
-Verified assets are written to `.build/releases/v0.9.1`. The script checks version/build metadata, archive URLs and size, signatures, and bundle integrity. It refuses to overwrite an existing preparation directory. `--prepare-only` does not create or push a tag, contact GitHub to publish, or run the test suite; run the checks above first. Omit that flag only when deliberately publishing from a clean, tagged checkout whose tag is already on GitHub.
+Verified assets are written to `.build/releases/v0.9.1`. The script checks version/build metadata, archive URLs and size, signatures, and bundle integrity. It creates the disk image after the update feed so the feed contains only the ZIP. It verifies and mounts the image read-only, checks the app's code signature and compares its files, symlinks and permissions with the original bundle before adding it to the release. The Build workflow also tests that a change to executable permissions is rejected. The script refuses to overwrite an existing preparation directory. `--prepare-only` does not create or push a tag, contact GitHub to publish, or run the test suite; run the checks above first. Omit that flag only when deliberately publishing from a clean, tagged checkout whose tag is already on GitHub.
+
+To package an already verified app separately, run `./scripts/package-dmg.sh "PATH/Orbit Disk.app" "PATH/Orbit-Disk.dmg"`. The destination must not already exist.
 
 ## Optional Apple signing and notarization
 

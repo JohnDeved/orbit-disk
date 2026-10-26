@@ -44,7 +44,9 @@ signature=$(python3 scripts/validate-release.py "$tag" --appcast "$staging/asset
 "$tools/sign_update" --verify --ed-key-file "$staging/signing-key" "$archive" "$signature"
 "$tools/sign_update" --verify --ed-key-file "$staging/signing-key" "$staging/assets/appcast.xml"
 rm "$staging/signing-key"
-(cd "$staging/assets"; shasum -a 256 "$archive_name" appcast.xml > SHA256SUMS)
+dmg_name="Orbit-Disk.dmg"
+./scripts/package-dmg.sh "$staging/Orbit Disk.app" "$staging/assets/$dmg_name"
+(cd "$staging/assets"; shasum -a 256 "$archive_name" "$dmg_name" appcast.xml > SHA256SUMS)
 output="$PWD/.build/releases/$tag"
 [[ ! -e "$output" ]] || { print -u2 "Release output already exists: $output"; exit 1; }
 mv "$staging/assets" "$output"
@@ -66,6 +68,6 @@ fi
 # Assets stay private in a draft until the complete signed set has been uploaded.
 gh release create "$tag" --repo "$repository" --verify-tag --draft \
   --title "Orbit Disk ${tag#v}" --generate-notes --notes-file "$staging/release-notes.md" \
-  "$output/$archive_name" "$output/appcast.xml" "$output/SHA256SUMS"
+  "$output/$archive_name" "$output/$dmg_name" "$output/appcast.xml" "$output/SHA256SUMS"
 gh release edit "$tag" --repo "$repository" --draft=false --latest
 printf 'Published https://github.com/%s/releases/tag/%s\n' "$repository" "$tag"
