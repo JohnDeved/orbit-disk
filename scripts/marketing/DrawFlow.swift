@@ -3,10 +3,6 @@ import Foundation
 
 let input = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 let output = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
-let coral = NSColor(calibratedRed: 1, green: 0.55, blue: 0.40, alpha: 1)
-let paper = NSColor(calibratedRed: 0.91, green: 0.92, blue: 0.95, alpha: 1)
-let muted = NSColor(calibratedRed: 0.65, green: 0.68, blue: 0.73, alpha: 1)
-let background = NSColor(calibratedRed: 0.085, green: 0.10, blue: 0.13, alpha: 1)
 
 func render(_ name: String, height: CGFloat, _ block: (CGFloat) -> Void) throws {
     let size = NSSize(width: 1360, height: height)
@@ -17,8 +13,7 @@ func render(_ name: String, height: CGFloat, _ block: (CGFloat) -> Void) throws 
     guard let context = NSGraphicsContext(bitmapImageRep: rep) else { fatalError("Cannot draw flow image") }
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = context
-    background.setFill()
-    NSRect(x: 0, y: 0, width: 1360, height: height).fill()
+    context.cgContext.clear(CGRect(origin: .zero, size: size))
     block(height)
     context.flushGraphics()
     NSGraphicsContext.restoreGraphicsState()
@@ -50,14 +45,14 @@ func picture(_ file: String, crop: CGRect, into rect: NSRect) {
     outline.lineWidth = 1
     outline.stroke()
 }
-func arrow(_ start: CGPoint, _ c1: CGPoint, _ c2: CGPoint, _ end: CGPoint, _ height: CGFloat) {
+func arrow(_ start: CGPoint, _ c1: CGPoint, _ c2: CGPoint, _ end: CGPoint, _ height: CGFloat, color: NSColor) {
     func p(_ v: CGPoint) -> NSPoint { NSPoint(x: v.x, y: height - v.y) }
     let curve = NSBezierPath()
     curve.move(to: p(start))
     curve.curve(to: p(end), controlPoint1: p(c1), controlPoint2: p(c2))
     curve.lineWidth = 3
     curve.lineCapStyle = .round
-    coral.setStroke(); curve.stroke()
+    color.setStroke(); curve.stroke()
     let dx = end.x - c2.x, dy = end.y - c2.y
     let length = hypot(dx, dy), ux = dx / length, uy = dy / length
     let tip = p(end)
@@ -66,28 +61,38 @@ func arrow(_ start: CGPoint, _ c1: CGPoint, _ c2: CGPoint, _ end: CGPoint, _ hei
     let head = NSBezierPath(); head.move(to: left); head.line(to: tip); head.line(to: right)
     head.lineWidth = 3; head.lineCapStyle = .round; head.lineJoinStyle = .round; head.stroke()
 }
-try render("orbit-navigate.png", height: 1650) { h in
-    text("Map and list show the same folder", 75, 48, h, size: 23, weight: .semibold, color: paper)
-    text("HOME", 1190, 53, h, size: 15, weight: .semibold, color: muted)
-    picture("orbit-overview.png", crop: CGRect(x: 210, y: 100, width: 1070, height: 520), into: box(75, 100, 1210, 588, h))
-    arrow(CGPoint(x: 690, y: 288), CGPoint(x: 735, y: 250), CGPoint(x: 790, y: 248), CGPoint(x: 832, y: 270), h)
-    text("Open Projects, then select Studio", 75, 800, h, size: 23, weight: .semibold, color: paper)
-    text("PROJECTS", 1165, 805, h, size: 15, weight: .semibold, color: muted)
-    arrow(CGPoint(x: 1215, y: 260), CGPoint(x: 1345, y: 240), CGPoint(x: 1360, y: 740), CGPoint(x: 1287, y: 829), h)
-    picture("orbit-projects.png", crop: CGRect(x: 210, y: 0, width: 1070, height: 620), into: box(75, 850, 1210, 701, h))
-    text("Use the center or Up to return", 75, 1580, h, size: 18, weight: .regular, color: muted)
-}
-try render("orbit-collect.png", height: 1840) { h in
-    text("Drag a segment or row into the collection", 75, 48, h, size: 23, weight: .semibold, color: paper)
-    picture("orbit-collection.png", crop: CGRect(x: 210, y: 85, width: 1070, height: 725), into: box(75, 100, 1210, 820, h))
-    arrow(CGPoint(x: 330, y: 385), CGPoint(x: 200, y: 520), CGPoint(x: 240, y: 790), CGPoint(x: 600, y: 850), h)
-    text("Review before removing", 75, 1000, h, size: 23, weight: .semibold, color: paper)
-    arrow(CGPoint(x: 1190, y: 870), CGPoint(x: 1355, y: 870), CGPoint(x: 1355, y: 1030), CGPoint(x: 1205, y: 1080), h)
-    // The review view is captured from the app; its pixel dimensions depend on the display scale.
-    let url = input.appendingPathComponent("orbit-review.png")
-    guard let image = NSImage(contentsOf: url), let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { fatalError("Missing review capture") }
-    let width = CGFloat(cg.width), height = CGFloat(cg.height)
-    let scale = 1040 / width
-    let w = width * scale, hh = height * scale
-    picture("orbit-review.png", crop: CGRect(x: 0, y: 0, width: width, height: height), into: box((1360-w)/2, 1100, w, hh, h))
+for isDark in [false, true] {
+    let theme = isDark ? "dark" : "light"
+    let paper = isDark ? NSColor(srgbRed: 0.90, green: 0.93, blue: 0.95, alpha: 1)
+                       : NSColor(srgbRed: 0.14, green: 0.16, blue: 0.18, alpha: 1)
+    let muted = isDark ? NSColor(srgbRed: 0.69, green: 0.73, blue: 0.77, alpha: 1)
+                       : NSColor(srgbRed: 0.34, green: 0.38, blue: 0.42, alpha: 1)
+    let coral = isDark ? NSColor(srgbRed: 1.0, green: 0.55, blue: 0.40, alpha: 1)
+                   : NSColor(srgbRed: 0.83, green: 0.337, blue: 0.176, alpha: 1)
+    try render("orbit-navigate-\(theme).png", height: 1650) { h in
+        text("Map and list show the same folder", 75, 48, h, size: 23, weight: .semibold, color: paper)
+        text("HOME", 1190, 53, h, size: 15, weight: .semibold, color: muted)
+        picture("orbit-overview.png", crop: CGRect(x: 210, y: 100, width: 1070, height: 520), into: box(75, 100, 1210, 588, h))
+        arrow(CGPoint(x: 690, y: 288), CGPoint(x: 735, y: 250), CGPoint(x: 790, y: 248), CGPoint(x: 832, y: 270), h, color: coral)
+        text("Open Projects, then select Studio", 75, 800, h, size: 23, weight: .semibold, color: paper)
+        text("PROJECTS", 1165, 805, h, size: 15, weight: .semibold, color: muted)
+        arrow(CGPoint(x: 1215, y: 260), CGPoint(x: 1345, y: 240), CGPoint(x: 1360, y: 740), CGPoint(x: 1287, y: 829), h, color: coral)
+        picture("orbit-projects.png", crop: CGRect(x: 210, y: 0, width: 1070, height: 620), into: box(75, 850, 1210, 701, h))
+        text("Use the center or Up to return", 75, 1580, h, size: 18, weight: .regular, color: muted)
+    }
+    try render("orbit-collect-\(theme).png", height: 1840) { h in
+        text("Drag a segment or row into the collection", 75, 48, h, size: 23, weight: .semibold, color: paper)
+        picture("orbit-collection.png", crop: CGRect(x: 210, y: 85, width: 1070, height: 725), into: box(75, 100, 1210, 820, h))
+        arrow(CGPoint(x: 330, y: 385), CGPoint(x: 200, y: 520), CGPoint(x: 240, y: 790), CGPoint(x: 600, y: 850), h, color: coral)
+        text("Review before removing", 75, 1000, h, size: 23, weight: .semibold, color: paper)
+        arrow(CGPoint(x: 1190, y: 870), CGPoint(x: 1355, y: 870), CGPoint(x: 1355, y: 1030), CGPoint(x: 1205, y: 1080), h, color: coral)
+        // The review view is captured from the app; its pixel dimensions depend on the display scale.
+        let url = input.appendingPathComponent("orbit-review.png")
+        guard let image = NSImage(contentsOf: url), let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { fatalError("Missing review capture") }
+        let width = CGFloat(cg.width), height = CGFloat(cg.height)
+        let scale = 1040 / width
+        let w = width * scale, hh = height * scale
+        picture("orbit-review.png", crop: CGRect(x: 0, y: 0, width: width, height: height), into: box((1360-w)/2, 1100, w, hh, h))
+    }
+
 }

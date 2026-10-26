@@ -29,7 +29,8 @@ Choose Home, a disk, or another folder. Each ring shows another level inside it,
 <p><b>Home → Projects → select Studio</b></p>
 
 <p align="center">
-  <img src="docs/art/orbit-navigate.png" width="100%" alt="Projects is selected in the Home map and Contents list. An arrow leads to the opened Projects folder, where Studio is selected; the map center and Up button return to Home.">
+  <img src="docs/art/orbit-navigate-dark.png#gh-dark-mode-only" width="100%" alt="Projects is selected in the Home map and Contents list. An arrow leads to the opened Projects folder, where Studio is selected; the map center and Up button return to Home.">
+  <img src="docs/art/orbit-navigate-light.png#gh-light-mode-only" width="100%" alt="Projects is selected in the Home map and Contents list. An arrow leads to the opened Projects folder, where Studio is selected; the map center and Up button return to Home.">
 </p>
 
 Click a folder segment or its row arrow to open it. Click the center of the map to go back up. Items too small to draw individually are still available in the list.
@@ -41,7 +42,8 @@ Drag a segment or a list row into the collection tray. Collected items are marke
 <p><b>Map or list → collection tray → review</b></p>
 
 <p align="center">
-  <img src="docs/art/orbit-collect.png" width="100%" alt="The collected Downloads folder is marked on the map and list. Arrows lead to the collection tray and a review showing options to move it to Trash or delete it permanently.">
+  <img src="docs/art/orbit-collect-dark.png#gh-dark-mode-only" width="100%" alt="The collected Downloads folder is marked on the map and list. Arrows lead to the collection tray and a review showing options to move it to Trash or delete it permanently.">
+  <img src="docs/art/orbit-collect-light.png#gh-light-mode-only" width="100%" alt="The collected Downloads folder is marked on the map and list. Arrows lead to the collection tray and a review showing options to move it to Trash or delete it permanently.">
 </p>
 
 Files stay where they are until you review the collection and confirm **Move to Trash** or **Delete Permanently**. Permanent deletion has its own confirmation and cannot be undone.
