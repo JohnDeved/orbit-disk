@@ -62,7 +62,7 @@ This build is not signed with an Apple Developer ID certificate or notarized by 
 NOTES
 else
   cat > "$staging/release-notes.md" <<'NOTES'
-For macOS 14 or later, on Apple silicon and Intel Macs. Signed with Developer ID and notarized by Apple. In-app updates are verified with Orbit Disk's Sparkle signing key.
+For macOS 14 or later, on Apple silicon and Intel Macs. The app is signed with Developer ID and notarized by Apple; the disk image itself is not signed or notarized. In-app updates are verified with Orbit Disk's Sparkle signing key.
 NOTES
 fi
 # Assets stay private in a draft until the complete signed set has been uploaded.

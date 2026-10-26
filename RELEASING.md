@@ -83,6 +83,8 @@ Set all six repository Actions secrets to enable Developer ID signing and notari
 
 If none are set, the release remains ad-hoc signed. An incomplete set fails validation. The signing script uses a temporary Keychain, signs nested helpers and the app, waits for Apple to accept notarization, and staples and verifies the ticket before packaging. Keep these values in Actions secrets or temporary local environment variables, never in the repository.
 
+The disk image itself is not signed or notarized. Apple recommends signing and notarizing the distributed disk image as well as the app.
+
 ## Update interface
 
 The app uses Sparkle's standard installer with daily checks and user-approved installation/restart. The English dialog copy is in `Assets/Sparkle.en.json`. Packaging merges it into the staged framework and re-signs the framework; the original Sparkle license and other languages remain included. The merge fails if an expected vendor string key changes, so review this overlay when upgrading Sparkle. Skip, dismissal, and install-on-quit actions retain their distinct meanings.
