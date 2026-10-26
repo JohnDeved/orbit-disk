@@ -1,0 +1,41 @@
+name: Build
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build app
+        run: ./build-app.sh --output '.build/ci/Orbit Disk.app'
+      - name: Check release metadata validation
+        run: python3 scripts/test-release.py
+      - name: Check update dialog copy
+        run: python3 Tests/test_update_copy.py
+      - name: Check scanner and index
+        run: swift run -c release OrbitCoreChecks
+      - name: Check app model and native interaction
+        run: ./check-app.sh
+      - name: Check updater behavior
+        run: ./check-updater.sh
+      - name: Check rendered layouts
+        run: ./check-layout.sh
+      - name: Archive app with framework symlinks
+        run: ditto -c -k --sequesterRsrc --keepParent '.build/ci/Orbit Disk.app' .build/ci/Orbit-Disk.zip
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Orbit-Disk-${{ github.sha }}
+          path: .build/ci/Orbit-Disk.zip
+          if-no-files-found: error
+          retention-days: 14

@@ -1,5 +1,15 @@
 # Orbit Disk: scan and search design
 
+## Public updates (0.9.0)
+
+Sparkle 2.10.1 is pinned in SwiftPM and bundled with the app. The public GitHub latest-release asset serves the appcast; downloads require no GitHub account or user token. Only update metadata and app downloads use the network. Scan contents and indexed paths are not included in update requests. Sparkle checks daily while the app is running, and the user chooses installation and restart. [Sparkle setup](https://sparkle-project.org/documentation/) and [publishing](https://sparkle-project.org/documentation/publishing/).
+
+Both the appcast and universal ZIP carry Ed25519 signatures. The public verification key is embedded in the app; the private key belongs only in the maintainer's Keychain and release secret. Signed-feed validation is required with no expiration fallback, and the archive is verified before extraction. Tag releases build both arm64 and x86_64 for macOS 14, verify signatures and metadata, upload all assets to a draft, then publish it. Release validation rejects mismatched versions, non-increasing build numbers, incomplete Apple credentials, and an unexpected archive URL or length.
+
+The updater defers checks and restart during file removal. An application termination guard also covers Sparkle's resumed-install paths. Ordinary restarts retain saved SQLite maps but clear the session-only collection. The native installer and its helpers perform replacement and relaunch; the application does not implement its own shell-based installer. [Sparkle updater delegate](https://sparkle-project.org/documentation/api-reference/Protocols/SPUUpdaterDelegate.html).
+
+Current releases use ad-hoc code signatures because no Apple Developer ID is available. Sparkle's release signatures authenticate later updates independently; initial internet downloads still require macOS approval. The optional Developer ID path signs nested code, submits it for notarization, staples the result, and only then creates the signed update archive. That path requires credentials and has not been exercised against Apple's service. See RELEASING.md.
+
 Orbit Disk separates filesystem work from searching. A background scan reads names and size metadata, builds a folder tree, and totals sizes from the leaves upward. The result is persisted in a local SQLite index. Opening a saved folder loads its direct children and a bounded preview of larger descendants. Name search reads indexed metadata without reopening files. File contents are never stored in the index.
 
 This follows the useful part of instant-search tools: gather metadata once, then query an index. Everything keeps its running database in memory and indexes size information for fast searches and sorting. Its NTFS change-journal approach belongs to Windows; it is not an API available to this macOS app. [Everything indexes](https://www.voidtools.com/en-us/support/everything/indexes/) and [Everything FAQ](https://www.voidtools.com/faq/).

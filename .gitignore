@@ -6,3 +6,5 @@ Assets/*.iconset/
 *.app/
 *.zip
 *.dSYM/
+__pycache__/
+*.pyc

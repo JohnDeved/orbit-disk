@@ -4,7 +4,14 @@ import AppKit
 @main
 struct OrbitDiskApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var model = DiskModel()
+    @StateObject private var model: DiskModel
+    @StateObject private var updater: AppUpdater
+
+    init() {
+        let model = DiskModel()
+        _model = StateObject(wrappedValue: model)
+        _updater = StateObject(wrappedValue: AppUpdater(model: model))
+    }
 
     var body: some Scene {
         WindowGroup("Orbit Disk") {
@@ -12,6 +19,8 @@ struct OrbitDiskApp: App {
                 .preferredColorScheme(.dark)
                 .frame(minWidth: 1060, minHeight: 680)
                 .onAppear {
+                    delegate.model = model
+                    updater.start()
                     guard !model.didLaunch else { return }
                     model.didLaunch = true
                     if let index = CommandLine.arguments.firstIndex(of: "--scan"),
@@ -25,6 +34,9 @@ struct OrbitDiskApp: App {
         .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1280, height: 810)
         .commands {
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesButton(updater: updater)
+            }
             CommandGroup(replacing: .newItem) {
                 Button("Open Folder…", action: model.chooseFolder).keyboardShortcut("o")
                     .disabled(model.isRemoving)
@@ -44,14 +56,10 @@ struct OrbitDiskApp: App {
                     .disabled(!model.canCollectSelection)
             }
         }
-    }
-}
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
+        Settings {
+            UpdateSettingsView(updater: updater)
+                .preferredColorScheme(.dark)
+        }
     }
-
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 }

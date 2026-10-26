@@ -1,0 +1,13 @@
+{
+  "A new version of %@ is available!": "Update %@",
+  "A new version of %@ is ready to install!": "Restart %@",
+  "An important update to %@ is ready to install": "Important update for %@",
+  "%@ %@ is now available—you have %@. Would you like to download it now?": "Version %2$@ is available. You’re using %3$@.",
+  "%@ %@ is now available—you have %@. This is an important update; would you like to download it now?": "Version %2$@ is available. You’re using %3$@.",
+  "%@ %@ is now available—you have %@. Would you like to learn more about this update on the web?": "Version %2$@ is available. You’re using %3$@.",
+  "%1$@ %2$@ has been downloaded and is ready to use! Would you like to install it and relaunch %1$@ now?": "Version %2$@ is ready. Restart %1$@ to finish updating.",
+  "%1$@ %2$@ has been downloaded and is ready to use! This is an important update; would you like to install it and relaunch %1$@ now?": "Version %2$@ is ready. Restart %1$@ to install this important update.",
+  "Install Update": "Update",
+  "Remind Me Later": "Not Now",
+  "Install and Relaunch": "Update and Restart"
+}

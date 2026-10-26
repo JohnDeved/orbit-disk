@@ -1,0 +1,48 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+concurrency:
+  group: releases
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/validate-release.py "$RELEASE_TAG"
+      - name: Check release validation
+        run: python3 scripts/test-release.py
+      - name: Resolve package dependencies
+        run: swift package resolve
+      - name: Check update dialog copy
+        run: python3 Tests/test_update_copy.py
+      - name: Check scanner and index
+        run: swift run -c release OrbitCoreChecks
+      - name: Check app model and native interaction
+        run: ./check-app.sh
+      - name: Check updater behavior
+        run: ./check-updater.sh
+      - name: Check rendered layouts
+        run: ./check-layout.sh
+      - name: Build and publish signed release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: ./scripts/release.sh "$RELEASE_TAG"

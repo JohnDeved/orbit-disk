@@ -9,6 +9,7 @@ python3 Tests/OrbitLayoutChecks/make-probes.py "$checks_path/ContentView.swift"
 app_sources=(Sources/OrbitDisk/*.swift)
 app_sources=(${app_sources:#*/ContentView.swift})
 app_sources=(${app_sources:#*/OrbitDiskApp.swift})
+app_sources=(${app_sources:#*/AppUpdater.swift})
 swiftc -parse-as-library -O -swift-version 5 \
   -target "$(uname -m)-apple-macosx14.0" \
   -I "$build_path/Modules" -I Sources/CSQLite \

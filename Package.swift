@@ -10,10 +10,17 @@ let package = Package(
         .executable(name: "OrbitCoreChecks", targets: ["OrbitCoreChecks"]),
         .library(name: "OrbitCore", targets: ["OrbitCore"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.10.1")
+    ],
     targets: [
         .systemLibrary(name: "CSQLite"),
         .target(name: "OrbitCore", dependencies: ["CSQLite"]),
-        .executableTarget(name: "OrbitDisk", dependencies: ["OrbitCore"]),
+        .executableTarget(
+            name: "OrbitDisk",
+            dependencies: ["OrbitCore", .product(name: "Sparkle", package: "Sparkle")],
+            linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])]
+        ),
         .executableTarget(name: "OrbitScan", dependencies: ["OrbitCore"]),
         .executableTarget(name: "OrbitCoreChecks", dependencies: ["OrbitCore"], path: "Tests/OrbitCoreTests")
     ],

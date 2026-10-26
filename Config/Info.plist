@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>Orbit Disk</string>
+	<key>CFBundleExecutable</key>
+	<string>OrbitDisk</string>
+	<key>CFBundleIconFile</key>
+	<string>OrbitDisk</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.orbitdisk.app</string>
+	<key>CFBundleName</key>
+	<string>Orbit Disk</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.9.0</string>
+	<key>CFBundleVersion</key>
+	<string>12</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Orbit Disk, 2026</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>SUAllowsAutomaticUpdates</key>
+	<false/>
+	<key>SUAutomaticallyUpdate</key>
+	<false/>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/JohnDeved/orbit-disk/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>UDm1JQBOARmAsZbcgyIzTTq79g7d7zJHIahiDKty5TI=</string>
+	<key>SURequireSignedFeed</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
+	<key>SUSignedFeedFailureExpirationInterval</key>
+	<integer>0</integer>
+	<key>SUVerifyUpdateBeforeExtraction</key>
+	<true/>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Orbit Disk Collection Items</string>
+			<key>UTTypeIdentifier</key>
+			<string>local.orbitdisk.collection-items</string>
+		</dict>
+	</array>
+</dict>
+</plist>
