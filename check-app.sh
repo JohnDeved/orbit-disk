@@ -22,3 +22,7 @@ swiftc -O -swift-version 5 -target "$target" \
   Sources/OrbitDisk/PointingCursor.swift Tests/OrbitInteractionChecks/main.swift \
   "$build_path/OrbitCore.build/"*.swift.o -o "$build_path/OrbitInteractionChecks"
 "$build_path/OrbitInteractionChecks"
+swiftc -parse-as-library -O -swift-version 5 -target "$target" \
+  Sources/OrbitDisk/ListHoverTracking.swift Tests/OrbitListHoverChecks.swift \
+  -o "$build_path/OrbitListHoverChecks"
+"$build_path/OrbitListHoverChecks"

@@ -32,6 +32,7 @@ struct OrbitDiskApp: App {
                 }
         }
         .windowStyle(.hiddenTitleBar)
+        .windowToolbarStyle(.unified(showsTitle: false))
         .defaultSize(width: 1280, height: 810)
         .commands {
             CommandGroup(after: .appInfo) {

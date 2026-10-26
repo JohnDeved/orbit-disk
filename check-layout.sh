@@ -12,6 +12,7 @@ app_sources=(${app_sources:#*/OrbitDiskApp.swift})
 app_sources=(${app_sources:#*/AppUpdater.swift})
 swiftc -parse-as-library -O -swift-version 5 \
   -target "$(uname -m)-apple-macosx14.0" \
+  -module-cache-path "$PWD/.build/module-cache" \
   -I "$build_path/Modules" -I Sources/CSQLite \
   "${app_sources[@]}" "$checks_path/ContentView.swift" \
   Tests/OrbitLayoutChecks/LayoutChecks.swift \

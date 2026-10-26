@@ -17,13 +17,12 @@ struct ContentView: View {
     @FocusState private var fileListFocused: Bool
     @State private var collectionTargeted = false
     @State private var mapPresentation = SunburstPresentationCache()
+    @State private var listHoverTracking = ListHoverTracking()
 
     var body: some View {
         HStack(spacing: 0) {
             sidebar
             VStack(spacing: 0) {
-                header
-                Divider()
                 if let current = model.current {
                     explorer(current)
                 } else if model.isScanning {
@@ -35,11 +34,19 @@ struct ContentView: View {
                 collectionBar
             }
         }
-        .background(OrbitStyle.canvas)
+        .background {
+            HStack(spacing: 0) {
+                OrbitStyle.sidebar.frame(width: 210)
+                    .overlay(alignment: .trailing) { Rectangle().fill(.white.opacity(0.06)).frame(width: 1) }
+                OrbitStyle.canvas
+            }.ignoresSafeArea(.container, edges: .top)
+        }
         .foregroundStyle(.white)
         .tint(OrbitStyle.accent)
         .buttonStyle(.bordered)
         .controlSize(.large)
+        .toolbar { windowToolbar }
+        .toolbarBackground(.hidden, for: .windowToolbar)
         .onChange(of: model.selectedID) { _, selected in
             if selected != nil { searchFocused = false; fileListFocused = true }
         }
@@ -73,13 +80,25 @@ struct ContentView: View {
         }
     }
 
+    @ToolbarContentBuilder
+    private var windowToolbar: some ToolbarContent {
+        if #available(macOS 26, *) {
+            ToolbarItem(placement: .navigation) { headerLocation }
+                .sharedBackgroundVisibility(.hidden)
+            ToolbarSpacer(.flexible)
+            ToolbarItem(placement: .primaryAction) { header }
+                .sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem(placement: .navigation) { headerLocation }
+            ToolbarItem(placement: .principal) { Spacer() }
+            ToolbarItem(placement: .primaryAction) { header }
+        }
+    }
+
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("orbit disk")
-                .font(.system(size: 24, weight: .semibold, design: .rounded))
-                .padding(.top, 20).padding(.horizontal, 24).padding(.bottom, 22)
             Text("Devices").font(.system(size: 11, weight: .semibold)).foregroundStyle(OrbitStyle.muted)
-                .padding(.horizontal, 24).padding(.bottom, 12)
+                .padding(.horizontal, 24).padding(.top, 20).padding(.bottom, 12)
             ScrollView {
               VStack(spacing: 0) {
                ForEach(model.volumes) { volume in
@@ -127,14 +146,21 @@ struct ContentView: View {
         }.buttonStyle(.plain).pointingCursor().disabled(model.isRemoving)
     }
 
+    private var headerLocation: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(model.current?.name ?? "Make room for what matters.")
+                .font(.system(size: 17, weight: .semibold)).lineLimit(1)
+            Text(model.current?.url.path ?? "A clearer view of your storage.")
+                .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted).lineLimit(1).truncationMode(.middle)
+        }.frame(width: 280, alignment: .leading)
+            .frame(height: 40)
+            .padding(.leading, 142)
+            .foregroundStyle(.white)
+            .accessibilityElement(children: .contain)
+    }
+
     private var header: some View {
         HStack(spacing: 18) {
-            VStack(alignment: .leading, spacing: 5) {
-                Text(model.current?.name ?? "Make room for what matters.")
-                    .font(.system(size: 24, weight: .semibold)).lineLimit(1)
-                Text(model.current?.url.path ?? "A clearer view of your storage.")
-                    .font(.system(size: 12)).foregroundStyle(OrbitStyle.muted).lineLimit(1).truncationMode(.middle)
-            }.frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             Group {
                 HStack(spacing: 7) {
                     Image(systemName: "magnifyingglass").foregroundStyle(OrbitStyle.muted)
@@ -152,11 +178,18 @@ struct ContentView: View {
                 .help(model.isPartialMap ? "Search becomes available when the map is saved. You can browse folders now." : "Search the saved file index")
                 Button(action: model.rescan) { Label("Refresh", systemImage: "arrow.clockwise").padding(.vertical, 2) }
                     .pointingCursor().help("Refresh the full map (⌘R)").fixedSize()
+                    .accessibilityLabel("Refresh")
                     .disabled(model.isScanning || model.isRefreshing || model.isRemoving)
             }.opacity(model.root == nil ? 0 : 1).disabled(model.root == nil).accessibilityHidden(model.root == nil)
             Button(action: model.chooseFolder) { Label("Open Folder…", systemImage: "folder.badge.plus").padding(.vertical, 2) }
                 .pointingCursor().disabled(model.isRemoving).fixedSize()
-        }.padding(.horizontal, 28).frame(height: 80)
+                .accessibilityLabel("Open Folder…")
+        }.padding(.trailing, 12)
+            .frame(height: 40)
+            .foregroundStyle(.white).tint(OrbitStyle.accent)
+            .buttonStyle(.bordered).controlSize(.regular)
+            .labelStyle(.titleAndIcon)
+            .accessibilityElement(children: .contain)
     }
 
     private func explorer(_ node: DiskNode) -> some View {
@@ -269,6 +302,7 @@ struct ContentView: View {
                                 .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
                         }
                     }.listStyle(.plain).scrollContentBackground(.hidden).focused($fileListFocused)
+                    .onDisappear { listHoverTracking.detach() }
                     .onChange(of: relatedIDs) { _, ids in
                         guard !ids.isEmpty else { return }
                         if ids.count == 1, let id = ids.first {
@@ -315,7 +349,7 @@ struct ContentView: View {
         let percent = parent.size > 0 ? Double(item.size) / Double(parent.size) : 0
         let collectionState = model.collectionCoverage.state(for: item.id)
         let selected = model.selectedID == item.id
-        let highlighted = selected || related
+        let hovered = related || model.hoveredListID == item.id
         return HStack(spacing: 11) {
             RoundedRectangle(cornerRadius: 3).fill(model.isFiltering ? OrbitStyle.muted : DiskPalette.color(for: colorIndex)).frame(width: 7, height: 30)
                 .accessibilityHidden(true)
@@ -364,11 +398,16 @@ struct ContentView: View {
         }
         .frame(height: 40)
         .padding(.vertical, 7).padding(.horizontal, 5).contentShape(Rectangle())
-        .background(ListSelectionAppearance().accessibilityHidden(true))
-        .background(RoundedRectangle(cornerRadius: 7).fill(highlighted ? OrbitStyle.accent.opacity(0.13) : .clear))
+        .background(ListSelectionAppearance(hoverTracking: listHoverTracking, itemID: item.id) { [weak model] id in
+            guard let model, model.hoveredListID != id else { return }
+            model.hoveredListID = id
+        }.accessibilityHidden(true))
+        .background(RoundedRectangle(cornerRadius: 7)
+            .fill(selected ? Color(red: 0.29, green: 0.18, blue: 0.16) : hovered ? Color(red: 0.145, green: 0.157, blue: 0.184) : .clear))
         .overlay {
             RoundedRectangle(cornerRadius: 7)
-                .stroke(highlighted ? OrbitStyle.accent : .clear, lineWidth: selected ? 2 : 1.5)
+                .strokeBorder(selected ? OrbitStyle.accent : hovered ? Color(red: 0.47, green: 0.50, blue: 0.56) : .clear,
+                              lineWidth: selected ? 2.5 : 1)
                 .allowsHitTesting(false)
         }
         .overlay {
@@ -383,8 +422,7 @@ struct ContentView: View {
                 .accessibilityHidden(true)
         }
         .onHover { inside in
-            if inside { model.hoveredListID = item.id }
-            else if model.hoveredListID == item.id { model.hoveredListID = nil }
+            listHoverTracking.rowHoverChanged(id: item.id, inside: inside)
         }
         .help(item.url.path)
         .accessibilityElement(children: .contain)
@@ -508,10 +546,10 @@ struct ContentView: View {
             .pointingCursor().disabled(model.collection.isEmpty || model.isValidatingCollection || dragging).fixedSize()
         }
         .padding(.horizontal, 20).frame(maxWidth: .infinity).frame(height: 80)
-        .background(ready ? OrbitStyle.accent.opacity(0.16) : OrbitStyle.sidebar)
+        .background(ready ? OrbitStyle.accent.opacity(0.16) : dragging ? OrbitStyle.accent.opacity(0.06) : .clear)
         .overlay {
             RoundedRectangle(cornerRadius: 9)
-                .stroke(ready || dragging ? OrbitStyle.accent : OrbitStyle.muted.opacity(0.7),
+                .stroke(ready || dragging ? OrbitStyle.accent : .clear,
                         style: StrokeStyle(lineWidth: ready ? 2 : 1, dash: dragging && !ready ? [6, 4] : []))
         }
         .contentShape(Rectangle())

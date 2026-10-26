@@ -227,3 +227,24 @@ Apple Developer ID signing and notarization are implemented as an optional pipel
 - PASS, hard/purpose/liveliness/craft gates: branch color stays fixed while the white outline locates the hovered item. Native navigation, selection and collection affordances remain clear, without new controls or layout changes. ENERGY 2 / RHYTHM 2 / MOTION 1 remains the design direction. Cached drawing and hit paths invalidate when their data or geometry changes; independent source review found no actionable regressions.
 
 Pixel checks use native offscreen rendering and interaction checks use AppKit events. A physical-mouse FPS/latency measurement was not performed. The packaged app was exercised on Apple silicon; Intel and older macOS versions were not run locally.
+
+
+## Native toolbar and quieter list scrolling (0.9.2)
+
+- PASS, native top-edge inspection: sidebar and canvas backgrounds continue through the transparent title bar, with the sidebar divider intact. The header has no icon or wordmark. The compact toolbar no longer uses containers taller than the title bar. Focused 1280→1060→1280 measurements place both 40-point containers at y6–46 inside the 52-point bar, leaving six points of clearance above and below, with zero layout shifts; these bounds are now asserted by the full suite. Search click/type/clear and ⌘F focus worked, Open Folder opened the native picker and Escape closed it, and Refresh updated the generated fixture's index. Toolbar accessibility inspection exposes distinct Refresh and Open Folder labels.
+- PASS, measured native layout: 40 rendered states and 16 navigation/search transitions retain 0-point maximum structural/column movement and 54-point rows. At 1280 × 810 and 1060 × 680, the location starts at x238, matching the content navigation; toolbar centers align within 0.5 points of the traffic lights. All controls remain visible through shrinking and expanding, and the final action keeps a 20-point trailing margin. The pre-macOS-26 toolbar branch also passed six states on the current OS; older macOS itself was not run.
+- PASS, selection and collection styling: native inspection shows a warm selected row with a thick coral outline; temporary hover uses a neutral fill and thin slate outline. Selected text contrast is at least 6.14:1, hovered text at least 7.40:1, and outlines at least 5.47:1 and 3.71:1 respectively. The collection footer has no idle inner box; its existing drop area and drag feedback remain.
+- PASS, app regressions: the full app-model suite and all 19 native interaction groups pass, including selection, navigation, linked hover and collection drag behavior.
+- PASS, focused scroll checks: nine optimized native checks cover phase-less wheels, gesture and momentum overlap, scrollbar live scrolling, gesture cancellation, event scope, clip-origin changes, actual-pointer row replacement, inactive-window guards, teardown and the real quiet timer. The tracker does not retain discarded lists or publish row churn during scrolling.
+- PASS, implementation review: independent review found no actionable regressions in the list tracker, row appearance adapter or toolbar changes. Normal selection, collection drag payloads, scanner and removal behavior retain their existing implementations.
+
+### Design delivery gate
+
+- PASS, R-02/03/17/18/23/24/27/28/33/34/36/38: changes contain no marketing claims, fabricated content, new visual assets or dead navigation. Native empty, mapping and error states remain; this is a desktop-only app. Production changes are checked-in Swift source.
+- PASS, R-26/32/35 and C-2/4: the universal app was built and exercised in native windows. The recorded search, clear, keyboard-focus, folder-picker, Escape and Refresh checks cover the changed toolbar controls; selection and scrolling retain native behavior.
+- PASS, R-25: measured row text and outline contrast exceeds the applicable threshold; collection text remains at least 6.57:1 during drop feedback and 8.74:1 at rest.
+- PASS, purpose rules R-01/04/06/07/08/09/10/12/13/14/19/22: DESIGN.md records the map's data purpose, branch colors, native action symbols, system type, persistent selection and temporary hover. The icon was removed from the header as requested; no decorative replacement was added.
+- PASS, R-37 and liveliness: the established ENERGY 2 / RHYTHM 2 / MOTION 1 direction remains. The map is the focal point, coral marks actions and selection, and the fixed sidebar and inspector organize navigation and details.
+- PASS, C-1/3/5 and consistency rules R-05/11/15/16/20/21/29/30/31: the existing disk explorer composition, native labels, typography and charcoal/coral palette remain; graph colors encode filesystem branches. The footer keeps its functional drop area while removing its idle box.
+
+Tests use generated files in isolated bundles. Physical-device frame rate, VoiceOver and older macOS releases were not measured. Intel is compiled and packaged but not run locally.

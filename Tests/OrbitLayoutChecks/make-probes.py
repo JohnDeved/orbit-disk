@@ -7,7 +7,9 @@ def replace(a,b,n=1):
     global src
     assert a in src, a
     src=src.replace(a,b,n)
-replace('                header\n','                header.layoutProbe("header")\n')
+replace('ToolbarItem(placement: .navigation) { headerLocation }', 'ToolbarItem(placement: .navigation) { headerLocation.toolbarProbe("toolbar-location") }', 2)
+replace('ToolbarItem(placement: .primaryAction) { header }', 'ToolbarItem(placement: .primaryAction) { header.toolbarProbe("toolbar-actions") }', 2)
+replace('}.frame(width: 280, alignment: .leading)', '}.frame(width: 280, alignment: .leading).toolbarProbe("location")')
 replace('                collectionBar\n','                collectionBar.layoutProbe("tray")\n')
 replace('}.padding(.horizontal, 28).frame(height: 48)','}.padding(.horizontal, 28).frame(height: 48).layoutProbe("breadcrumb")')
 replace('.padding(.horizontal, 16).frame(maxWidth: .infinity, maxHeight: .infinity)','.padding(.horizontal, 16).frame(maxWidth: .infinity, maxHeight: .infinity).layoutProbe("map")')
@@ -15,9 +17,9 @@ replace('}.padding(.bottom, 12)','}.padding(.bottom, 12).layoutProbe("metrics")'
 replace('filePanel(node).frame(width: 340)','filePanel(node).frame(width: 340).layoutProbe("panel")')
 replace('            scanFooter\n','            scanFooter.layoutProbe("footer")\n')
 replace('            inspector\n','            inspector.layoutProbe("inspector")\n')
-replace('.padding(9).frame(width: 210, height: 34)','.padding(9).frame(width: 210, height: 34).layoutProbe("search")')
-replace('.pointingCursor().help("Refresh the full map (⌘R)").fixedSize()','.pointingCursor().help("Refresh the full map (⌘R)").fixedSize().layoutProbe("refresh")')
-replace('.pointingCursor().disabled(model.isRemoving).fixedSize()','.pointingCursor().disabled(model.isRemoving).fixedSize().layoutProbe("open-folder")')
+replace('.padding(9).frame(width: 210, height: 34)','.padding(9).frame(width: 210, height: 34).toolbarProbe("search")')
+replace('.pointingCursor().help("Refresh the full map (⌘R)").fixedSize()','.pointingCursor().help("Refresh the full map (⌘R)").fixedSize().toolbarProbe("refresh")')
+replace('.pointingCursor().disabled(model.isRemoving).fixedSize()','.pointingCursor().disabled(model.isRemoving).fixedSize().toolbarProbe("open-folder")')
 replace('.disabled(model.navigation.count < 2).help("Go up one folder (⌘[)")','.disabled(model.navigation.count < 2).help("Go up one folder (⌘[)").layoutProbe("up")')
 replace('.padding(.vertical, 7).padding(.horizontal, 5).contentShape(Rectangle())','.padding(.vertical, 7).padding(.horizontal, 5).layoutProbe("row:\\(item.id)").contentShape(Rectangle())')
 replace('}.frame(width: 76, alignment: .trailing)','}.frame(width: 76, alignment: .trailing).layoutProbe("row-size:\\(item.id)")')

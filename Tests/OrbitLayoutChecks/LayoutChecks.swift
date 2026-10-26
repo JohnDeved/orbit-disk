@@ -12,6 +12,22 @@ extension View {
             Color.clear.preference(key: FramePreference.self, value: [name: geometry.frame(in: .global)])
         })
     }
+    func toolbarProbe(_ name: String) -> some View {
+        background(ToolbarFrameProbe(name: name))
+    }
+}
+struct ToolbarFrameProbe: NSViewRepresentable {
+    let name: String
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        view.identifier = NSUserInterfaceItemIdentifier("orbit-layout:\(name)")
+        view.setAccessibilityElement(false)
+        return view
+    }
+    func updateNSView(_ view: NSView, context: Context) {}
+}
+final class LayoutWindow: NSWindow {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 @MainActor final class FrameRecorder {
     var frames: [String: CGRect] = [:]
@@ -66,17 +82,24 @@ final class LayoutGate: @unchecked Sendable {
         let empty = root.children.first { $0.id == emptyURL.path }!
         let longFolder = root.children.first { $0.id == longURL.path }!
         let recorder = FrameRecorder()
-        let window = NSWindow(contentRect: CGRect(x: -20_000, y: -20_000, width: 1280, height: 810), styleMask: [.borderless], backing: .buffered, defer: false)
+        let window = LayoutWindow(contentRect: CGRect(x: -20_000, y: -20_000, width: 1280, height: 810),
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                              backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
-        let host = NSHostingView(rootView: AnyView(EmptyView()))
-        window.contentView = host
+        window.toolbarStyle = .unified
+        window.titleVisibility = .hidden
+        let host = NSHostingController(rootView: AnyView(EmptyView()))
+        host.sizingOptions = []
+        window.contentViewController = host
         window.orderFront(nil)
         defer { window.close(); model.cancelScan() }
         var reports: [String: [String: [Double]]] = [:]
         var failures: [String] = []
-        let stable = ["header", "search", "refresh", "open-folder", "breadcrumb", "up", "map", "metrics", "panel", "inspector", "inspector-actions", "collect-action", "footer", "tray", "review-action"]
+        var installedSize = CGSize.zero
+        let stable = ["window", "header", "toolbar-location", "toolbar-actions", "location", "search", "refresh", "open-folder", "traffic-close", "traffic-minimize", "traffic-zoom", "breadcrumb", "up", "map", "metrics", "panel", "inspector", "inspector-actions", "collect-action", "footer", "tray", "review-action"]
         var maximumDelta = 0.0
         var rowHeightRange: ClosedRange<Double>?
+        var wideToolbarFrames: [String: CGRect] = [:]
         func serial(_ frames: [String: CGRect]) -> [String: [Double]] {
             frames.mapValues { [Double($0.minX), Double($0.minY), Double($0.width), Double($0.height)] }
         }
@@ -85,22 +108,81 @@ final class LayoutGate: @unchecked Sendable {
         }
         func settle() async throws {
             for _ in 0..<6 {
-                host.layoutSubtreeIfNeeded(); host.displayIfNeeded()
+                window.contentView?.superview?.layoutSubtreeIfNeeded()
+                host.view.layoutSubtreeIfNeeded(); host.view.displayIfNeeded()
                 try await Task.sleep(nanoseconds: 35_000_000)
             }
         }
         func install(_ view: AnyView, size: CGSize) {
+            installedSize = size
             recorder.frames = [:]
             host.rootView = AnyView(view.preferredColorScheme(.dark)
-                .frame(width: size.width, height: size.height)
                 .onPreferenceChange(FramePreference.self) { recorder.frames = $0; recorder.history.append($0) })
             window.setContentSize(size)
-            host.setFrameSize(size)
+        }
+        func toolbarFrames() -> [String: CGRect] {
+            var frames = ["window": CGRect(origin: .zero, size: window.frame.size)]
+            func windowFrame(_ view: NSView) -> CGRect {
+                let frame = view.convert(view.bounds, to: nil)
+                return CGRect(x: frame.minX, y: window.frame.height - frame.maxY, width: frame.width, height: frame.height)
+            }
+            func visit(_ view: NSView) {
+                guard !view.isHiddenOrHasHiddenAncestor else { return }
+                if let identifier = view.identifier?.rawValue, identifier.hasPrefix("orbit-layout:") {
+                    frames[String(identifier.dropFirst("orbit-layout:".count))] = windowFrame(view)
+                }
+                for child in view.subviews { visit(child) }
+            }
+            if let frameView = window.contentView?.superview { visit(frameView) }
+            for (name, type) in [("traffic-close", NSWindow.ButtonType.closeButton),
+                                 ("traffic-minimize", .miniaturizeButton), ("traffic-zoom", .zoomButton)] {
+                if let button = window.standardWindowButton(type) { frames[name] = windowFrame(button) }
+            }
+            let headerParts = ["location", "search", "refresh", "open-folder"].compactMap { frames[$0] }
+            if headerParts.count == 4 { frames["header"] = headerParts.reduce(CGRect.null) { $0.union($1) } }
+            return frames
+        }
+        func checkToolbar(_ label: String, _ frames: [String: CGRect]) {
+            let controls = ["header", "toolbar-location", "toolbar-actions", "location", "search", "refresh", "open-folder"]
+            guard let traffic = frames["traffic-close"] else { failures.append("Missing traffic lights: \(label)"); return }
+            for name in controls {
+                guard let frame = frames[name], frame.width > 0, frame.height > 0 else {
+                    failures.append("Missing native toolbar control \(name): \(label)"); continue
+                }
+                if abs(frame.midY - traffic.midY) > 1 {
+                    failures.append("\(label) \(name) is not aligned with traffic lights: \(frame.midY) vs \(traffic.midY)")
+                }
+                if frame.minX < 0 || frame.maxX > window.frame.width + 0.5 {
+                    failures.append("\(label) \(name) escapes toolbar width: \(frame)")
+                }
+                if frame.minY < -0.5 || frame.maxY > 52.5 {
+                    failures.append("\(label) \(name) escapes the 52pt titlebar height: \(frame)")
+                }
+            }
+            for (left, right) in [("traffic-zoom", "header"), ("location", "search"), ("search", "refresh"), ("refresh", "open-folder")] {
+                if let a = frames[left], let b = frames[right], a.maxX > b.minX + 0.5 {
+                    failures.append("\(label) toolbar controls overlap: \(left) \(a), \(right) \(b)")
+                }
+            }
+            if let location = frames["location"], let up = frames["up"], abs(location.minX - up.minX) > 1 {
+                failures.append("\(label) location does not align with content navigation: \(location.minX) vs \(up.minX)")
+            }
+            if let firstWindow = wideToolbarFrames["window"], let firstAction = wideToolbarFrames["open-folder"],
+               let action = frames["open-folder"], abs((firstWindow.width - firstAction.maxX) - (window.frame.width - action.maxX)) > 1 {
+                failures.append("\(label) toolbar actions lost their trailing alignment: \(action)")
+            }
         }
         func capture(_ key: String) async throws -> [String: CGRect] {
             try await settle()
-            let frames = recorder.frames
+            if abs(window.frame.width - installedSize.width) > 0.5 || abs(window.frame.height - installedSize.height) > 0.5 {
+                failures.append("Harness window resized unexpectedly: \(key) \(window.frame.size), expected \(installedSize)")
+            }
+            let frames = recorder.frames.merging(toolbarFrames(), uniquingKeysWith: { _, native in native })
+            if key.hasSuffix("/root") || key.hasSuffix("/resize-back") {
+                print("TOOLBAR \(key): \(window.toolbar?.visibleItems?.count ?? 0) visible items; header \(String(describing: frames["header"]))")
+            }
             reports[key] = serial(frames)
+            if !key.hasPrefix("collection/") { checkToolbar(key, frames) }
             for (_, frame) in frames where frame.height < 0 || frame.width < 0 { failures.append("Negative frame: \(key) \(frame)") }
             return frames
         }
@@ -148,6 +230,7 @@ final class LayoutGate: @unchecked Sendable {
             try await wait("root") { model.current?.id == root.id && !model.isOpeningFolder }
             install(AnyView(ContentView(model: model)), size: size)
             let baseline = try await capture(prefix + "/root")
+            if size.width == 1280 { wideToolbarFrames = baseline }
             model.selectedID = short.id
             compare(prefix+"/file-selection", baseline, try await capture(prefix+"/file-selection"))
             model.selectedID = folder.id
@@ -196,6 +279,10 @@ final class LayoutGate: @unchecked Sendable {
             compare(prefix+"/partial-complete", baseline, try await capture(prefix+"/partial-complete"))
             partial.cancelScan()
         }
+        installedSize = CGSize(width: 1280, height: 810)
+        window.setContentSize(installedSize)
+        compare("1280x810/resize-back", wideToolbarFrames, try await capture("1280x810/resize-back"),
+                names: ["window", "header", "toolbar-location", "toolbar-actions", "location", "search", "refresh", "open-folder", "traffic-close", "traffic-minimize", "traffic-zoom"])
         model.showCollection = true
         let modalSize = CGSize(width: 720, height: 470)
         install(AnyView(CollectionView(model: model)), size: modalSize)
