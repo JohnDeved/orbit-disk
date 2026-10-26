@@ -58,7 +58,9 @@ private final class CaptureWindow: NSWindow {
 
 @main struct MarketingCapture {
     @MainActor static func main() async throws {
-        precondition(CommandLine.arguments.count == 2, "Usage: MarketingCapture OUTPUT_DIRECTORY")
+        precondition(CommandLine.arguments.count == 4 && CommandLine.arguments[2] == "-AppleLocale" && CommandLine.arguments[3] == "en_US",
+                     "Usage: MarketingCapture OUTPUT_DIRECTORY -AppleLocale en_US")
+        precondition(Locale.current.identifier.hasPrefix("en_US"), "Marketing capture requires the en_US locale")
         let output = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
         let app = NSApplication.shared
@@ -85,8 +87,9 @@ private final class CaptureWindow: NSWindow {
         window.setContentSize(NSSize(width: 1280, height: 810))
         defer { window.close() }
 
-        func capture(_ name: String, selected: DiskNode, collected: [DiskNode]) async throws {
+        func capture(_ name: String, selected: DiskNode, collected: [DiskNode], folder: DiskNode? = nil) async throws {
             model.installMarketingFixture(root: root, selected: selected, collected: collected)
+            if let folder { model.installMarketingFolder(root: root, folder: folder) }
             for _ in 0..<8 {
                 window.contentView?.superview?.layoutSubtreeIfNeeded()
                 host.view.layoutSubtreeIfNeeded()
@@ -118,5 +121,43 @@ private final class CaptureWindow: NSWindow {
         }
         try await capture("orbit-overview.png", selected: projects, collected: [])
         try await capture("orbit-collection.png", selected: downloads, collected: [downloads])
+        try await capture("orbit-projects.png", selected: projects.children[0], collected: [], folder: projects)
+
+        model.installMarketingFixture(root: root, selected: downloads, collected: [downloads])
+        let reviewWindow = CaptureWindow(contentRect: CGRect(x: -20_000, y: -20_000, width: 720, height: 470),
+                                         styleMask: [.borderless], backing: .buffered, defer: false)
+        reviewWindow.appearance = NSAppearance(named: .darkAqua)
+        let reviewHost = NSHostingController(rootView: CollectionView(model: model)
+            .preferredColorScheme(.dark).environment(\.controlActiveState, .key))
+        reviewHost.sizingOptions = []
+        reviewWindow.contentViewController = reviewHost
+        reviewWindow.setContentSize(NSSize(width: 720, height: 470))
+        reviewWindow.orderFront(nil)
+        defer { reviewWindow.close() }
+        for _ in 0..<12 {
+            reviewHost.view.layoutSubtreeIfNeeded()
+            reviewHost.view.displayIfNeeded()
+            try await Task.sleep(nanoseconds: 30_000_000)
+        }
+        let reviewView = reviewHost.view
+        guard let bitmap = reviewView.bitmapImageRepForCachingDisplay(in: reviewView.bounds),
+              bitmap.pixelsWide >= 720, bitmap.pixelsHigh >= 470 else {
+            fatalError("Cannot render the collection review")
+        }
+        reviewView.cacheDisplay(in: reviewView.bounds, to: bitmap)
+        var reviewSamples = Set<String>()
+        for x in stride(from: 20, to: bitmap.pixelsWide, by: 80) {
+            for y in stride(from: 20, to: bitmap.pixelsHigh, by: 80) {
+                if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) {
+                    reviewSamples.insert("\(Int(color.redComponent * 255)),\(Int(color.greenComponent * 255)),\(Int(color.blueComponent * 255))")
+                }
+            }
+        }
+        guard reviewSamples.count > 5 else { fatalError("Collection review screenshot is blank or incomplete") }
+        guard let png = bitmap.representation(using: .png, properties: [:]) else {
+            fatalError("Cannot encode the collection review")
+        }
+        try png.write(to: output.appendingPathComponent("orbit-review.png"), options: .atomic)
+        print("Captured orbit-review.png: \(bitmap.pixelsWide) × \(bitmap.pixelsHigh)")
     }
 }

@@ -35,7 +35,7 @@ jobs:
         run: ./scripts/capture-marketing.sh
       - name: Commit updated screenshots
         run: |
-          git add docs/screenshots/orbit-overview.png docs/screenshots/orbit-collection.png
+          git add docs/screenshots/orbit-overview.png docs/screenshots/orbit-collection.png docs/art/orbit-navigate.png docs/art/orbit-collect.png
           if git diff --cached --quiet; then exit 0; fi
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Update README screenshots'
           git pull --rebase origin main

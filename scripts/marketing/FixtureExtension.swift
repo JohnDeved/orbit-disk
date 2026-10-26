@@ -1,5 +1,10 @@
 
 @MainActor extension DiskModel {
+    func installMarketingFolder(root: DiskNode, folder: DiskNode) {
+        navigation = [root, folder]
+        childColorIndices = Dictionary(uniqueKeysWithValues: folder.children.enumerated().map { ($0.element.id, $0.offset) })
+    }
+
     func installMarketingFixture(root: DiskNode, selected: DiskNode, collected: [DiskNode]) {
         self.root = root
         navigation = [root]
