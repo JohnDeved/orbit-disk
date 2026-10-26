@@ -238,7 +238,7 @@ struct ContentView: View {
                     }
                     .font(.system(size: 10)).foregroundStyle(OrbitStyle.muted)
                     .padding(.bottom, 10)
-                    Text(model.isPartialMap ? (model.isScanning ? "Explore now · Collect finished items · Sizes update as mapping continues" : "Explore partial results · Restart mapping to finish") : "Drag any segment to collect · Click a folder to open · Center to go up")
+                    Text(model.isPartialMap ? (model.isScanning ? "Explore now · Collect finished items · Sizes update as mapping continues" : "Explore partial results · Restart mapping to finish") : "")
                         .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted)
                         .lineLimit(2).multilineTextAlignment(.center)
                         .frame(maxWidth: .infinity).frame(height: 28)

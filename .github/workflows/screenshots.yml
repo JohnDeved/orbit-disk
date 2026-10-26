@@ -1,0 +1,42 @@
+name: Refresh README screenshots
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Sources/OrbitDisk/**'
+      - 'Sources/OrbitCore/**'
+      - 'Assets/**'
+      - 'Config/**'
+      - 'Package.swift'
+      - 'Package.resolved'
+      - 'scripts/capture-marketing.sh'
+      - 'scripts/marketing/**'
+      - '.github/workflows/screenshots.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: readme-screenshots
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Render the app with sample data
+        run: ./scripts/capture-marketing.sh
+      - name: Commit updated screenshots
+        run: |
+          git add docs/screenshots/orbit-overview.png docs/screenshots/orbit-collection.png
+          if git diff --cached --quiet; then exit 0; fi
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'Update README screenshots'
+          git pull --rebase origin main
+          git push origin HEAD:main

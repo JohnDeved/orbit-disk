@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="54" viewBox="0 0 240 54" role="img" aria-labelledby="title">
+  <title id="title">Download Orbit Disk</title>
+  <rect x="1" y="1" width="238" height="52" rx="14" fill="#ff9877"/>
+  <path d="M27 16v16m-6-6 6 6 6-6M19 36h16" fill="none" stroke="#171b22" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="45" y="33" fill="#171b22" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" font-size="16" font-weight="650">Download Orbit Disk</text>
+</svg>
