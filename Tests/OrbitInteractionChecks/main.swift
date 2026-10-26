@@ -29,8 +29,8 @@ let metrics = SunburstMetrics(size: CGSize(width: 400, height: 400))
 func point(_ sector: SunburstSegment) -> CGPoint {
     let radius = metrics.innerRadius + (CGFloat(sector.depth) + 0.5) * metrics.ringWidth
     let angle = (sector.start + sector.end) / 2 - .pi / 2
-    return CGPoint(x: metrics.center.x + CGFloat(Darwin.cos(angle)) * radius,
-                   y: metrics.center.y + CGFloat(Darwin.sin(angle)) * radius)
+    return CGPoint(x: metrics.center.x + cos(angle) * radius,
+                   y: metrics.center.y + sin(angle) * radius)
 }
 let partialCoverage = CollectionCoverage(paths: [group.members[0].id])
 let groupedCoverage = CollectionCoverage(paths: group.members.map(\.id))

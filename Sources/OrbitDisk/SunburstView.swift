@@ -371,11 +371,10 @@ struct SunburstSegment {
         let radius = metrics.innerRadius + CGFloat(depth) * metrics.ringWidth + 1.4 + width / 2
         let inset = min((end - start) * 0.17, 1.2 / Double(radius))
         let halfSweep = max(0, (end - start) / 2 - inset)
-        let availableWidth = 2 * radius * CGFloat(Darwin.sin(min(.pi / 2, halfSweep)))
+        let availableWidth = 2 * radius * sin(min(.pi / 2, halfSweep))
         guard width >= diameter + 4, availableWidth >= diameter + 4 else { return nil }
         let angle = (start + end) / 2 - .pi / 2
-        return CGPoint(x: metrics.center.x + radius * CGFloat(Darwin.cos(angle)),
-                       y: metrics.center.y + radius * CGFloat(Darwin.sin(angle)))
+        return CGPoint(x: metrics.center.x + radius * cos(angle), y: metrics.center.y + radius * sin(angle))
     }
 
     func path(metrics: SunburstMetrics) -> Path {
