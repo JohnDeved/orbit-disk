@@ -8,6 +8,8 @@ Push a stable `vX.Y.Z` tag to publish a universal app for macOS 14 or later. The
 
 Assets are uploaded to a draft before it becomes the latest public release. The app reads `https://github.com/JohnDeved/orbit-disk/releases/latest/download/appcast.xml`; users do not need GitHub credentials. Existing releases are never overwritten.
 
+Both workflows use the `macos-26` runner and explicitly select Xcode 26.6 through `DEVELOPER_DIR`. They print the Xcode and Swift versions in the job log. This build environment does not raise the app's macOS 14 deployment target.
+
 ## Version and tag
 
 1. Change `CFBundleShortVersionString` in `Config/Info.plist` to the new version and increase the integer `CFBundleVersion`. Both must be newer than previous release tags. For example, after version `0.9.0`, build `12`, use version `0.9.1`, build `13`.
