@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024"
+     viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
+  <title id="title">Orbit Disk: Night</title>
+  <desc id="description">A satin charcoal tile with a softly bevelled coral disk and an ivory orbital ring.</desc>
+  <defs>
+    <radialGradient id="tile" cx="256" cy="128" r="976" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3C4655"/>
+      <stop offset=".52" stop-color="#272F3B"/>
+      <stop offset="1" stop-color="#171D26"/>
+    </radialGradient>
+    <linearGradient id="tile-edge" x1="192" y1="96" x2="832" y2="928" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#BBC9D9" stop-opacity=".42"/>
+      <stop offset=".4" stop-color="#68788D" stop-opacity=".12"/>
+      <stop offset="1" stop-color="#090D14" stop-opacity=".72"/>
+    </linearGradient>
+    <radialGradient id="planet" cx="-88" cy="-120" r="416" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFBE91"/>
+      <stop offset=".42" stop-color="#FF996F"/>
+      <stop offset=".78" stop-color="#F47B54"/>
+      <stop offset="1" stop-color="#DF593A"/>
+    </radialGradient>
+    <linearGradient id="planet-edge" x1="-160" y1="-192" x2="160" y2="192" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFE5BD" stop-opacity=".76"/>
+      <stop offset=".45" stop-color="#FFD5A6" stop-opacity=".12"/>
+      <stop offset="1" stop-color="#B8412D" stop-opacity=".62"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="-104" y1="-309" x2="104" y2="309" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFCEE"/>
+      <stop offset=".44" stop-color="#FFF5DE"/>
+      <stop offset="1" stop-color="#E8D3B1"/>
+    </linearGradient>
+    <linearGradient id="ring-edge" x1="-104" y1="-309" x2="104" y2="309" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFF4"/>
+      <stop offset=".4" stop-color="#F9EACA"/>
+      <stop offset="1" stop-color="#B99B73"/>
+    </linearGradient>
+    <pattern id="satin" width="64" height="16" patternUnits="userSpaceOnUse">
+      <path d="M0 2H64M0 9H64" stroke="#DDE8F5" stroke-width=".5" opacity=".022"/>
+      <path d="M0 5H64M0 14H64" stroke="#080D15" stroke-width=".5" opacity=".035"/>
+    </pattern>
+    <ellipse id="orbit-path" rx="360" ry="128" fill="none"/>
+    <g id="orbit">
+      <use href="#orbit-path" stroke="url(#ring-edge)" stroke-width="48"/>
+      <use href="#orbit-path" stroke="url(#ring)" stroke-width="44"/>
+    </g>
+    <clipPath id="front-half" clipPathUnits="userSpaceOnUse">
+      <rect x="-512" width="1024" height="512"/>
+    </clipPath>
+    <clipPath id="planet-clip">
+      <circle r="224"/>
+    </clipPath>
+    <clipPath id="ring-overlap">
+      <circle r="228"/>
+    </clipPath>
+    <filter id="contact-shadow" x="-10%" y="-20%" width="120%" height="140%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="3"/>
+    </filter>
+  </defs>
+  <rect x="96" y="96" width="832" height="832" rx="192" fill="url(#tile)"/>
+  <rect x="96" y="96" width="832" height="832" rx="192" fill="url(#satin)"/>
+  <rect x="97" y="97" width="830" height="830" rx="191" fill="none" stroke="url(#tile-edge)" stroke-width="2"/>
+  <g transform="translate(512 512)">
+    <g transform="rotate(-24)">
+      <use href="#orbit"/>
+    </g>
+    <circle r="224" fill="url(#planet)"/>
+    <circle r="222" fill="none" stroke="url(#planet-edge)" stroke-width="4"/>
+    <g clip-path="url(#planet-clip)">
+      <g transform="translate(0 8) rotate(-24)" clip-path="url(#front-half)">
+        <use href="#orbit-path" stroke="#612919" stroke-width="48" opacity=".26" filter="url(#contact-shadow)"/>
+      </g>
+    </g>
+    <g clip-path="url(#ring-overlap)">
+      <g transform="rotate(-24)">
+        <use href="#orbit" clip-path="url(#front-half)"/>
+      </g>
+    </g>
+  </g>
+</svg>
