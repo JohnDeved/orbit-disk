@@ -17,9 +17,32 @@ private struct IndexedFolder: Sendable {
     let ancestors: [DiskNode]
 }
 
-private struct MapHoverPresentation {
+struct MapHoverPresentation {
     let relatedRowIDs: Set<String>
     let description: String?
+}
+
+final class GroupedMapHoverCache {
+    private struct Entry {
+        let members: [DiskNode]
+        let presentation: MapHoverPresentation
+    }
+    private var entries: [String: Entry] = [:]
+
+    func presentation(groupID: String, members: [DiskNode], make: () -> MapHoverPresentation) -> MapHoverPresentation {
+        if let entry = entries[groupID], entry.members.count == members.count,
+           entry.members.withUnsafeBufferPointer({ cached in
+               members.withUnsafeBufferPointer { cached.baseAddress == $0.baseAddress }
+           }) {
+            return entry.presentation
+        }
+        let presentation = make()
+        // Retaining the immutable members keeps their storage alive; changed values use a different buffer.
+        entries[groupID] = Entry(members: members, presentation: presentation)
+        return presentation
+    }
+
+    func removeAll() { entries.removeAll(keepingCapacity: true) }
 }
 
 private struct CollectionEligibility {
@@ -115,7 +138,12 @@ final class DiskModel: ObservableObject {
     @Published var navigation: [DiskNode] = [] {
         didSet { invalidateDisplayedNodes() }
     }
-    @Published private(set) var mapRevision = UUID()
+    @Published private(set) var mapRevision = UUID() {
+        didSet {
+            mapHoverPresentationCache = nil
+            groupedMapHoverCache.removeAll()
+        }
+    }
     @Published var selectedID: String?
     @Published var isScanning = false
     @Published private(set) var isPartialMap = false
@@ -149,7 +177,9 @@ final class DiskModel: ObservableObject {
     @Published var hoveredMapNodes: [DiskNode] = [] {
         didSet { mapHoverPresentationCache = nil }
     }
-    @Published var hoveredMapGroupID: String?
+    @Published var hoveredMapGroupID: String? {
+        didSet { if hoveredMapGroupID != oldValue { mapHoverPresentationCache = nil } }
+    }
     @Published var hoveredListID: String?
     @Published var showCollection = false
     @Published var confirmTrash = false
@@ -199,6 +229,7 @@ final class DiskModel: ObservableObject {
     private var displayedNodesCache: [DiskNode]?
     private var displayedIDsCache: Set<String>?
     private var mapHoverPresentationCache: MapHoverPresentation?
+    private let groupedMapHoverCache = GroupedMapHoverCache()
     private(set) var childColorIndices: [String: Int] = [:]
 
     init(cacheDirectory: URL? = nil, preferences: UserDefaults = .standard,
@@ -234,12 +265,30 @@ final class DiskModel: ObservableObject {
     var mapRelatedRowIDs: Set<String> { mapHoverPresentation.relatedRowIDs }
     var mapHoverDescription: String? { mapHoverPresentation.description }
 
+    func setMapHover(nodes: [DiskNode]?, groupID: String?) {
+        if let nodes { hoveredMapNodes = nodes }
+        else if !hoveredMapNodes.isEmpty { hoveredMapNodes = [] }
+        if hoveredMapGroupID != groupID { hoveredMapGroupID = groupID }
+        if nodes != nil, hoveredListID != nil { hoveredListID = nil }
+    }
+
     private var mapHoverPresentation: MapHoverPresentation {
         if let cached = mapHoverPresentationCache { return cached }
+        let presentation: MapHoverPresentation
+        if let groupID = hoveredMapGroupID, !hoveredMapNodes.isEmpty {
+            presentation = groupedMapHoverCache.presentation(groupID: groupID, members: hoveredMapNodes) {
+                makeMapHoverPresentation()
+            }
+        } else {
+            presentation = makeMapHoverPresentation()
+        }
+        mapHoverPresentationCache = presentation
+        return presentation
+    }
+
+    private func makeMapHoverPresentation() -> MapHoverPresentation {
         guard let first = hoveredMapNodes.first, let current else {
-            let empty = MapHoverPresentation(relatedRowIDs: [], description: nil)
-            mapHoverPresentationCache = empty
-            return empty
+            return MapHoverPresentation(relatedRowIDs: [], description: nil)
         }
         let displayedIDs: Set<String>
         if let cached = displayedIDsCache { displayedIDs = cached }
@@ -273,9 +322,7 @@ final class DiskModel: ObservableObject {
         }
         let description = hoveredMapNodes.count == 1 ? relativeHoverPath(firstPath)
             : "\(hoveredMapNodes.count) items in \(relativeHoverPath(commonParent))"
-        let presentation = MapHoverPresentation(relatedRowIDs: related, description: description)
-        mapHoverPresentationCache = presentation
-        return presentation
+        return MapHoverPresentation(relatedRowIDs: related, description: description)
     }
 
     private static func parentPath(_ path: String) -> String {
@@ -287,6 +334,7 @@ final class DiskModel: ObservableObject {
         displayedNodesCache = nil
         displayedIDsCache = nil
         mapHoverPresentationCache = nil
+        groupedMapHoverCache.removeAll()
     }
 
     private func relativeHoverPath(_ path: String) -> String {
@@ -299,9 +347,8 @@ final class DiskModel: ObservableObject {
     }
 
     private func clearHover() {
-        hoveredMapNodes = []
-        hoveredMapGroupID = nil
-        hoveredListID = nil
+        setMapHover(nodes: nil, groupID: nil)
+        if hoveredListID != nil { hoveredListID = nil }
     }
 
     func canCollect(_ node: DiskNode) -> Bool {

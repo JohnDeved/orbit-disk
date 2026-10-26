@@ -40,6 +40,7 @@ Use Swift 6.3 or later command-line tools or Xcode, Python 3, and macOS. CI uses
 swift run -c release OrbitCoreChecks
 ./check-app.sh
 ./check-updater.sh
+./check-rendering.sh
 ./check-layout.sh
 python3 scripts/test-release.py
 python3 Tests/test_update_copy.py

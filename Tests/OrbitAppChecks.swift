@@ -71,6 +71,76 @@ private final class PreviewGate: @unchecked Sendable {
         }
     }
 
+    @MainActor static func checkGroupedHoverCaching(base: URL, preferences: UserDefaults) {
+        let rootURL = base.appendingPathComponent("hover-fixture")
+        func leaf(_ name: String, identity: String = "1:1") -> DiskNode {
+            DiskNode(url: rootURL.appendingPathComponent(name), name: name, isDirectory: false,
+                     size: 1, allocatedSize: 1, fileCount: 1, fileIdentity: identity)
+        }
+        let zeta = leaf("zeta.bin")
+        let alpha = leaf("alpha.bin", identity: "1:2")
+        let members = [zeta, alpha]
+        let groupID = "group:\(rootURL.path)"
+        let cache = GroupedMapHoverCache()
+        var computations = 0
+        func presentation(_ nodes: [DiskNode]) -> MapHoverPresentation {
+            cache.presentation(groupID: groupID, members: nodes) {
+                computations += 1
+                return MapHoverPresentation(relatedRowIDs: Set(nodes.map(\.id)),
+                                            description: nodes.compactMap(\.fileIdentity).joined(separator: ","))
+            }
+        }
+        precondition(presentation(members).relatedRowIDs == [zeta.id, alpha.id])
+        for _ in 0..<100 { _ = presentation(members) }
+        precondition(computations == 1, "Unchanged grouped members must reuse their presentation")
+        var changed = members
+        changed[0] = leaf("replacement.bin")
+        precondition(presentation(changed).relatedRowIDs == [changed[0].id, alpha.id] && computations == 2,
+                     "Equal-count membership changes must invalidate a same-ID group")
+        changed[0] = leaf("replacement.bin", identity: "1:99")
+        precondition(presentation(changed).description == "1:99,1:2" && computations == 3,
+                     "Changed metadata must not reuse the previous member buffer")
+        cache.removeAll()
+        _ = presentation(changed)
+        precondition(computations == 4)
+
+        func folder(_ name: String, children: [DiskNode]) -> DiskNode {
+            DiskNode(url: rootURL, name: name, isDirectory: true, size: 2, allocatedSize: 2,
+                     fileCount: 2, children: children)
+        }
+        let root = folder("Fixture", children: members)
+        let model = DiskModel(cacheDirectory: base.appendingPathComponent("hover-cache"), preferences: preferences)
+        model.root = root
+        model.navigation = [root]
+        model.setMapHover(nodes: members, groupID: groupID)
+        precondition(model.mapRelatedRowIDs == [zeta.id, alpha.id])
+        model.setMapHover(nodes: nil, groupID: nil)
+        precondition(model.mapRelatedRowIDs.isEmpty && model.mapHoverDescription == nil)
+        model.setMapHover(nodes: members, groupID: groupID)
+        precondition(model.mapRelatedRowIDs == [zeta.id, alpha.id])
+        model.setMapHover(nodes: changed, groupID: groupID)
+        precondition(model.mapRelatedRowIDs == [alpha.id], "Changed group membership must reach the model")
+        model.setMapHover(nodes: members, groupID: groupID)
+        model.navigation = [folder("Renamed fixture", children: [alpha])]
+        precondition(model.mapRelatedRowIDs == [alpha.id] && model.mapHoverDescription == "2 items in Renamed fixture",
+                     "Same-path navigation metadata and children must invalidate cached group relations")
+        model.navigation = [root]
+        model.query = "bin"
+        model.searchResults = [zeta]
+        model.setMapHover(nodes: members, groupID: groupID)
+        precondition(model.mapRelatedRowIDs == [zeta.id])
+        model.searchResults = [alpha]
+        precondition(model.mapRelatedRowIDs == [alpha.id], "Equal-count search changes must invalidate group relations")
+        model.query = ""
+        model.setMapHover(nodes: members, groupID: groupID)
+        precondition(model.mapRelatedRowIDs == [zeta.id, alpha.id], "Leaving search must restore folder relations")
+        precondition(model.displayedNodes.first { model.mapRelatedRowIDs.contains($0.id) }?.id == zeta.id)
+        model.sortByName = true
+        precondition(model.displayedNodes.first { model.mapRelatedRowIDs.contains($0.id) }?.id == alpha.id,
+                     "Cached group relations must not pin the scroll target to the previous sort order")
+        print("PASS: grouped hover reuse, equal-count membership and metadata changes, hover exit, navigation, filtering, and sorting")
+    }
+
     @MainActor static func checkProgressiveMapping(base: URL, preferences: UserDefaults) async throws {
         let fm = FileManager.default
         let root = base.appendingPathComponent("progressive-fixture")
@@ -540,6 +610,7 @@ private final class PreviewGate: @unchecked Sendable {
         let suite = "local.orbitdisk.modelcheck.\(UUID().uuidString)"
         let prefs = UserDefaults(suiteName: suite)!
         defer { prefs.removePersistentDomain(forName: suite) }
+        checkGroupedHoverCaching(base: base, preferences: prefs)
         let model = DiskModel(cacheDirectory: cache, preferences: prefs)
         model.scan(root)
         try await wait("first map") { model.root != nil && !model.isScanning }

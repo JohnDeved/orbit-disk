@@ -71,12 +71,77 @@ final class SunburstPreparedLayout {
 }
 
 struct SunburstPresentation {
+    let revision = UUID()
     let layout: SunburstPreparedLayout
     let collectionStates: [CollectionState]
     let rootCollectionState: CollectionState
 
     func collectionState(for id: String) -> CollectionState {
         layout.index(for: id).map { collectionStates[$0] } ?? .none
+    }
+}
+
+struct SunburstBaseLayer: View, Equatable {
+    let presentation: SunburstPresentation
+    let metrics: SunburstMetrics
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.presentation.revision == rhs.presentation.revision && lhs.metrics == rhs.metrics
+    }
+
+    var body: some View {
+        Canvas { context, _ in
+            if presentation.layout.segments.isEmpty {
+                let radius = metrics.innerRadius + 13
+                let ring = Path(ellipseIn: CGRect(x: metrics.center.x - radius, y: metrics.center.y - radius,
+                                                  width: radius * 2, height: radius * 2))
+                context.stroke(ring, with: .color(.white.opacity(0.12)), lineWidth: 18)
+            }
+
+            for (index, segment) in presentation.layout.segments.enumerated() {
+                let path = segment.path(metrics: metrics)
+                let color = segment.node == nil
+                    ? Color(red: 0.52, green: 0.55, blue: 0.61)
+                    : DiskPalette.color(for: segment.branchIndex, depth: segment.depth)
+                context.fill(path, with: .color(color))
+                drawCollectionState(presentation.collectionStates[index], segment: segment,
+                                    path: path, context: context)
+            }
+        }
+    }
+
+    private func drawCollectionState(_ state: CollectionState, segment: SunburstSegment,
+                                     path: Path, context: GraphicsContext) {
+        guard state != .none else { return }
+        let ink = Color(red: 5 / 255.0, green: 7 / 255.0, blue: 10 / 255.0)
+        if state == .included {
+            var clipped = context
+            clipped.clip(to: path)
+            let bounds = path.boundingRect
+            var hatch = Path()
+            for x in stride(from: bounds.minX - bounds.height, through: bounds.maxX, by: 8) {
+                hatch.move(to: CGPoint(x: x, y: bounds.minY))
+                hatch.addLine(to: CGPoint(x: x + bounds.height, y: bounds.maxY))
+            }
+            clipped.stroke(hatch, with: .color(ink), lineWidth: 1.5)
+        }
+
+        let diameter: CGFloat = state == .included ? 16 : 14
+        guard let point = segment.collectionMarkerCenter(metrics: metrics, diameter: diameter) else { return }
+        let radius = diameter / 2
+        let badge = Path(ellipseIn: CGRect(x: point.x - radius, y: point.y - radius,
+                                          width: diameter, height: diameter))
+        context.fill(badge, with: .color(ink))
+        var glyph = Path()
+        if state == .included {
+            glyph.move(to: CGPoint(x: point.x - radius * 0.45, y: point.y))
+            glyph.addLine(to: CGPoint(x: point.x - radius * 0.1, y: point.y + radius * 0.35))
+            glyph.addLine(to: CGPoint(x: point.x + radius * 0.48, y: point.y - radius * 0.35))
+        } else {
+            glyph.move(to: CGPoint(x: point.x - radius * 0.42, y: point.y))
+            glyph.addLine(to: CGPoint(x: point.x + radius * 0.42, y: point.y))
+        }
+        context.stroke(glyph, with: .color(.white), style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
     }
 }
 
@@ -131,37 +196,24 @@ struct SunburstView: View {
         GeometryReader { geometry in
             let metrics = SunburstMetrics(size: geometry.size)
             let active = activeSegment
-            let selectedSegmentID = presentation.layout.segment(for: selectedID)?.id
+            let selected = presentation.layout.segment(for: selectedID)
 
             ZStack {
-                Canvas { context, _ in
-                    if segments.isEmpty {
-                        let ring = Path(ellipseIn: CGRect(
-                            x: metrics.center.x - metrics.innerRadius - 13,
-                            y: metrics.center.y - metrics.innerRadius - 13,
-                            width: (metrics.innerRadius + 13) * 2,
-                            height: (metrics.innerRadius + 13) * 2
-                        ))
-                        context.stroke(ring, with: .color(.white.opacity(0.12)), lineWidth: 18)
-                    }
-
-                    for (index, segment) in segments.enumerated() {
-                        let path = segment.path(metrics: metrics)
-                        let isRelated = active == nil || active?.branchIndex == segment.branchIndex
-                        let color = segment.node == nil
-                            ? Color(red: 0.52, green: 0.55, blue: 0.61)
-                            : DiskPalette.color(for: segment.branchIndex, depth: segment.depth)
-                        context.fill(path, with: .color(color.opacity(isRelated ? 1 : 0.9)))
-                        drawCollectionState(presentation.collectionStates[index], segment: segment,
-                                            path: path, metrics: metrics, context: context)
-                        if segment.id == active?.id || segment.id == selectedSegmentID {
-                            context.stroke(path, with: .color(.white.opacity(0.95)), lineWidth: 2)
-                        }
-                    }
-                }
+                SunburstBaseLayer(presentation: presentation, metrics: metrics).equatable()
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel("Storage map for \(root.name)")
                 .accessibilityValue("\(SunburstText.size(root.size, state: root.scanState)), \(root.fileCount) \(root.fileCount == 1 ? "file" : "files")\(root.isScanComplete ? "" : " mapped so far"). Folder contents are available in the file list.")
+
+                Canvas { context, _ in
+                    if let active {
+                        context.stroke(active.path(metrics: metrics), with: .color(.white.opacity(0.95)), lineWidth: 2)
+                    }
+                    if let selected, selected.id != active?.id {
+                        context.stroke(selected.path(metrics: metrics), with: .color(.white.opacity(0.95)), lineWidth: 2)
+                    }
+                }
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
 
                 MapInteractionView(rootID: root.id, layoutRevision: presentation.layout.revision,
                                    segments: segments, metrics: metrics, canGoBack: canGoBack,
@@ -184,40 +236,6 @@ struct SunburstView: View {
             onHover(nil, nil)
         }
         .onChange(of: selectedID) { _, _ in pinnedGroupID = nil }
-    }
-
-    private func drawCollectionState(_ state: CollectionState, segment: SunburstSegment,
-                                     path: Path, metrics: SunburstMetrics, context: GraphicsContext) {
-        guard state != .none else { return }
-        let ink = Color(red: 5 / 255.0, green: 7 / 255.0, blue: 10 / 255.0)
-        if state == .included {
-            var clipped = context
-            clipped.clip(to: path)
-            let bounds = path.boundingRect
-            var hatch = Path()
-            for x in stride(from: bounds.minX - bounds.height, through: bounds.maxX, by: 8) {
-                hatch.move(to: CGPoint(x: x, y: bounds.minY))
-                hatch.addLine(to: CGPoint(x: x + bounds.height, y: bounds.maxY))
-            }
-            clipped.stroke(hatch, with: .color(ink), lineWidth: 1.5)
-        }
-
-        let diameter: CGFloat = state == .included ? 16 : 14
-        guard let point = segment.collectionMarkerCenter(metrics: metrics, diameter: diameter) else { return }
-        let radius = diameter / 2
-        let badge = Path(ellipseIn: CGRect(x: point.x - radius, y: point.y - radius,
-                                          width: diameter, height: diameter))
-        context.fill(badge, with: .color(ink))
-        var glyph = Path()
-        if state == .included {
-            glyph.move(to: CGPoint(x: point.x - radius * 0.45, y: point.y))
-            glyph.addLine(to: CGPoint(x: point.x - radius * 0.1, y: point.y + radius * 0.35))
-            glyph.addLine(to: CGPoint(x: point.x + radius * 0.48, y: point.y - radius * 0.35))
-        } else {
-            glyph.move(to: CGPoint(x: point.x - radius * 0.42, y: point.y))
-            glyph.addLine(to: CGPoint(x: point.x + radius * 0.42, y: point.y))
-        }
-        context.stroke(glyph, with: .color(.white), style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
     }
 
     @ViewBuilder

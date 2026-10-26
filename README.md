@@ -68,6 +68,7 @@ Install Apple's Swift command-line tools or Xcode with Swift 6.3 or later, plus 
 swift run OrbitCoreChecks
 ./check-app.sh
 ./check-updater.sh
+./check-rendering.sh
 ./check-layout.sh
 python3 scripts/test-release.py
 python3 Tests/test_update_copy.py
@@ -80,6 +81,8 @@ The build script creates `../Orbit Disk.app`, includes the Night app icon and pi
 GitHub Actions builds and checks pushes to `main` and pull requests. Version tags create universal GitHub releases. See [RELEASING.md](RELEASING.md) for the version, signing, and publishing steps.
 
 `OrbitCoreChecks` is a dependency-free test executable so the tests run with Command Line Tools alone, even when XCTest is unavailable. It creates temporary fixtures and checks metadata, bulk/fallback parity, resource forks, sparse files, hard links, Unicode, cancellation, unreadable roots, cleanup policy, persistent indexes, incremental updates, stale revisions, and cancellation during index writes. Progressive checks cover discovery states, preview bounds and exact completed totals. `check-app.sh` checks the app model with real filesystem events, including live changes, cached relaunch, offline replay, and navigation/collection retention. It also checks partial browsing, stop/restart, save failures, gesture-held updates, linked hover, private drag tokens, grouped collection, duplicate prevention, stale identities, large-drop validation/cancellation, and native chart hit testing and gesture thresholds.
+
+`check-rendering.sh` checks native graph pixels through hover, selection, and collection changes, plus drawing-cache invalidation. The layout suite checks stable frames through navigation and interaction.
 
 ## Scope and limits
 

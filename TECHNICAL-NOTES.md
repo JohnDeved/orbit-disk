@@ -1,5 +1,14 @@
 # Orbit Disk: scan and search design
 
+## Hover responsiveness (0.9.1)
+
+Hover no longer dims unrelated branches. Crossing a sector gap therefore leaves every branch color unchanged. The colored Canvas and collection marks sit in an equatable base layer keyed by presentation revision and metrics; a separate Canvas draws at most the hovered and selected outlines. Collection, folder-publication and geometry changes invalidate the appropriate layer.
+
+Native hit testing caches the exact sector paths until the root, layout revision or metrics change. Each mouse-move event resolves its segment once for both the cursor and highlight. Optimized microbenchmarks over 1,024 pointer positions measured 30.836 → 1.865 ms with 72 sectors and 317.754 → 25.652 ms at the 768-sector cap (16.5× and 12.4× faster). Exact path containment, including boundaries and gaps, is preserved.
+
+Leaving the map skips list scanning; a single related row scrolls directly to its identifier. Group relationship results survive leaving and re-entering a segment. The cache retains immutable member arrays and compares their storage identity in bounded buffer scopes, invalidating on changed members, map revisions, navigation and filtering. Re-entering a synthetic 100,000-member group measured 146.67 → 0.0018 ms median; first-entry relationship work remains unchanged. These measurements cover specific calculations, not whole-app frame rate or input-to-display latency.
+
+
 ## Public updates (0.9.0)
 
 Sparkle 2.10.1 is pinned in SwiftPM and bundled with the app. The public GitHub latest-release asset serves the appcast; downloads require no GitHub account or user token. Only update metadata and app downloads use the network. Scan contents and indexed paths are not included in update requests. Sparkle checks daily while the app is running, and the user chooses installation and restart. [Sparkle setup](https://sparkle-project.org/documentation/) and [publishing](https://sparkle-project.org/documentation/publishing/).

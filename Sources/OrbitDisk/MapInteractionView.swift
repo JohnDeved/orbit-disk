@@ -31,12 +31,17 @@ struct MapInteractionView: NSViewRepresentable {
 final class MapInteractionNSView: NSView, NSDraggingSource {
     var interaction: MapInteractionView? {
         didSet {
-            if oldValue?.layoutRevision != interaction?.layoutRevision || oldValue?.rootID != interaction?.rootID ||
-                oldValue?.metrics != interaction?.metrics || oldValue?.canGoBack != interaction?.canGoBack {
+            let layoutChanged = oldValue?.layoutRevision != interaction?.layoutRevision ||
+                oldValue?.rootID != interaction?.rootID || oldValue?.metrics != interaction?.metrics
+            if layoutChanged {
+                hitRegions = interaction.map { MapHitRegions(segments: $0.segments, metrics: $0.metrics) }
+            }
+            if layoutChanged || oldValue?.canGoBack != interaction?.canGoBack {
                 scheduleHoverRefresh()
             }
         }
     }
+    private(set) var hitRegions: MapHitRegions?
     private var tracking: NSTrackingArea?
     private var hoveredSegment: SunburstSegment?
     private var hoveredLayoutRevision: UUID?
@@ -86,7 +91,8 @@ final class MapInteractionNSView: NSView, NSDraggingSource {
 
     override func cursorUpdate(with event: NSEvent) {
         guard !isDragging else { return }
-        cursor(at: convert(event.locationInWindow, from: nil)).set()
+        let point = convert(event.locationInWindow, from: nil)
+        cursor(at: point, segment: segment(at: point)).set()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -174,22 +180,23 @@ final class MapInteractionNSView: NSView, NSDraggingSource {
     }
 
     private func segment(at point: CGPoint) -> SunburstSegment? {
-        guard let interaction else { return nil }
-        return interaction.segments.first { $0.path(metrics: interaction.metrics).contains(point) }
+        guard let interaction, let index = hitRegions?.index(at: point) else { return nil }
+        return interaction.segments[index]
     }
 
-    private func cursor(at point: CGPoint) -> NSCursor {
+    private func cursor(at point: CGPoint, segment: SunburstSegment?) -> NSCursor {
         guard let interaction else { return .arrow }
         let metrics = interaction.metrics
         let inCenter = hypot(point.x - metrics.center.x, point.y - metrics.center.y) <= metrics.innerRadius
-        return segment(at: point) != nil || (inCenter && interaction.canGoBack) ? .pointingHand : .arrow
+        return segment != nil || (inCenter && interaction.canGoBack) ? .pointingHand : .arrow
     }
 
     private func updateHover(with event: NSEvent) {
         guard !isDragging else { return }
         let point = convert(event.locationInWindow, from: nil)
-        setHovered(segment(at: point))
-        cursor(at: point).set()
+        let segment = segment(at: point)
+        setHovered(segment)
+        cursor(at: point, segment: segment).set()
     }
 
     private func scheduleHoverRefresh() {
@@ -208,8 +215,9 @@ final class MapInteractionNSView: NSView, NSDraggingSource {
                 self.setHovered(nil)
                 return
             }
-            self.setHovered(self.segment(at: point))
-            self.cursor(at: point).set()
+            let segment = self.segment(at: point)
+            self.setHovered(segment)
+            self.cursor(at: point, segment: segment).set()
         }
     }
 
@@ -246,5 +254,17 @@ final class MapInteractionNSView: NSView, NSDraggingSource {
                                                     .foregroundColor: NSColor(calibratedWhite: 0.78, alpha: 1)])
             return true
         }
+    }
+}
+
+final class MapHitRegions {
+    private let paths: [Path]
+
+    init(segments: [SunburstSegment], metrics: SunburstMetrics) {
+        paths = segments.map { $0.path(metrics: metrics) }
+    }
+
+    func index(at point: CGPoint) -> Int? {
+        paths.firstIndex { $0.contains(point) }
     }
 }

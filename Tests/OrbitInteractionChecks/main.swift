@@ -145,8 +145,9 @@ var hovered: [String?] = []
 var hoveredMembers: [[String]] = []
 var chartActivity: [Bool] = []
 func configuration(rootID: String = root.id, layoutRevision: UUID = mapRevision,
-                   sectors: [SunburstSegment] = segments) -> MapInteractionView {
-    MapInteractionView(rootID: rootID, layoutRevision: layoutRevision, segments: sectors, metrics: metrics, canGoBack: true,
+                   sectors: [SunburstSegment] = segments, chartMetrics: SunburstMetrics = metrics,
+                   canGoBack: Bool = true) -> MapInteractionView {
+    MapInteractionView(rootID: rootID, layoutRevision: layoutRevision, segments: sectors, metrics: chartMetrics, canGoBack: canGoBack,
                        onHover: { hovered.append($0?.id); hoveredMembers.append($0?.members.map(\.id) ?? []) },
                        onActivate: { activated.append($0.id) },
                        makeDrag: { requestedDrags.append($0.id); return nil }, onDragEnded: {},
@@ -156,6 +157,64 @@ view.interaction = configuration()
 precondition(view.hitTest(view.convert(metrics.center, to: container)) == nil)
 precondition(view.hitTest(view.convert(largePoint, to: container)) === view)
 print("PASS chart event overlay preserves the center button hit target")
+
+let initialHitRegions = view.hitRegions!
+for _ in 0..<20 {
+    view.interaction = configuration()
+    precondition(view.hitRegions === initialHitRegions)
+}
+view.interaction = configuration(canGoBack: false)
+precondition(view.hitRegions === initialHitRegions)
+view.interaction = configuration(chartMetrics: SunburstMetrics(size: CGSize(width: 360, height: 210)))
+let resizedHitRegions = view.hitRegions!
+precondition(resizedHitRegions !== initialHitRegions)
+view.interaction = configuration(rootID: "/changed", chartMetrics: SunburstMetrics(size: CGSize(width: 360, height: 210)))
+let newRootHitRegions = view.hitRegions!
+precondition(newRootHitRegions !== resizedHitRegions)
+view.interaction = configuration(rootID: "/changed", layoutRevision: UUID(),
+                                 chartMetrics: SunburstMetrics(size: CGSize(width: 360, height: 210)))
+precondition(view.hitRegions !== newRootHitRegions)
+view.interaction = nil
+precondition(view.hitRegions == nil)
+view.interaction = configuration()
+print("PASS hit paths reuse the same layout and refresh on resize, root, revision, and removal")
+
+let boundarySegments = (0..<72).map { index in
+    let sector = index % 24
+    return SunburstSegment(id: "boundary-\(index)", node: large.node, members: large.members,
+                           name: "Boundary", size: 1,
+                           start: Double(sector) * 2 * .pi / 24, end: Double(sector + 1) * 2 * .pi / 24,
+                           depth: index / 24, branchIndex: sector)
+}
+for testMetrics in [metrics, SunburstMetrics(size: CGSize(width: 360, height: 210))] {
+    for testSegments in [segments, boundarySegments] {
+        let regions = MapHitRegions(segments: testSegments, metrics: testMetrics)
+        var probes: [CGPoint] = [testMetrics.center, .zero, CGPoint(x: 500, y: 500)]
+        for x in stride(from: 0, through: 400, by: 8) {
+            for y in stride(from: 0, through: 400, by: 8) {
+                probes.append(CGPoint(x: x, y: y))
+            }
+        }
+        for segment in testSegments {
+            let inner = testMetrics.innerRadius + CGFloat(segment.depth) * testMetrics.ringWidth + 1.4
+            let outer = inner + max(1, testMetrics.ringWidth - 2.8)
+            let inset = min((segment.end - segment.start) * 0.17, 1.2 / Double((inner + outer) / 2))
+            for angle in [segment.start, segment.start + inset, (segment.start + segment.end) / 2,
+                          segment.end - inset, segment.end] {
+                for radius in [inner - 0.0001, inner, inner + 0.0001, (inner + outer) / 2,
+                               outer - 0.0001, outer, outer + 0.0001] {
+                    probes.append(CGPoint(x: testMetrics.center.x + cos(angle - .pi / 2) * radius,
+                                          y: testMetrics.center.y + sin(angle - .pi / 2) * radius))
+                }
+            }
+        }
+        for probe in probes {
+            precondition(regions.index(at: probe) == testSegments.firstIndex { $0.path(metrics: testMetrics).contains(probe) },
+                         "Cached hit path changed a sector or gap boundary at \(probe)")
+        }
+    }
+}
+print("PASS cached hit regions preserve exact sector, radial gap, angular gap, center, and outer boundaries")
 
 func event(_ type: NSEvent.EventType, _ point: CGPoint) -> NSEvent {
     NSEvent.mouseEvent(with: type, location: view.convert(point, to: nil), modifierFlags: [], timestamp: 0,

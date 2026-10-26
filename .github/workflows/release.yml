@@ -38,6 +38,8 @@ jobs:
         run: ./check-app.sh
       - name: Check updater behavior
         run: ./check-updater.sh
+      - name: Check graph rendering
+        run: ./check-rendering.sh
       - name: Check rendered layouts
         run: ./check-layout.sh
       - name: Build and publish signed release

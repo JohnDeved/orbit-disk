@@ -190,9 +190,7 @@ struct ContentView: View {
                                  onSelect: { model.selectedID = $0.id }, onOpen: model.open,
                                  onBack: model.goBack, canGoBack: model.navigation.count > 1,
                                  onHover: { nodes, groupID in
-                                     model.hoveredMapNodes = nodes ?? []
-                                     model.hoveredMapGroupID = groupID
-                                     if nodes != nil { model.hoveredListID = nil }
+                                     model.setMapHover(nodes: nodes, groupID: groupID)
                                  }, makeDrag: model.beginCollectionDrag, onDragEnded: model.endCollectionDrag,
                                  onInteractionActive: model.setMapInteractionActive)
                         .padding(.horizontal, 16).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -272,7 +270,10 @@ struct ContentView: View {
                         }
                     }.listStyle(.plain).scrollContentBackground(.hidden).focused($fileListFocused)
                     .onChange(of: relatedIDs) { _, ids in
-                        if let first = model.displayedNodes.first(where: { ids.contains($0.id) }) {
+                        guard !ids.isEmpty else { return }
+                        if ids.count == 1, let id = ids.first {
+                            proxy.scrollTo(id)
+                        } else if let first = model.displayedNodes.first(where: { ids.contains($0.id) }) {
                             proxy.scrollTo(first.id)
                         }
                     }
