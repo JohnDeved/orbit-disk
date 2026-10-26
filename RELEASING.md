@@ -33,7 +33,7 @@ Sparkle signatures authenticate the app archive and update feed. They do not rep
 
 ## Local checks and preparation
 
-Use Swift 6 command-line tools or Xcode, Python 3, and macOS. Publishing locally also needs an authenticated GitHub CLI with release access.
+Use Swift 6.3 or later command-line tools or Xcode, Python 3, and macOS. CI uses Swift 6.3.3 from Xcode 26.6. Publishing locally also needs an authenticated GitHub CLI with release access.
 
 ```sh
 ./build-app.sh --universal

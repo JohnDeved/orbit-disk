@@ -61,7 +61,7 @@ The map, list, inspector and action controls keep their positions while navigati
 
 ## Build and verify
 
-Install Apple's Swift command-line tools or Xcode with Swift 6, plus Python 3, then run from this folder:
+Install Apple's Swift command-line tools or Xcode with Swift 6.3 or later, plus Python 3, then run from this folder:
 
 ```sh
 ./build-app.sh
