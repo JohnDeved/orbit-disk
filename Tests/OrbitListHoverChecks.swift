@@ -232,25 +232,41 @@ enum OrbitListHoverChecks {
         }
         scroll.contentView.setBoundsOrigin(.zero)
         pointer = window.convertPoint(toScreen: point(in: first))
-        let timed = ListHoverTracking(settleDelay: 0.12, pointerLocation: { pointer })
+        let quietDelay: TimeInterval = 0.12
+        let timed = ListHoverTracking(settleDelay: quietDelay, pointerLocation: { pointer })
         timed.register(first, id: "first", table: table)
         var timedChanges: [String?] = []
-        timed.onHoverChanged = { timedChanges.append($0) }
+        var mayRestoreHover = false
+        var quietDeadline = TimeInterval.infinity
+        timed.onHoverChanged = { id in
+            if id != nil {
+                precondition(mayRestoreHover, "The timer restored hover during a gesture or momentum")
+                precondition(ProcessInfo.processInfo.systemUptime >= quietDeadline,
+                             "The timer restored hover before the latest wheel event became quiet")
+            }
+            timedChanges.append(id)
+        }
         timed.scrollWheel(phase: .began, momentum: [])
         runLoop(for: 0.18)
         precondition(timed.isSuppressed && timedChanges == [nil])
         timed.scrollWheel(phase: .ended, momentum: [])
-        runLoop(for: 0.02)
         timed.scrollWheel(phase: [], momentum: .began)
         runLoop(for: 0.18)
         precondition(timed.isSuppressed && timedChanges == [nil])
+        mayRestoreHover = true
+        quietDeadline = ProcessInfo.processInfo.systemUptime + quietDelay
         timed.scrollWheel(phase: [], momentum: .ended)
-        runLoop(for: 0.03)
-        timed.scrollWheel(phase: [], momentum: [])
-        runLoop(for: 0.04)
+        // Leave the old timer due without delivering it, then reset it with a new wheel event.
+        while ProcessInfo.processInfo.systemUptime < quietDeadline {
+            Thread.sleep(forTimeInterval: max(0, quietDeadline - ProcessInfo.processInfo.systemUptime))
+        }
         precondition(timed.isSuppressed && timedChanges == [nil])
-        runLoop(for: 0.12)
-        precondition(!timed.isSuppressed && timedChanges == [nil, "first"])
+        quietDeadline = ProcessInfo.processInfo.systemUptime + quietDelay
+        timed.scrollWheel(phase: [], momentum: [])
+        let completionDeadline = ProcessInfo.processInfo.systemUptime + 2
+        while timed.isSuppressed && ProcessInfo.processInfo.systemUptime < completionDeadline { runLoop(for: 0.005) }
+        precondition(!timed.isSuppressed && timedChanges == [nil, "first"],
+                     "Quiet timer did not restore the pointer row: suppressed=\(timed.isSuppressed), changes=\(timedChanges), row=\(String(describing: timed.rowID(at: window.convertPoint(fromScreen: pointer))))")
         timed.detach()
         print("PASS the real quiet timer stays blocked through gesture and momentum, and restarts after each wheel event")
 
