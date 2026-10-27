@@ -851,7 +851,12 @@ final class DiskModel: ObservableObject {
     private let stagingDirectory: URL
     private let scanProgressObserver: @Sendable (ScanProgress) -> Void
     private let sortStartObserver: @Sendable () -> Void
-    private var snapshot: IndexSnapshot?
+    private var snapshot: IndexSnapshot? {
+        didSet {
+            guard oldValue?.id != snapshot?.id || oldValue?.databaseURL != snapshot?.databaseURL else { return }
+            prepareSearchIndex()
+        }
+    }
     private var scanCancellation: ScanCancellation?
     private var searchCancellation: ScanCancellation?
     private var sessions: [String: MappingSession] = [:]
@@ -929,6 +934,10 @@ final class DiskModel: ObservableObject {
     private var deferredIndexedFolder: (() -> Void)?
     var hasDeferredIndexedFolder: Bool { deferredIndexedFolder != nil }
     private var searchTask: Task<Void, Never>?
+    private var searchPreparationTask: Task<Void, Never>?
+    private var searchPreparationCancellation: ScanCancellation?
+    private var searchPreparationSnapshotID: String?
+    private var searchPreparationDatabaseURL: URL?
     private var refreshTask: Task<Void, Never>?
     private var workCompletion: Task<Void, Never>?
     private var monitor: DiskChangeMonitor?
@@ -1073,7 +1082,36 @@ final class DiskModel: ObservableObject {
         refreshVolumes()
     }
 
-    deinit { searchCancellation?.cancel(); searchTask?.cancel() }
+    deinit {
+        searchCancellation?.cancel(); searchTask?.cancel()
+        searchPreparationCancellation?.cancel(); searchPreparationTask?.cancel()
+    }
+
+    private func prepareSearchIndex() {
+        if let snapshot, searchPreparationSnapshotID == snapshot.id,
+           searchPreparationDatabaseURL == snapshot.databaseURL, searchPreparationTask != nil { return }
+        searchPreparationCancellation?.cancel(); searchPreparationTask?.cancel()
+        searchPreparationCancellation = nil; searchPreparationTask = nil
+        searchPreparationSnapshotID = nil; searchPreparationDatabaseURL = nil
+        guard let snapshot else { return }
+        let store = store, cancellation = ScanCancellation()
+        searchPreparationCancellation = cancellation; searchPreparationSnapshotID = snapshot.id
+        searchPreparationDatabaseURL = snapshot.databaseURL
+        searchPreparationTask = Task.detached(priority: .utility) { [weak self] in
+            do {
+                // Give the initial folder read a head start over the optional search cache.
+                try await Task.sleep(nanoseconds: 250_000_000)
+                _ = try store.prepareSearch(snapshot: snapshot, cancellation: cancellation)
+            } catch {}
+            await self?.finishSearchPreparation(cancellation)
+        }
+    }
+
+    private func finishSearchPreparation(_ cancellation: ScanCancellation) {
+        guard searchPreparationCancellation === cancellation else { return }
+        searchPreparationCancellation = nil; searchPreparationTask = nil
+        searchPreparationSnapshotID = nil; searchPreparationDatabaseURL = nil
+    }
 
     var current: DiskNode? { navigation.last }
     var isUpdatingRemovalSizes: Bool {
@@ -3637,6 +3675,7 @@ final class DiskModel: ObservableObject {
         if isPartialMap, !originalQuery.isEmpty, let preview = scanPreview {
             let token = ScanCancellation()
             let replayGeneration = preview.removalReplayReadiness()?.generation
+            let searchDelay: UInt64 = preview.isSearchPrepared ? 16_000_000 : 100_000_000
             searchCancellation = token
             #if ORBIT_TESTING
             let searchObserver = testBeforePreviewSearch
@@ -3646,7 +3685,7 @@ final class DiskModel: ObservableObject {
             #endif
             searchTask = Task { [weak self, weak session] in
                 do {
-                    try await Task.sleep(nanoseconds: 100_000_000)
+                    try await Task.sleep(nanoseconds: searchDelay)
                     let result = try await Task.detached(priority: .userInitiated) {
                         searchObserver()
                         #if ORBIT_TESTING
@@ -3700,13 +3739,16 @@ final class DiskModel: ObservableObject {
         let token = ScanCancellation()
         searchCancellation = token
         let store = store, stablePathOrder = sameSearch && searchStateUsesPreviewOrder
+        let prepared = store.isSearchPrepared(snapshot: saved)
+        if !prepared { prepareSearchIndex() }
+        let searchDelay: UInt64 = removals.isEmpty && prepared ? 16_000_000 : 100_000_000
         #if ORBIT_TESTING
         let savedOrderObserver = testSavedSearchOrder
         #else
         let savedOrderObserver: @Sendable (Bool) -> Void = { _ in }
         #endif
         searchTask = Task { [weak self] in
-            do { try await Task.sleep(nanoseconds: 100_000_000) } catch { return }
+            do { try await Task.sleep(nanoseconds: searchDelay) } catch { return }
             do {
                 let worker = Task.detached(priority: .userInitiated) {
                     savedOrderObserver(stablePathOrder)

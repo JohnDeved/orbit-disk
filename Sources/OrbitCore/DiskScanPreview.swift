@@ -65,6 +65,7 @@ public final class DiskScanPreview: @unchecked Sendable {
     public func removalReplayReadiness() -> (cursor: RemovalCursor?, blocked: Bool, generation: UInt64)? {
         currentStage()?.removalReplayReadiness()
     }
+    public var isSearchPrepared: Bool { currentStage()?.isSearchPrepared ?? false }
     #if ORBIT_TESTING
     package var testAfterSearchRemovals: (@Sendable () -> Void)?
     package func testBegin(_ root: DiskNode) { begin(root) }

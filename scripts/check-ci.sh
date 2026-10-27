@@ -16,6 +16,7 @@ case "$1" in
     ./check-app.sh --native-only
     ;;
   search)
+    ./check-prepared-search.sh
     ./check-preview-batches.sh
     ./check-preview-search.sh
     ./check-stage-search-fast.sh

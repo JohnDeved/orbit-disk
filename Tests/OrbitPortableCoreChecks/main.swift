@@ -220,6 +220,7 @@ func checkCancellation() async throws {
         try checkPathOrdering()
         try checkCollectionMembership()
         try await checkCancellation()
-        print("6 portable core check groups passed")
+        try checkCompactNames()
+        print("7 portable core check groups passed")
     }
 }

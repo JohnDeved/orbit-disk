@@ -14,6 +14,7 @@ final class Gate: @unchecked Sendable {
  let store=DiskIndexStore(directory:cache), snapshot=stage.testPreviewSnapshot
  let before=try store.stagedSearch(query:"file",snapshot:snapshot,revision:1,removals:[],cancellation:ScanCancellation(),limit:300)
  precondition(before.count == 2000)
+ let prepared = try store.prepareStagedSearch(snapshot:snapshot); precondition(prepared)
  let gate=Gate();DiskIndexStore.testSearchSQLiteProgress={gate.pause()}
  let reader=Task.detached {try store.stagedSearch(query:"file",snapshot:snapshot,revision:1,removals:[],cancellation:ScanCancellation(),limit:300)}
  for _ in 0..<5000 {if gate.waiting {break};try await Task.sleep(nanoseconds:1_000_000)}

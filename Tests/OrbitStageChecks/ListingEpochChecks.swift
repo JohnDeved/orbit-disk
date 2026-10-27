@@ -51,6 +51,7 @@ enum ListingEpochChecks {
         try checkStaleFinish(base.appendingPathComponent("stale"))
         try checkFallback(base.appendingPathComponent("fallback"))
         try checkActiveListing(base.appendingPathComponent("active"))
+        try checkBoundedBatches(base.appendingPathComponent("batches"))
     }
     static func checkCrashes(_ base: URL) throws {
         for boundary in ["batch-epoch", "batch-committed", "empty-epoch", "empty-committed"] {
@@ -195,5 +196,34 @@ enum ListingEpochChecks {
         let stopped = try stage.view(path: root.path, removals: [], cancellation: ScanCancellation())!
         precondition(stopped.folder.children.allSatisfy { $0.scanState == .pending })
         print("PASS: active folder is visible in folder and search views before the first commit; cancellation clears it")
+    }
+
+    static func checkBoundedBatches(_ base: URL) throws {
+        let root = base.appendingPathComponent("root", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        for index in 0..<4097 { try Data([1]).write(to: root.appendingPathComponent("file-\(index)")) }
+        var savedCount: Int64 = 0
+        do {
+            let stage = try makeStage(base), database = Database(stage.crawler.store.databasePath)
+            var counts: [Int64] = []
+            do {
+                _ = try stage.crawler.step(maxBatches: 2, onBatch: { _, _ in
+                    counts.append(database.scalar("SELECT COUNT(*) FROM nodes WHERE parent IS NOT NULL"))
+                })
+                fatalError("missing batch interruption")
+            } catch DurableCrawler.Interrupt.afterBatch {}
+            precondition(counts.count == 2 && counts[0] == 128)
+            precondition(counts[1] > counts[0] && counts[1] - counts[0] <= 1024)
+            precondition(database.scalar("SELECT COUNT(*) FROM directories WHERE pending=1") == 1)
+            precondition(database.scalar("SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name IN ('st_path','st_is_link','folded','identity')") == 0)
+            savedCount = counts[1]
+        }
+        let stage = try makeStage(base), database = Database(stage.crawler.store.databasePath)
+        precondition(database.scalar("SELECT COUNT(*) FROM nodes WHERE parent IS NOT NULL") == savedCount)
+        try finish(stage)
+        let view = try stage.view(path: root.path, removals: [], cancellation: ScanCancellation())!.folder
+        precondition(view.scanState == .complete && view.fileCount == 4097 && view.size == 4097)
+        precondition(view.children.count == 4097)
+        print("PASS: first 128 rows are durable immediately; bounded background batches survive reopen without losing rows")
     }
 }

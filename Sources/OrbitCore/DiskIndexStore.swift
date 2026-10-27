@@ -47,6 +47,8 @@ public struct DiskIndexStore: Sendable {
     public let directory: URL
     public let lockDirectory: URL
     #if ORBIT_TESTING
+    package static var testDisablePreparedSearch = false
+    package static var testSearchIndexByteLimit: Int?
     package static var testSearchSQLiteProgress: (@Sendable () -> Void)?
     package static var testEqualSizeSearchSkip: (@Sendable () -> Void)?
     package static var testBeforePublish: (@Sendable () -> Void)?
@@ -57,6 +59,7 @@ public struct DiskIndexStore: Sendable {
     private static let version: Int64 = 3
     private static let applicationID: Int64 = 0x4F524254
     private static let mutationLock = NSLock()
+    private static let searchIndexes = PreparedNameIndexes()
     private static let nodeColumns = "path,name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,file_identity"
 
     public init(directory: URL) {
@@ -365,22 +368,59 @@ public struct DiskIndexStore: Sendable {
         try Task.checkCancellation()
         let needle = Self.fold(query.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !needle.isEmpty else { return ([], 0, revision, false) }
+        // Pin the prefix before establishing the SQLite snapshot; a newer prefix could hide older rows.
+        let prefixKey = PreparedNameIndexes.Key(snapshot, staged: true)
+        let prefix = prefixKey.flatMap { Self.searchIndexes.lookup($0) }
+        let candidates = try prefix?.index.matches(needle, stopAfterCandidateLimit: true) { try Task.checkCancellation(); try check(cancellation) }
         let db = try open(snapshot, cancellation: cancellation)
         db.checkTaskCancellation()
         try db.execute("BEGIN")
         defer { try? db.execute("ROLLBACK") }
         let sources = try stagedRemovalSources(removals, db: db, cancellation: cancellation)
         let projection = try DiskRemovalProjection(removals: removals, source: sources, cancellation: cancellation)
+        var namePredicate = "instr(n.search_name,?)>0"
+        var parameters: [IndexValue] = [.text(needle)]
+        if let prefix, let ids = candidates?.ids, prefixKey == PreparedNameIndexes.Key(snapshot, staged: true),
+           prefix.generation == (try db.integer("SELECT value FROM orbit_search_generation WHERE singleton=1")) {
+            let narrowed = ids.isEmpty ? "n.id>?" : "(n.id IN (" + Array(repeating: "?", count: ids.count).joined(separator: ",") + ") OR n.id>?)"
+            namePredicate = narrowed + " AND " + namePredicate
+            parameters = ids.map(IndexValue.integer) + [.integer(prefix.index.highWaterID), .text(needle)]
+        }
+        let resultLimit = max(0, min(limit, 10_000))
+        var verifiedCount: Int?
+        if removals.isEmpty, prefix != nil, candidates?.ids == nil {
+            func edge(_ order: String) throws -> Int64? {
+                let row = try db.statement("SELECT n.size FROM (SELECT size,search_name,parent FROM nodes INDEXED BY nodes_by_size ORDER BY size \(order) LIMIT 4096) n WHERE n.parent IS NOT NULL AND \(namePredicate) LIMIT 1")
+                try row.bind(parameters)
+                return try row.step() ? row.integer(0) : nil
+            }
+            // All boundary ties still need normalized path ordering; avoid an extra full pass when every size ties.
+            let high = resultLimit == 0 ? nil : try edge("DESC")
+            let low = resultLimit == 0 ? nil : try edge("ASC")
+            if resultLimit == 0 || (high != nil && low != nil && high != low) {
+                let totals = try db.statement("SELECT COUNT(*),MIN(CAST(n.size AS INTEGER)),MIN(CAST(n.allocated AS INTEGER)),MIN(CAST(n.file_count AS INTEGER)),MIN(CAST(n.raw_alloc AS INTEGER)),MIN(typeof(n.size)='integer') FROM nodes n WHERE n.parent IS NOT NULL AND \(namePredicate)")
+                try totals.bind(parameters)
+                guard try totals.step(), (1...4).allSatisfy({ totals.integer(Int32($0)) >= 0 }) else {
+                    throw DiskIndexError.invalid("A staged disk index entry is damaged.")
+                }
+                let count = Int(totals.integer(0))
+                try Task.checkCancellation(); try check(cancellation)
+                if resultLimit == 0 { return ([], count, revision, false) }
+                if totals.integer(5) == 1 { verifiedCount = count }
+            }
+        }
+        let sizeOrdered = verifiedCount != nil
+        let indexHint = sizeOrdered ? "INDEXED BY nodes_by_size" : ""
+        let order = sizeOrdered ? "ORDER BY n.size DESC" : ""
         let statement = try db.statement("""
             SELECT n.path,n.name,n.is_dir,n.is_link,n.accessible,n.size,n.allocated,n.file_count,n.raw_alloc,n.file_identity,
                    COALESCE(d.pending,0),CASE WHEN e.value IS NULL THEN 0 ELSE 1 END,COALESCE(pd.pending,0)
-            FROM nodes n LEFT JOIN directories d ON d.path=CAST(n.path AS BLOB) LEFT JOIN epochs e ON e.parent=d.path
+            FROM nodes n \(indexHint) LEFT JOIN directories d ON d.path=CAST(n.path AS BLOB) LEFT JOIN epochs e ON e.parent=d.path
             LEFT JOIN nodes p ON p.id=n.parent LEFT JOIN directories pd ON pd.path=CAST(p.path AS BLOB)
-            WHERE n.parent IS NOT NULL AND instr(n.search_name,?)>0
+            WHERE n.parent IS NOT NULL AND \(namePredicate) \(order)
             """)
-        try statement.bind([.text(needle)])
-        let resultLimit = max(0, min(limit, 10_000))
-        var result: [DiskNode] = [], count = 0, scanned = 0
+        try statement.bind(parameters)
+        var result: [DiskNode] = [], count = verifiedCount ?? 0, scanned = 0
         var worstID = ""
         func worse(_ a: DiskNode, _ b: DiskNode) -> Bool {
             a.size == b.size ? b.id.utf8.lexicographicallyPrecedes(a.id.utf8) : a.size < b.size
@@ -403,8 +443,12 @@ public struct DiskIndexStore: Sendable {
                 throw DiskIndexError.invalid("A staged disk index entry is damaged.")
             }
             if removals.isEmpty {
-                count += 1
-                if resultLimit == 0 || (result.count == resultLimit && statement.integer(5) < result[0].size) { continue }
+                if verifiedCount == nil { count += 1 }
+                if resultLimit == 0 { continue }
+                if result.count == resultLimit && statement.integer(5) < result[0].size {
+                    if sizeOrdered { break }
+                    continue
+                }
             }
             let directory = statement.integer(2) != 0
             let url = URL(fileURLWithPath: path, isDirectory: directory)
@@ -581,27 +625,155 @@ public struct DiskIndexStore: Sendable {
         return result.reversed()
     }
 
+    /// Prepare a disposable search accelerator from a completed saved map, without crawling files.
+    @discardableResult
+    public func prepareSearch(snapshot: IndexSnapshot, cancellation: ScanCancellation = ScanCancellation()) throws -> Bool {
+        try Task.checkCancellation(); try check(cancellation)
+        guard let key = PreparedNameIndexes.Key(snapshot) else { throw DiskIndexError.staleSnapshot }
+        let db = try open(snapshot, cancellation: cancellation)
+        let completedMap = try { () throws -> Bool in
+            let mode = try db.statement("PRAGMA journal_mode")
+            return try mode.step() && mode.text(0) == "delete"
+        }()
+        guard completedMap else { return false }
+        if Self.searchIndexes.lookup(key) != nil { return true }
+        try Self.searchIndexes.begin(key) { try Task.checkCancellation(); try check(cancellation) }
+        defer { Self.searchIndexes.end(key) }
+        if Self.searchIndexes.lookup(key) != nil { return true }
+        try db.execute("BEGIN")
+        defer { try? db.execute("ROLLBACK") }
+        try validate(snapshot, db: db)
+        #if ORBIT_TESTING
+        let builder = CompactNameIndex.Builder(byteLimit: Self.testSearchIndexByteLimit ?? 96 * 1024 * 1024)
+        #else
+        let builder = CompactNameIndex.Builder()
+        #endif
+        let rows = try db.statement("SELECT id,search_name FROM nodes WHERE parent IS NOT NULL ORDER BY id")
+        var count = 0, complete = true
+        while try rows.step() {
+            if count & 511 == 0 { try Task.checkCancellation(); try check(cancellation) }; count += 1
+            guard let bytes = sqlite3_column_text(rows.handle, 1) else { throw DiskIndexError.invalid("A search name is missing.") }
+            let name = UnsafeBufferPointer(start: bytes, count: Int(sqlite3_column_bytes(rows.handle, 1)))
+            if !builder.append(id: rows.integer(0), name: name) { complete = false; break }
+        }
+        try Task.checkCancellation(); try check(cancellation)
+        guard PreparedNameIndexes.Key(snapshot) == key else { throw DiskIndexError.staleSnapshot }
+        let index = builder.finish()
+        guard index.recordCount > 0 || complete else { return false }
+        Self.searchIndexes.insert(index, for: key, complete: complete)
+        return true
+    }
+
+    /// Index an immutable name prefix while newer rows continue to arrive in the WAL.
+    @discardableResult
+    public func prepareStagedSearch(snapshot: IndexSnapshot, cancellation: ScanCancellation = ScanCancellation()) throws -> Bool {
+        try Task.checkCancellation(); try check(cancellation)
+        guard let key = PreparedNameIndexes.Key(snapshot, staged: true) else { throw DiskIndexError.staleSnapshot }
+        let db = try open(snapshot, cancellation: cancellation)
+        let monotonicIDs = try { () throws -> Bool in
+            let schema = try db.statement("SELECT sql FROM sqlite_master WHERE type='table' AND name='nodes'")
+            return try schema.step() && schema.text(0)?.contains("AUTOINCREMENT") == true
+        }()
+        guard monotonicIDs,
+              try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='orbit_search_generation'") == 1 else { return false }
+        try Self.searchIndexes.begin(key) { try Task.checkCancellation(); try check(cancellation) }
+        defer { Self.searchIndexes.end(key) }
+        try db.execute("BEGIN")
+        defer { try? db.execute("ROLLBACK") }
+        try validate(snapshot, db: db)
+        let generation = try db.integer("SELECT value FROM orbit_search_generation WHERE singleton=1")
+        let highWater = try db.integer("SELECT COALESCE(MAX(id),0) FROM nodes")
+        if let existing = Self.searchIndexes.lookup(key), existing.generation == generation,
+           highWater <= existing.index.highWaterID || !existing.complete { return true }
+        #if ORBIT_TESTING
+        let builder = CompactNameIndex.Builder(byteLimit: Self.testSearchIndexByteLimit ?? 96 * 1024 * 1024)
+        #else
+        let builder = CompactNameIndex.Builder()
+        #endif
+        let rows = try db.statement("SELECT id,search_name FROM nodes WHERE parent IS NOT NULL ORDER BY id")
+        var count = 0, complete = true
+        while try rows.step() {
+            if count & 511 == 0 { try Task.checkCancellation(); try check(cancellation) }; count += 1
+            guard let bytes = sqlite3_column_text(rows.handle, 1) else { throw DiskIndexError.invalid("A search name is missing.") }
+            let name = UnsafeBufferPointer(start: bytes, count: Int(sqlite3_column_bytes(rows.handle, 1)))
+            if !builder.append(id: rows.integer(0), name: name) { complete = false; break }
+        }
+        try Task.checkCancellation(); try check(cancellation)
+        guard PreparedNameIndexes.Key(snapshot, staged: true) == key else { throw DiskIndexError.staleSnapshot }
+        let index = builder.finish()
+        guard index.recordCount > 0 else { return false }
+        Self.searchIndexes.insert(index, for: key, generation: generation, complete: complete)
+        return true
+    }
+
+    public func isStagedSearchPrepared(snapshot: IndexSnapshot) -> Bool {
+        guard let key = PreparedNameIndexes.Key(snapshot, staged: true) else { return false }
+        return Self.searchIndexes.lookup(key) != nil
+    }
+
+    #if ORBIT_TESTING
+    package func testSearchIndex(snapshot: IndexSnapshot, staged: Bool = false) -> (count: Int, highWater: Int64, complete: Bool, bytes: Int)? {
+        guard let key = PreparedNameIndexes.Key(snapshot, staged: staged), let entry = Self.searchIndexes.lookup(key) else { return nil }
+        return (entry.index.recordCount, entry.index.highWaterID, entry.complete, entry.index.byteCount)
+    }
+    #endif
+
+    public func isSearchPrepared(snapshot: IndexSnapshot) -> Bool {
+        guard let key = PreparedNameIndexes.Key(snapshot) else { return false }
+        return Self.searchIndexes.lookup(key) != nil
+    }
+
     public func search(query: String, snapshot: IndexSnapshot, limit: Int = 300,
                        cancellation: ScanCancellation = ScanCancellation(), stablePathOrder: Bool = false,
                        removals: [ScanRemoval] = []) throws -> IndexSearchResult {
         try check(cancellation)
         let needle = Self.fold(query.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !needle.isEmpty else { return IndexSearchResult(nodes: [], totalCount: 0) }
+        let key = PreparedNameIndexes.Key(snapshot)
         let db = try open(snapshot, cancellation: cancellation)
         if !removals.isEmpty {
             return try projectedSearch(needle: needle, limit: limit, stablePathOrder: stablePathOrder,
                                        removals: removals, db: db, cancellation: cancellation)
         }
+        try db.execute("BEGIN")
+        defer { try? db.execute("ROLLBACK") }
+        try validate(snapshot, db: db)
+        db.checkTaskCancellation()
         let values: [IndexValue] = [.text(needle)]
-        let count = try db.integer("SELECT COUNT(*) FROM nodes WHERE parent IS NOT NULL AND instr(search_name,?)>0", values)
-        try check(cancellation)
+        let prepared = key == PreparedNameIndexes.Key(snapshot) ? key.flatMap { Self.searchIndexes.lookup($0) } : nil
+        let matches = try prepared?.index.matches(needle) { try Task.checkCancellation(); try check(cancellation) }
+        let count: Int64
+        if let matches, let prepared {
+            let tail = try prepared.complete ? 0 : db.integer("SELECT COUNT(*) FROM nodes WHERE id>? AND parent IS NOT NULL AND instr(search_name,?)>0",
+                [.integer(prepared.index.highWaterID), .text(needle)])
+            count = Int64(matches.count) + tail
+        } else {
+            count = try db.integer("SELECT COUNT(*) FROM nodes WHERE parent IS NOT NULL AND instr(search_name,?)>0", values)
+        }
+        try Task.checkCancellation(); try check(cancellation)
         let resultLimit = max(0, min(limit, 10_000))
         guard count > 0, resultLimit > 0 else {
             return IndexSearchResult(nodes: [], totalCount: Int(count))
         }
         let order = stablePathOrder ? "size DESC,path COLLATE BINARY" : "size DESC,id"
-        let nodes = try readNodes("SELECT \(Self.nodeColumns) FROM nodes WHERE parent IS NOT NULL AND instr(search_name,?)>0 ORDER BY \(order) LIMIT ?",
-                                  values + [.integer(Int64(resultLimit))], db: db)
+        let predicate: String
+        let parameters: [IndexValue]
+        if let ids = matches?.ids, let prepared {
+            let indexed = ids.isEmpty ? "0" : "id IN (" + Array(repeating: "?", count: ids.count).joined(separator: ",") + ")"
+            if prepared.complete {
+                predicate = indexed
+                parameters = ids.map(IndexValue.integer)
+            } else {
+                let narrowed = ids.isEmpty ? "id>?" : "(\(indexed) OR id>?)"
+                predicate = narrowed + " AND parent IS NOT NULL AND instr(search_name,?)>0"
+                parameters = ids.map(IndexValue.integer) + [.integer(prepared.index.highWaterID), .text(needle)]
+            }
+        } else {
+            predicate = "parent IS NOT NULL AND instr(search_name,?)>0"
+            parameters = values
+        }
+        let nodes = try readNodes("SELECT \(Self.nodeColumns) FROM nodes WHERE \(predicate) ORDER BY \(order) LIMIT ?",
+                                  parameters + [.integer(Int64(resultLimit))], db: db)
         try check(cancellation)
         return IndexSearchResult(nodes: nodes, totalCount: Int(count))
     }
@@ -924,7 +1096,7 @@ private final class IndexStatement {
             let index = Int32(offset + 1)
             let status: Int32
             switch value {
-            case .text(let text): status = text.withCString { sqlite3_bind_text(handle, index, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+            case .text(let text): status = text.withCString { sqlite3_bind_text(handle, index, $0, Int32(text.utf8.count), unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
             case .integer(let number): status = sqlite3_bind_int64(handle, index, number)
             case .real(let number): status = sqlite3_bind_double(handle, index, number)
             case .null: status = sqlite3_bind_null(handle, index)
@@ -944,4 +1116,65 @@ private final class IndexStatement {
     func text(_ index: Int32) -> String? { sqlite3_column_text(handle, index).map { String(cString: $0) } }
     func integer(_ index: Int32) -> Int64 { sqlite3_column_int64(handle, index) }
     func real(_ index: Int32) -> Double { sqlite3_column_double(handle, index) }
+}
+
+private final class PreparedNameIndexes: @unchecked Sendable {
+    struct Key: Hashable {
+        let snapshot: String
+        let path: String
+        let device: Int32
+        let inode: UInt64
+        let size: Int64
+        let modifiedSeconds: Int
+        let modifiedNanos: Int
+        let changedSeconds: Int
+        let changedNanos: Int
+        let staged: Bool
+        init?(_ snapshot: IndexSnapshot, staged: Bool = false) {
+            var info = stat()
+            guard lstat(snapshot.databaseURL.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return nil }
+            self.snapshot = snapshot.id; path = snapshot.databaseURL.path; self.staged = staged
+            device = info.st_dev; inode = info.st_ino; size = staged ? 0 : info.st_size
+            modifiedSeconds = staged ? 0 : info.st_mtimespec.tv_sec; modifiedNanos = staged ? 0 : info.st_mtimespec.tv_nsec
+            changedSeconds = staged ? 0 : info.st_ctimespec.tv_sec; changedNanos = staged ? 0 : info.st_ctimespec.tv_nsec
+        }
+    }
+    private let lock = NSLock()
+    struct Value {
+        let index: CompactNameIndex
+        let generation: Int64?
+        let complete: Bool
+    }
+    private var entries: [(key: Key, value: Value)] = []
+    private var building: Key?
+    func lookup(_ key: Key) -> Value? {
+        #if ORBIT_TESTING
+        if DiskIndexStore.testDisablePreparedSearch { return nil }
+        #endif
+        lock.lock(); defer { lock.unlock() }
+        guard let position = entries.firstIndex(where: { $0.key == key }) else { return nil }
+        let entry = entries.remove(at: position); entries.append(entry)
+        return entry.value
+    }
+    func begin(_ key: Key, check: () throws -> Void) throws {
+        while true {
+            try check()
+            lock.lock()
+            if building == nil { building = key; lock.unlock(); return }
+            lock.unlock()
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+    }
+    func end(_ key: Key) {
+        lock.lock(); defer { lock.unlock() }
+        if building == key { building = nil }
+    }
+    func insert(_ index: CompactNameIndex, for key: Key, generation: Int64? = nil, complete: Bool = true) {
+        lock.lock(); defer { lock.unlock() }
+        entries.removeAll { $0.key.path == key.path }
+        while !entries.isEmpty && entries.reduce(index.byteCount, { $0 + $1.value.index.byteCount }) > 128 * 1024 * 1024 {
+            entries.removeFirst()
+        }
+        entries.append((key, Value(index: index, generation: generation, complete: complete)))
+    }
 }

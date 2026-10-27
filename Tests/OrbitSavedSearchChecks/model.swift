@@ -21,6 +21,9 @@ final class Gate: @unchecked Sendable {
     for i in 0..<20 { try Data([1,2]).write(to:folder.appendingPathComponent(String(format:"match-nested-%02d",i))) }
     let model=DiskModel(cacheDirectory:base.appendingPathComponent("index"),preferences:UserDefaults(suiteName:"saved-search-\(UUID())")!)
     model.scan(root);try await wait("saved map") {!model.isScanning && model.current?.children.count == 351}
+    let store = DiskIndexStore(directory: base.appendingPathComponent("index"))
+    let saved = store.savedSnapshot(for: root)!
+    try await wait("background search preparation") { store.isSearchPrepared(snapshot: saved) }
     model.query="match";try await wait("initial search") {!model.isSearching && model.searchMatchCount == 371}
     let file=root.appendingPathComponent("match-000")
     let wanted=model.current!.children.filter {$0.id == file.path || $0.id == folder.path}

@@ -22,7 +22,7 @@ final class DurableCrawler {
     enum Interrupt: Error { case afterBatch }
 
     init(rootURL: URL, database: String, checkpoint: StageCheckpoint,
-         cancellation: ScanCancellation = ScanCancellation(), writeChunkSize: Int = 512, mirror: Bool = false,
+         cancellation: ScanCancellation = ScanCancellation(), writeChunkSize: Int = 1024, mirror: Bool = false,
          expectedSnapshot: SnapshotExpectation? = nil, generation: String? = nil, excluding: [URL] = []) throws {
         self.rootURL = rootURL.standardizedFileURL
         self.rootPath = Data(self.rootURL.path.utf8)
@@ -137,6 +137,7 @@ final class DurableCrawler {
         var pending: [FileMetadata] = []
         var listingIssues: [String] = []
         var listingIssueCount = 0
+        var lastCommit = ProcessInfo.processInfo.systemUptime
         func included(_ records: [FileMetadata]) -> [FileMetadata] {
             records.filter { record in
                 guard record.isDirectory else { return true }
@@ -157,6 +158,7 @@ final class DurableCrawler {
             batches += 1
             try onBatch?(directory.path, batches)
             if let maxBatches, batches >= maxBatches { throw Interrupt.afterBatch }
+            lastCommit = ProcessInfo.processInfo.systemUptime
         }
         func list(forceFallback: Bool, testFallback: (() -> Void)?) throws {
             try StreamingBulkDirectory.stream(descriptor, url: URL(fileURLWithPath: path, isDirectory: true),
@@ -165,7 +167,9 @@ final class DurableCrawler {
                     if listingIssues.count < 100 { listingIssues.append($0) }
                 }, forceFallback: forceFallback, testFallbackAfterFirstBuffer: testFallback) { records in
                     pending.append(contentsOf: included(records))
-                    if batches == 0 || pending.count >= writeChunkSize { try commitPending() }
+                    if batches == 0 || pending.count >= writeChunkSize || ProcessInfo.processInfo.systemUptime - lastCommit >= 0.05 {
+                        try commitPending()
+                    }
                 }
             try commitPending()
         }
@@ -178,11 +182,12 @@ final class DurableCrawler {
                 do {
                     while true {
                         guard !cancellation.isCancelled, !Task<Never, Never>.isCancelled else { throw CancellationError() }
-                        let page = try listing.page(limit: writeChunkSize)
+                        let pageSize = batches == 0 ? 128 : writeChunkSize
+                        let page = try listing.page(limit: pageSize)
                         if page.isEmpty { break }
                         pending = included(page)
                         try commitPending(source: listing.source)
-                        if page.count == writeChunkSize {
+                        if page.count == pageSize {
                             guard !cancellation.isCancelled, !Task<Never, Never>.isCancelled else { throw CancellationError() }
                             usleep(2_000)
                             guard !cancellation.isCancelled, !Task<Never, Never>.isCancelled else { throw CancellationError() }

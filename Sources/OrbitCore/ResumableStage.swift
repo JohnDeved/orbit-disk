@@ -35,6 +35,13 @@ public final class ResumableStage: @unchecked Sendable {
     private var preferredDirectory: Data?
     private var lastProgressTime: TimeInterval = 0
     private var progressItems = 0
+    private let searchPreparationLock = NSLock()
+    private var searchPreparationTask: Task<Void, Never>?
+    private var searchPreparationCancellation: ScanCancellation?
+    private var searchPreparationID = UUID()
+    private var searchPreparationSuspended = false
+    private var searchPreparationCount = 0
+    private var searchPreparationTime: TimeInterval = 0
     private var reuseProvider: ((URL, StageCheckpoint) throws -> StageReuseCandidate?)?
     private var reuseSources: [StageReuseSource] = []
     #if ORBIT_TESTING
@@ -147,6 +154,43 @@ public final class ResumableStage: @unchecked Sendable {
         let root = crawler.rootPath
         let valid = bytes.map { $0 == root || ($0.starts(with: root) && (root == Data([47]) || $0.dropFirst(root.count).first == 47)) } ?? false
         revisionLock.lock(); preferredDirectory = valid ? bytes : nil; revisionLock.unlock()
+    }
+
+    deinit { cancelSearchPreparation() }
+
+    public var isSearchPrepared: Bool { previewStore.isStagedSearchPrepared(snapshot: previewSnapshot) }
+
+    private func prepareSearchIndex(itemCount: Int? = nil) {
+        searchPreparationLock.lock(); defer { searchPreparationLock.unlock() }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard !searchPreparationSuspended, searchPreparationCancellation == nil, now - searchPreparationTime >= 1 else { return }
+        if let itemCount {
+            guard itemCount >= 8_192,
+                  searchPreparationCount == 0 || itemCount >= searchPreparationCount + min(searchPreparationCount, 65_536) else { return }
+            searchPreparationCount = itemCount
+        }
+        searchPreparationTime = now
+        let cancellation = ScanCancellation(), id = UUID()
+        searchPreparationCancellation = cancellation; searchPreparationID = id
+        let store = previewStore, snapshot = previewSnapshot
+        searchPreparationTask = Task.detached(priority: .utility) { [weak self] in
+            _ = try? store.prepareStagedSearch(snapshot: snapshot, cancellation: cancellation)
+            self?.finishSearchPreparation(id)
+        }
+    }
+
+    private func finishSearchPreparation(_ id: UUID) {
+        searchPreparationLock.lock(); defer { searchPreparationLock.unlock() }
+        guard searchPreparationID == id else { return }
+        searchPreparationCancellation = nil; searchPreparationTask = nil
+    }
+
+    private func cancelSearchPreparation(suspend: Bool = false) {
+        searchPreparationLock.lock(); defer { searchPreparationLock.unlock() }
+        if suspend { searchPreparationSuspended = true }
+        searchPreparationID = UUID()
+        searchPreparationCancellation?.cancel(); searchPreparationTask?.cancel()
+        searchPreparationCancellation = nil; searchPreparationTask = nil
     }
 
     /// Configure on the writer before advancing. Candidates must share the checkpoint's event stream.
@@ -271,6 +315,7 @@ public final class ResumableStage: @unchecked Sendable {
     public func search(query: String, cancellation: ScanCancellation, removals: [ScanRemoval], limit: Int) throws -> (nodes: [DiskNode], count: Int, revision: UInt64, removalsChanged: Bool) {
         let state = removalReplay.viewState()
         guard !state.blocked else { throw StageRemovalReplay.Retry.cannotExpose }
+        if !isSearchPrepared { prepareSearchIndex() }
         #if ORBIT_TESTING
         Self.testBeforeStagedRead?()
         #endif
@@ -289,6 +334,7 @@ public final class ResumableStage: @unchecked Sendable {
         try removalReplay.refreshIfNeeded()
         let advanced = try crawler.step(onRecordCount: { [self] count in progressItems += count }, onBatch: { [self] path, _ in
             bumpRevision()
+            prepareSearchIndex(itemCount: progressItems)
             #if ORBIT_TESTING
             if !testBatchDisabled, progressItems >= 512, let batch = testScanner?.testBatch {
                 do { try batch() }
@@ -324,12 +370,21 @@ public final class ResumableStage: @unchecked Sendable {
     }
 
     public func publish(elapsed: TimeInterval) throws -> IndexSnapshot {
+        cancelSearchPreparation(suspend: true)
+        var published = false
+        defer {
+            if !published {
+                searchPreparationLock.lock(); searchPreparationSuspended = false; searchPreparationLock.unlock()
+            }
+        }
         while true {
             try lease.validatePaths()
             do {
-                return try MirrorPublisher.publish(crawler, checkpoint: checkpoint, directory: previewStore.directory,
+                let snapshot = try MirrorPublisher.publish(crawler, checkpoint: checkpoint, directory: previewStore.directory,
                     elapsed: elapsed, expected: expectedSnapshot, expectedGeneration: expectedGeneration,
                     publicationFence: { try self.removalReplay.fencePublication($0) })
+                published = true
+                return snapshot
             } catch StageRemovalReplay.Retry.journalChanged {
                 try prepareRemovalReplay()
                 while try advance(progress: { _ in }) { }

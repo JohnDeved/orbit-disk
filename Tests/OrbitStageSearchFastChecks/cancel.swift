@@ -8,6 +8,8 @@ final class Gate: @unchecked Sendable {
 }
 @main struct Main {
  static func main() async throws {
+ DiskIndexStore.testDisablePreparedSearch = true
+ defer { DiskIndexStore.testDisablePreparedSearch = false }
  let base=URL(fileURLWithPath:CommandLine.arguments[1]),root=base.appendingPathComponent("root"),cache=base.appendingPathComponent(UUID().uuidString)
  let stage=try ResumableStage(cache:cache,root:root,current:StageCheckpoint(rootPath:root.path,identity:"bench",eventID:0))
  while try stage.advance(progress:{_ in}) {}

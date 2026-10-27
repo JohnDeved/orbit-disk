@@ -111,7 +111,7 @@ func checkLookupPreflight(_ base: URL) throws {
   }
   var legacy: OpaquePointer?
   guard sqlite3_open_v2(legacyDatabase, &legacy, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else { fatalError("legacy stage open") }
-  guard sqlite3_exec(legacy, "CREATE INDEX listing_identity ON nodes(dev,inode,directory,st_path)", nil, nil, nil) == SQLITE_OK else { fatalError("legacy stage index") }
+  guard sqlite3_exec(legacy, "CREATE INDEX listing_identity ON nodes(dev,inode,directory,path)", nil, nil, nil) == SQLITE_OK else { fatalError("legacy stage index") }
   sqlite3_close(legacy)
   let changed=StageCheckpoint(rootPath:root.path,identity:"replacement-journal",eventID:42)
   let stage=try ResumableStage(cache:cache,root:root,current:changed)

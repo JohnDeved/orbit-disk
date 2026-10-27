@@ -25,6 +25,7 @@ final class ListingStage {
         }
         sqlite3_busy_timeout(db, 5000)
         try exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+        try exec("PRAGMA cache_size=-16384;")
         try exec("BEGIN IMMEDIATE")
         do {
             try exec("CREATE TABLE IF NOT EXISTS sealed (singleton INTEGER PRIMARY KEY CHECK(singleton=1),snapshot_id TEXT NOT NULL,published INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS stage_issues (path BLOB PRIMARY KEY,message TEXT NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS listing_issues (parent BLOB PRIMARY KEY,count INTEGER NOT NULL,messages TEXT NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS blocked_directories (path BLOB PRIMARY KEY) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS dirty_links (dev INTEGER NOT NULL,inode INTEGER NOT NULL,PRIMARY KEY(dev,inode)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS link_candidates (dev INTEGER NOT NULL,inode INTEGER NOT NULL,parent BLOB NOT NULL,name BLOB NOT NULL,PRIMARY KEY(dev,inode,parent,name)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS link_rebuild (dev INTEGER NOT NULL,inode INTEGER NOT NULL,PRIMARY KEY(dev,inode)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS owners (dev INTEGER NOT NULL,inode INTEGER NOT NULL,parent BLOB NOT NULL,name BLOB NOT NULL,PRIMARY KEY(dev,inode)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS epochs (parent BLOB PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS dirty (parent BLOB PRIMARY KEY, revision INTEGER NOT NULL, pending INTEGER NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS scan (root BLOB PRIMARY KEY, identity BLOB NOT NULL, event_id INTEGER NOT NULL, expected_snapshot TEXT NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS directories (path BLOB PRIMARY KEY, device INTEGER NOT NULL, inode INTEGER NOT NULL, pending INTEGER NOT NULL, full_generation INTEGER NOT NULL DEFAULT 0, logical INTEGER NOT NULL DEFAULT 0, allocated INTEGER NOT NULL DEFAULT 0, files INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS full_refresh (singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation INTEGER NOT NULL, pending INTEGER NOT NULL); INSERT OR IGNORE INTO full_refresh VALUES(1,0,0); CREATE TABLE IF NOT EXISTS prune (path BLOB PRIMARY KEY, parent BLOB NOT NULL, name BLOB NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS trim (parent BLOB PRIMARY KEY, epoch INTEGER NOT NULL, revision INTEGER NOT NULL, full_generation INTEGER NOT NULL) WITHOUT ROWID;")
@@ -146,13 +147,19 @@ final class ListingStage {
             CREATE TABLE IF NOT EXISTS metadata (singleton INTEGER PRIMARY KEY CHECK(singleton=1), snapshot_id TEXT NOT NULL,
               root_path TEXT NOT NULL, scanned_at REAL NOT NULL, elapsed REAL NOT NULL, skipped INTEGER NOT NULL,
               issues TEXT NOT NULL, event_id TEXT NOT NULL, event_identity TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS nodes (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, parent INTEGER, name TEXT NOT NULL DEFAULT '', search_name TEXT NOT NULL DEFAULT '',
+            CREATE TABLE IF NOT EXISTS nodes (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, parent INTEGER, name TEXT NOT NULL DEFAULT '', search_name TEXT NOT NULL DEFAULT '',
               is_dir INTEGER NOT NULL DEFAULT 0, is_link INTEGER NOT NULL DEFAULT 0, accessible INTEGER NOT NULL DEFAULT 1,
               size INTEGER NOT NULL DEFAULT 0, allocated INTEGER NOT NULL DEFAULT 0, file_count INTEGER NOT NULL DEFAULT 0,
               raw_alloc INTEGER NOT NULL DEFAULT 0, file_identity TEXT,
-              st_parent BLOB, st_name BLOB, dev INTEGER, inode INTEGER, directory INTEGER, st_is_link INTEGER,
+              st_parent BLOB, st_name BLOB, dev INTEGER, inode INTEGER, directory INTEGER,
               is_mount INTEGER, st_size INTEGER, st_allocated INTEGER, links INTEGER, epoch INTEGER,
-              st_path BLOB, charged INTEGER, folded BLOB, identity BLOB, UNIQUE(st_parent,st_name));
+              charged INTEGER, UNIQUE(st_parent,st_name));
+            CREATE TABLE IF NOT EXISTS orbit_search_generation (singleton INTEGER PRIMARY KEY CHECK(singleton=1), value INTEGER NOT NULL);
+            INSERT OR IGNORE INTO orbit_search_generation VALUES(1,0);
+            CREATE TRIGGER IF NOT EXISTS node_search_generation AFTER UPDATE OF search_name ON nodes
+              WHEN OLD.search_name<>NEW.search_name BEGIN
+              UPDATE orbit_search_generation SET value=value+1 WHERE singleton=1;
+            END;
             CREATE INDEX IF NOT EXISTS children_by_size ON nodes(parent,size DESC,name);
             CREATE INDEX IF NOT EXISTS nodes_by_size ON nodes(size DESC,id,search_name,parent);
             CREATE INDEX IF NOT EXISTS file_identities ON nodes(file_identity) WHERE is_dir=0 AND file_identity IS NOT NULL;
@@ -497,9 +504,9 @@ final class ListingStage {
             guard sqlite3_step(parentCheck) == SQLITE_ROW else { throw Failure.sqlite("missing node parent") }
             let parentID = sqlite3_column_int64(parentCheck, 0)
             let insert = try prepare("""
-                INSERT INTO nodes(st_parent,st_name,dev,inode,directory,st_is_link,is_mount,st_size,st_allocated,links,epoch,st_path,charged,folded,identity,
+                INSERT INTO nodes(st_parent,st_name,dev,inode,directory,is_mount,st_size,st_allocated,links,epoch,charged,
                     path,parent,name,search_name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,file_identity)
-                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,
+                VALUES(?1,?2,?3,?4,?5,?7,?8,?9,?10,?11,?13,
                     CAST(?12 AS TEXT),?16,CAST(?2 AS TEXT),CAST(?14 AS TEXT),?5,?6,
                     CASE WHEN ?5=1 AND (?7=1 OR ?3<>(SELECT device FROM directories WHERE path=(SELECT root FROM scan LIMIT 1))) THEN 0 ELSE 1 END,
                     CASE WHEN ?5=1 THEN COALESCE((SELECT logical FROM directories WHERE path=?12),0) ELSE ?8 END,
@@ -508,8 +515,8 @@ final class ListingStage {
                     CASE WHEN ?5=1 THEN 0 ELSE ?9 END,CAST(?15 AS TEXT))
                 ON CONFLICT(st_parent,st_name) DO UPDATE SET
                     charged=CASE WHEN nodes.dev=excluded.dev AND nodes.inode=excluded.inode AND nodes.directory=excluded.directory THEN nodes.charged ELSE 0 END,
-                    dev=excluded.dev,inode=excluded.inode,directory=excluded.directory,st_is_link=excluded.st_is_link,is_mount=excluded.is_mount,
-                    st_size=excluded.st_size,st_allocated=excluded.st_allocated,links=excluded.links,epoch=excluded.epoch,st_path=excluded.st_path,folded=excluded.folded,identity=excluded.identity,
+                    dev=excluded.dev,inode=excluded.inode,directory=excluded.directory,is_mount=excluded.is_mount,
+                    st_size=excluded.st_size,st_allocated=excluded.st_allocated,links=excluded.links,epoch=excluded.epoch,
                     path=excluded.path,parent=excluded.parent,name=excluded.name,search_name=excluded.search_name,is_dir=excluded.is_dir,is_link=excluded.is_link,
                     accessible=excluded.accessible,size=excluded.size,
                     allocated=CASE WHEN excluded.directory=1 THEN excluded.allocated WHEN nodes.dev=excluded.dev AND nodes.inode=excluded.inode AND nodes.directory=excluded.directory THEN nodes.charged ELSE 0 END,
@@ -1136,7 +1143,7 @@ final class ListingStage {
     }
 
     func charge(path: Data) throws -> Int64? {
-        let statement = try prepare("SELECT charged FROM nodes WHERE st_path=?")
+        let statement = try prepare("SELECT charged FROM nodes WHERE path=CAST(? AS TEXT)")
         defer { sqlite3_finalize(statement) }
         bind(path, 1, statement)
         let result = sqlite3_step(statement)
@@ -1154,12 +1161,11 @@ final class ListingStage {
 
     func testCrashDuringTransaction(parent: Data) throws -> Never {
         try exec("BEGIN IMMEDIATE")
-        let statement = try prepare("INSERT INTO nodes(st_parent,st_name,dev,inode,directory,st_is_link,is_mount,st_size,st_allocated,links,epoch,st_path,charged,folded,identity,path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CAST(? AS TEXT))")
+        let statement = try prepare("INSERT INTO nodes(st_parent,st_name,dev,inode,directory,is_mount,st_size,st_allocated,links,epoch,charged,path) VALUES(?,?,?,?,?,?,?,?,?,?,?,CAST(? AS TEXT))")
         bind(parent, 1, statement); bind(Data("uncommitted".utf8), 2, statement)
         for index in 3...11 { sqlite3_bind_int64(statement, Int32(index), 0) }
         var path = parent; if path.last != 47 { path.append(47) }; path.append(contentsOf: "uncommitted".utf8)
-        bind(path, 12, statement); bind(path, 16, statement); sqlite3_bind_int64(statement, 13, 0)
-        bind(Data("uncommitted".utf8), 14, statement); bind(Data("0:0".utf8), 15, statement)
+        bind(path, 12, statement)
         try step(statement)
         kill(getpid(), SIGKILL)
         fatalError("SIGKILL returned")
