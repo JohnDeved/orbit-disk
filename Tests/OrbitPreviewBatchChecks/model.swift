@@ -29,7 +29,8 @@ final class Gate: @unchecked Sendable {
         let root=base.appendingPathComponent("model-files", isDirectory:true)
         let fm=FileManager.default
         try fm.createDirectory(at: root,withIntermediateDirectories:true)
-        for i in 0..<2_500 { try fm.createDirectory(at: root.appendingPathComponent("folder-\(i)"),withIntermediateDirectories:true) }
+        let folderCount = 2_500
+        for i in 0..<folderCount { try fm.createDirectory(at: root.appendingPathComponent("folder-\(i)"),withIntermediateDirectories:true) }
         let testingBatch=Gate(), testingFallback=Gate()
         let preferences=UserDefaults(suiteName:"local.orbit.partialchecks.\(UUID())")!
         let cache=base.appendingPathComponent("normal")
@@ -39,9 +40,11 @@ final class Gate: @unchecked Sendable {
         model.scan(root)
         try await wait("provisional root") { testingBatch.isWaiting && model.current?.children.isEmpty == false }
         let partial=model.current!
-        precondition(partial.children.count >= 512 && partial.children.count < 12000)
+        precondition(!partial.children.isEmpty && partial.children.count < folderCount && !partial.isScanComplete,
+                     "The first visible batch must be a nonempty, incomplete directory listing")
         let folder=partial.children.first!
-        precondition(folder.isDirectory && !folder.isScanComplete && model.canCollect(folder))
+        precondition(partial.children.allSatisfy { $0.isDirectory && !$0.isScanComplete && model.canCollect($0) },
+                     "Every provisional folder must remain collectable before mapping finishes")
         model.open(folder)
         try await wait("navigate to provisional folder") { model.current?.id == folder.id && !model.isOpeningFolder }
         model.goBack()
