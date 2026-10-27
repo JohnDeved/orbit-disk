@@ -1200,6 +1200,7 @@ final class CollectionGate: @unchecked Sendable {
     }
 
     @MainActor static func main() async throws {
+        setbuf(stdout, nil)
         checkCollectedAncestorParity()
         checkCollectionCoverage()
         let oversized = (0..<2).map { i in

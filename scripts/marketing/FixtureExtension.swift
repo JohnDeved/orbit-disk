@@ -25,7 +25,6 @@
                               capacity: 1_000_000_000_000, available: 342_000_000_000)]
         scanResult = ScanResult(root: root, elapsed: 0, skippedCount: 0, issues: [])
         statusMessage = "Sample data"
-        collectionEligibility = [selected.id: CollectionEligibility(identity: selected.fileIdentity, rejection: nil)]
         selectedID = selected.id
         collection = collected
         session.collectionState = collectionState
