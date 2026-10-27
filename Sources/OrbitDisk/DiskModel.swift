@@ -549,6 +549,7 @@ final class DiskModel: ObservableObject {
         didSet { mapChildIDs = nil; folderSizeOrder = nil; preparedMapHoverGroup = nil; invalidateDisplayedNodes() }
     }
     private(set) var mapChildIDs: [String]?
+    var mapChildIDSet: Set<String>? { mapChildIDs == nil ? nil : folderSizeOrder?.ids }
     private(set) var mapRevision = UUID() {
         willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 }
         didSet {

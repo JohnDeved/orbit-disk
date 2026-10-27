@@ -28,6 +28,17 @@ final class NthGate: @unchecked Sendable {
     func release(){gate.signal()}
 }
 @main struct Test {
+    @MainActor static func checkMapMembership(_ model: DiskModel) {
+        guard let ids = model.mapChildIDs else {
+            precondition(model.mapChildIDSet == nil)
+            return
+        }
+        guard let children = model.current?.children else { preconditionFailure("IDs without a current folder") }
+        precondition(ids.count == children.count && model.mapChildIDSet == Set(ids))
+        for (id, child) in zip(ids, children) {
+            precondition(id.utf8.elementsEqual(child.id.utf8), "IDs refer to a different folder revision")
+        }
+    }
     @MainActor static func wait(_ name:String,_ f:()->Bool) async throws {
         for _ in 0..<500 {if f(){return};try await Task.sleep(nanoseconds:20_000_000)}
         throw NSError(domain:name,code:1)
@@ -40,17 +51,26 @@ final class NthGate: @unchecked Sendable {
         let prefs=UserDefaults(suiteName:"session-check-\(UUID())")!, gate=RootGate(a.path)
         let cache=dir.appendingPathComponent("index"), store=DiskIndexStore(directory:cache)
         let model=DiskModel(cacheDirectory:cache,preferences:prefs,scanProgressObserver:{gate.observe($0)})
+        checkMapMembership(model)
         model.scan(a); try await wait("preview a") {gate.waiting && model.current?.children.count == 2}
+        checkMapMembership(model)
         precondition(model.collect([model.current!.children.first {$0.name == "first"}!]))
         model.scan(sub);try await wait("navigate partial") {model.current?.id == sub.path}
+        checkMapMembership(model)
         precondition(store.savedSnapshot(for:sub) == nil)
         model.scan(b);try await wait("scan b") {!model.isScanning && model.root?.id == b.path}
+        checkMapMembership(model)
+        model.query = "other"; checkMapMembership(model)
+        model.sortByName = true; checkMapMembership(model)
+        model.query = ""; model.sortByName = false; checkMapMembership(model)
         precondition(gate.waiting && model.collection.isEmpty && model.collectionSize == 0)
         precondition(model.collect([model.current!.children.first!]))
         model.scan(a);try await wait("reattach a") {model.root?.id == a.path && model.current?.id == sub.path}
+        checkMapMembership(model)
         precondition(gate.waiting && model.isScanning && store.savedSnapshot(for:a) == nil)
         precondition(model.collection.count == 1 && model.collection[0].name == "first" && model.collectionSize == 1)
         model.scan(b);try await wait("reattach b") {!model.isScanning && model.root?.id == b.path}
+        checkMapMembership(model)
         precondition(model.collection.count == 1 && model.collection[0].name == "other" && model.collectionSize == 3)
         gate.release(); try await wait("detached a saves") {store.savedSnapshot(for:a) != nil}
         precondition(model.root?.id == b.path)
@@ -80,6 +100,12 @@ final class NthGate: @unchecked Sendable {
         precondition(model.root?.size == 6)
         refreshGate.release();try await wait("reattach after refresh") {model.root?.id == a.path && model.root?.size == 7 && !model.isScanning}
         model.cancelScan()
+        let cleared=DiskModel(cacheDirectory:dir.appendingPathComponent("clear-index"),preferences:prefs)
+        cleared.scan(b); try await wait("clear fixture") {!cleared.isScanning && cleared.current?.id == b.path}
+        checkMapMembership(cleared)
+        precondition(cleared.testClearSynthetic())
+        precondition(cleared.mapChildIDs == nil && cleared.mapChildIDSet == nil)
+        cleared.cancelScan()
         let c=dir.appendingPathComponent("c"), moved=dir.appendingPathComponent("moved")
         try fm.createDirectory(at:c,withIntermediateDirectories:true)
         try Data([4]).write(to:c.appendingPathComponent("old"))

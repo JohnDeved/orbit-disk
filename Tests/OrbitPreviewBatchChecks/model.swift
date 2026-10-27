@@ -47,6 +47,8 @@ final class Gate: @unchecked Sendable {
         try await wait("back to partial root") { model.current?.id == root.path && !model.isOpeningFolder }
         model.selectedID=folder.id
         let revision=model.mapRevision
+        let heldIDs=model.mapChildIDs!
+        precondition(model.mapChildIDSet == Set(heldIDs))
         guard let drag = model.beginCollectionDrag([folder], label: folder.name) else { fatalError("partial folder not draggable") }
         let oldInteraction = model.beginMapInteraction()
         let currentInteraction = model.beginMapInteraction()
@@ -56,10 +58,13 @@ final class Gate: @unchecked Sendable {
         try await wait("save while interacting") { DiskIndexStore(directory: cache).savedSnapshot(for: root) != nil }
         try await Task.sleep(nanoseconds: 100_000_000)
         precondition(model.mapRevision == revision && model.isPartialMap, "gesture changed map")
+        precondition(model.mapChildIDs == heldIDs && model.mapChildIDSet == Set(heldIDs), "deferred publication changed group membership")
         model.endCollectionDrag(drag)
         precondition(model.testMapInteractionActive && model.mapRevision == revision, "source completion changed the held map")
+        precondition(model.mapChildIDs == heldIDs && model.mapChildIDSet == Set(heldIDs))
         currentInteraction()
         try await wait("complete") { !model.isScanning && !model.isPartialMap && !model.isOpeningFolder }
+        precondition(model.mapChildIDSet == model.mapChildIDs.map(Set.init))
         precondition(model.selectedID == folder.id && model.current?.children.allSatisfy(\.isScanComplete) == true)
         model.cancelScan()
         print("PASS: pending collection available; provisional navigation/back, selection, held geometry and final handoff")

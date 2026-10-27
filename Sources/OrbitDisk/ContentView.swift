@@ -227,7 +227,7 @@ struct ContentView: View {
                                  selectedID: model.selectedID, hoveredID: model.hoveredListID,
                                  collectionCoverage: model.collectionCoverage,
                                  updatingSizes: model.isUpdatingRemovalSizes,
-                                 colorIndices: model.childColorIndices, rootChildIDs: model.mapChildIDs,
+                                 colorIndices: model.childColorIndices, rootChildIDs: model.mapChildIDs, rootChildIDSet: model.mapChildIDSet,
                                  onSelect: { model.selectedID = $0.id }, onOpen: model.open,
                                  onBack: model.goBack, canGoBack: model.navigation.count > 1,
                                  onHover: { nodes, group in

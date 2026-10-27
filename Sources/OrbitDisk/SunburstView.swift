@@ -18,14 +18,15 @@ final class SunburstPresentationCache {
     private var prepared: SunburstPresentation?
 
     func presentation(root: DiskNode, mapRevision: UUID, coverage: CollectionCoverage,
-                      colorIndices: [String: Int] = [:], rootChildIDs: [String]? = nil) -> SunburstPresentation {
+                      colorIndices: [String: Int] = [:], rootChildIDs: [String]? = nil,
+                      rootChildIDSet: Set<String>? = nil) -> SunburstPresentation {
         let rootID = root.id
         let layout: SunburstPreparedLayout
         if self.rootID == rootID, self.mapRevision == mapRevision, let prepared {
             if self.coverage == coverage { return prepared }
             layout = prepared.layout
         } else {
-            layout = SunburstPreparedLayout(root: root, mapRevision: mapRevision, colorIndices: colorIndices, rootChildIDs: rootChildIDs)
+            layout = SunburstPreparedLayout(root: root, mapRevision: mapRevision, colorIndices: colorIndices, rootChildIDs: rootChildIDs, rootChildIDSet: rootChildIDSet)
         }
         let states = coverage.isEmpty
             ? Array(repeating: CollectionState.none, count: layout.segments.count)
@@ -53,20 +54,23 @@ final class SunburstPreparedLayout {
     private let segmentIndices: [String: Int]
     private let hoverGroups: [String: PreparedMapHoverGroup]
     private let groupMemberSets: [Set<String>?]
+    private let soleGroupMembers: Set<String>?
 
-    init(root: DiskNode, mapRevision: UUID, colorIndices: [String: Int] = [:], rootChildIDs: [String]? = nil) {
-        let segments = SunburstLayout.make(root: root, colorIndices: colorIndices, rootChildIDs: rootChildIDs)
+    init(root: DiskNode, mapRevision: UUID, colorIndices: [String: Int] = [:], rootChildIDs: [String]? = nil,
+         rootChildIDSet: Set<String>? = nil) {
+        let segments = SunburstLayout.make(root: root, colorIndices: colorIndices, rootChildIDs: rootChildIDs, rootChildIDSet: rootChildIDSet)
         let rootID = root.id
         let memberIDs = segments.map { $0.preparedMemberIDs ?? $0.members.map(\.id) }
         var indices: [String: Int] = [:]
         var hoverGroups: [String: PreparedMapHoverGroup] = [:]
         var groupMemberSets: [Set<String>?] = Array(repeating: nil, count: segments.count)
-        indices.reserveCapacity(memberIDs.reduce(segments.count) { $0 + $1.count })
+        let soleGroupMembers = segments.count == 1 && segments[0].reusesRootIDs ? rootChildIDSet : nil
+        indices.reserveCapacity(soleGroupMembers == nil ? memberIDs.reduce(segments.count) { $0 + $1.count } : 1)
         for (index, segment) in segments.enumerated() {
             indices[segment.id] = index
-            for memberID in memberIDs[index] { indices[memberID] = index }
+            if soleGroupMembers == nil { for memberID in memberIDs[index] { indices[memberID] = index } }
             if let parentID = segment.groupParentID {
-                let members = Set(memberIDs[index])
+                let members = soleGroupMembers ?? Set(memberIDs[index])
                 hoverGroups[segment.id] = PreparedMapHoverGroup(id: segment.id, parentID: parentID,
                                                                rootID: rootID, mapRevision: mapRevision,
                                                                memberIDs: members)
@@ -78,11 +82,13 @@ final class SunburstPreparedLayout {
         self.segmentIndices = indices
         self.hoverGroups = hoverGroups
         self.groupMemberSets = groupMemberSets
+        self.soleGroupMembers = soleGroupMembers
     }
 
     func index(for id: String?) -> Int? {
         guard let id else { return nil }
-        return segmentIndices[id]
+        if let index = segmentIndices[id] { return index }
+        return soleGroupMembers?.contains(id) == true ? 0 : nil
     }
 
     func contains(groupMember id: Data, at index: Int) -> Bool {
@@ -205,7 +211,7 @@ struct SunburstView: View {
     init(root: DiskNode, mapRevision: UUID, cache: SunburstPresentationCache,
          selectedID: String?, hoveredID: String?, collectionCoverage: CollectionCoverage,
          updatingSizes: Bool = false,
-         colorIndices: [String: Int] = [:], rootChildIDs: [String]? = nil, onSelect: @escaping (DiskNode) -> Void,
+         colorIndices: [String: Int] = [:], rootChildIDs: [String]? = nil, rootChildIDSet: Set<String>? = nil, onSelect: @escaping (DiskNode) -> Void,
          onOpen: @escaping (DiskNode) -> Void, onBack: @escaping () -> Void, canGoBack: Bool,
          onHover: @escaping ([DiskNode]?, PreparedMapHoverGroup?) -> Void,
          makeDrag: @escaping ([DiskNode], String) -> NSPasteboardItem?, onDragEnded: @escaping (NSPasteboardItem) -> Void,
@@ -223,7 +229,7 @@ struct SunburstView: View {
         self.onDragEnded = onDragEnded
         self.beginInteraction = beginInteraction
         self.presentation = cache.presentation(root: root, mapRevision: mapRevision, coverage: collectionCoverage,
-                                               colorIndices: colorIndices, rootChildIDs: rootChildIDs)
+                                               colorIndices: colorIndices, rootChildIDs: rootChildIDs, rootChildIDSet: rootChildIDSet)
     }
 
     private var activeSegment: SunburstSegment? {
@@ -415,6 +421,7 @@ struct SunburstSegment {
     var scanState: NodeScanState = .complete
     var groupParentID: String? = nil
     var preparedMemberIDs: [String]? = nil
+    var reusesRootIDs = false
 
     func matches(_ target: String?) -> Bool {
         guard let target else { return false }
@@ -462,7 +469,8 @@ enum SunburstLayout {
         let color: Int?
     }
 
-    static func make(root: DiskNode, colorIndices: [String: Int] = [:], rootChildIDs: [String]? = nil) -> [SunburstSegment] {
+    static func make(root: DiskNode, colorIndices: [String: Int] = [:], rootChildIDs: [String]? = nil,
+                     rootChildIDSet: Set<String>? = nil) -> [SunburstSegment] {
         guard root.size > 0 else { return [] }
         var result: [SunburstSegment] = []
         var queue = [Branch(node: root, start: 0, end: 2 * .pi, depth: 0, color: nil)]
@@ -474,10 +482,35 @@ enum SunburstLayout {
             guard branch.depth < 4, !branch.node.children.isEmpty else { continue }
             let children = branch.node.children
             let branchIDs = branch.depth == 0 && rootChildIDs?.count == children.count ? rootChildIDs : nil
+            let canReuseRoot = branch.depth == 0 && children.count >= 1_024 && branchIDs != nil && rootChildIDSet?.count == children.count
             let total = children.reduce(0.0) { $0 + Double(max(0, $1.size)) }
             let denominator = max(Double(branch.node.size), total)
             guard denominator > 0 else { continue }
             let sweep = branch.end - branch.start
+            if canReuseRoot && children[0].size > 0 && sweep * Double(children[0].size) / denominator < 0.014 {
+                var size: Int64 = 0
+                var complete = true
+                var allGrouped = true
+                for child in children {
+                    guard child.size > 0 && sweep * Double(child.size) / denominator < 0.014 else {
+                        allGrouped = false
+                        break
+                    }
+                    let sum = size.addingReportingOverflow(child.size)
+                    guard !sum.overflow else { allGrouped = false; break }
+                    size = sum.partialValue
+                    complete = complete && child.isScanComplete
+                }
+                if allGrouped {
+                    result.append(SunburstSegment(id: "group:\(branch.node.id)", node: nil, members: children,
+                                                  name: "\(children.count.formatted()) grouped \(children.count == 1 ? "item" : "items")",
+                                                  size: size, start: branch.start, end: branch.start + sweep * Double(size) / denominator,
+                                                  depth: branch.depth, branchIndex: branch.color ?? Int.min,
+                                                  scanState: complete ? .complete : .scanning,
+                                                  groupParentID: branch.node.id, preparedMemberIDs: branchIDs, reusesRootIDs: true))
+                    continue
+                }
+            }
             let remaining = max(0, min(48, 768 - result.count - 1))
             var cursor = branch.start
             var groupedSize: Int64 = 0

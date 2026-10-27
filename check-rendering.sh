@@ -12,3 +12,11 @@ swiftc -parse-as-library -O -swift-version 5 \
   Tests/OrbitRenderChecks.swift "$build_path/OrbitCore.build/"*.swift.o \
   -o "$build_path/OrbitRenderChecks"
 "$build_path/OrbitRenderChecks"
+swiftc -parse-as-library -O -swift-version 5 \
+  -module-cache-path .build/module-cache -target "$(uname -m)-apple-macosx14.0" \
+  -I "$build_path/Modules" -I Sources/CSQLite \
+  Sources/OrbitDisk/SunburstView.swift Sources/OrbitDisk/MapInteractionView.swift \
+  Sources/OrbitDisk/CollectionCoverage.swift Sources/OrbitDisk/PreparedMapHoverGroup.swift Sources/OrbitDisk/PointingCursor.swift \
+  Tests/OrbitRootGroupChecks/main.swift "$build_path/OrbitCore.build/"*.swift.o \
+  -o "$build_path/OrbitRootGroupChecks"
+"$build_path/OrbitRootGroupChecks"
