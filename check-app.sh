@@ -3,8 +3,9 @@ set -euo pipefail
 cd "${0:A:h}"
 swift build -c release --target OrbitCore -Xswiftc -DORBIT_TESTING
 build_path=$(swift build -c release --show-bin-path)
+package_name=$(python3 scripts/swift-package-name.py "$build_path/description.json")
 target="$(uname -m)-apple-macosx14.0"
-swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name orbitdisk \
+swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name "$package_name" \
   -I "$build_path/Modules" -I Sources/CSQLite \
   Sources/OrbitDisk/DiskModel.swift Sources/OrbitDisk/DiskChangeMonitor.swift \
   Sources/OrbitDisk/CollectionCoverage.swift Sources/OrbitDisk/PreparedMapHoverGroup.swift \
@@ -14,7 +15,7 @@ temp_root=${TMPDIR:-/tmp}
 fixture=$(mktemp -d "${temp_root%/}/OrbitAppChecks.XXXXXX")
 trap 'rm -rf "$fixture"' EXIT
 "$build_path/OrbitAppChecks" "$fixture"
-swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name orbitdisk \
+swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name "$package_name" \
   -I "$build_path/Modules" -I Sources/CSQLite \
   Sources/OrbitDisk/DiskModel.swift Sources/OrbitDisk/DiskChangeMonitor.swift \
   Sources/OrbitDisk/CollectionCoverage.swift Sources/OrbitDisk/PreparedMapHoverGroup.swift \
@@ -22,7 +23,7 @@ swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING 
   "$build_path/OrbitCore.build/"*.swift.o -o "$build_path/OrbitLargeCollectionChecks"
 mkdir -p "$fixture/large-collection"
 "$build_path/OrbitLargeCollectionChecks" "$fixture/large-collection"
-swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name orbitdisk \
+swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name "$package_name" \
   -I "$build_path/Modules" -I Sources/CSQLite \
   Sources/OrbitDisk/DiskModel.swift Sources/OrbitDisk/DiskChangeMonitor.swift \
   Sources/OrbitDisk/CollectionCoverage.swift Sources/OrbitDisk/PreparedMapHoverGroup.swift \

@@ -18,7 +18,7 @@ print "Building the native screenshot renderer…"
 app_sources=("$tmp/app/"*.swift)
 app_sources=(${app_sources:#*/OrbitDiskApp.swift})
 app_sources=(${app_sources:#*/AppUpdater.swift})
-swiftc -parse-as-library -Onone -swift-version 5 -target "$target" \
+swiftc -parse-as-library -Onone -swift-version 5 -package-name OrbitDisk -target "$target" \
   -module-cache-path "$tmp/module-cache" -I "$tmp" -I Sources/CSQLite \
   "${app_sources[@]}" scripts/marketing/Capture.swift "$tmp/OrbitCore.o" -o "$tmp/MarketingCapture"
 "$tmp/MarketingCapture" "$tmp/raw" -AppleLocale en_US
