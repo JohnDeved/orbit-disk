@@ -10,6 +10,10 @@ import OrbitCore
         fatalError("timeout")
     }
     @MainActor static func main() async throws {
+        if CommandLine.arguments.count > 2 && CommandLine.arguments[2] == "hover" {
+            try await HoverRefreshHostedChecks.run(URL(fileURLWithPath: CommandLine.arguments[1]))
+            return
+        }
         NSApplication.shared.setActivationPolicy(.prohibited)
         let base = URL(fileURLWithPath: CommandLine.arguments[1])
         let rootURL = base.appendingPathComponent("root")

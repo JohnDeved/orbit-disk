@@ -2463,6 +2463,15 @@ final class DiskModel: ObservableObject {
         if needsReset { largeListIdentity &+= 1 }
         let preservesHover = current?.id == view.folder.id && root?.id == view.root.id
             && root?.fileIdentity == view.root.fileIdentity
+        let oldGroup = preservesHover && !isFiltering && hoveredMapNodes.count >= 1_024 ? preparedMapHoverGroup : nil
+        let oldIDs = oldGroup == nil ? nil : mapChildIDs
+        let oldSet = oldGroup == nil ? nil : mapChildIDSet
+        let hoveredWasCurrentChildren = oldGroup != nil && (current.map { current in
+            hoveredMapNodes.count == current.children.count && hoveredMapNodes.withUnsafeBufferPointer { left in
+                current.children.withUnsafeBufferPointer { right in left.baseAddress == right.baseAddress }
+            }
+        } ?? false)
+        let hoverRevisionWasCurrent = oldGroup?.mapRevision == mapRevision
         if !preservesHover { clearHover() }
         mapRevision = UUID()
         root = view.root
@@ -2503,12 +2512,32 @@ final class DiskModel: ObservableObject {
             for (id, node) in searchNodes where nodesByID[id] == nil { searchNodesByID[id] = node }
         }
         if preservesHover {
-            let refreshedHover = hoveredMapNodes.compactMap { previous -> DiskNode? in
+            let rootPrefix = view.folder.id == "/" ? "/" : view.folder.id + "/"
+            let rootPrefixBytes = Array(rootPrefix.utf8)
+            let fastRoot = hoverRevisionWasCurrent && hoveredWasCurrentChildren && hoveredMapNodes.count == oldIDs?.count
+                && oldGroup?.parentID == view.folder.id && oldGroup?.rootID == view.folder.id
+                && oldGroup?.id == hoveredMapGroupID && oldIDs?.count == view.childIDs.count
+                && view.displayedIDs.count == view.childIDs.count && oldSet?.count == view.childIDs.count
+                && oldSet == oldGroup?.memberIDs
+                && zip(oldIDs ?? [], view.childIDs).allSatisfy { $0.utf8.elementsEqual($1.utf8) }
+                && zip(zip(hoveredMapNodes, view.folder.children), view.childIDs).allSatisfy { pair, id in
+                    let (old, new) = pair
+                    let bytes = id.utf8
+                    return old.fileIdentity != nil && old.fileIdentity == new.fileIdentity && new.children.isEmpty
+                        && bytes.starts(with: rootPrefixBytes) && bytes.count > rootPrefixBytes.count
+                        && !bytes.dropFirst(rootPrefixBytes.count).contains(47)
+                }
+            let refreshedHover = fastRoot ? view.folder.children : hoveredMapNodes.compactMap { previous -> DiskNode? in
                 guard let node = node(withID: previous.id), node.fileIdentity == previous.fileIdentity else { return nil }
                 return node
             }
             if refreshedHover.count == hoveredMapNodes.count {
                 hoveredMapNodes = refreshedHover
+                if fastRoot, let oldGroup {
+                    preparedMapHoverGroup = PreparedMapHoverGroup(id: oldGroup.id, parentID: oldGroup.parentID,
+                                                                  rootID: oldGroup.rootID, mapRevision: mapRevision,
+                                                                  memberIDs: view.displayedIDs)
+                }
             } else {
                 hoveredMapNodes = []
                 hoveredMapGroupID = nil
