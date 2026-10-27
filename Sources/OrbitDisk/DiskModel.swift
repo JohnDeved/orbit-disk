@@ -506,7 +506,7 @@ final class DiskModel: ObservableObject {
     private var statusMessageRevision: UInt64 = 0
     private var errorMessageRevision: UInt64 = 0
     #if ORBIT_TESTING
-    var testBeforeSessionReopen: @Sendable () -> Void = {}
+    var testBeforeSessionReopen: @Sendable () async -> Void = {}
     var testForceCollectionFailure = false
     func testSetTransferFeedback(_ url: URL) {
         sessions[url.path]?.removalStatus = "removal status"
@@ -880,7 +880,7 @@ final class DiskModel: ObservableObject {
         return isReachableWithinSession(root: root, target: target, expectedIdentity: identity)
     }
     func testContains(_ path: String, root: String) -> Bool { containsBytes(path, root: root) }
-    var testCollectionPrepare: @Sendable () -> Void = {}
+    var testCollectionPrepare: @Sendable () async -> Void = {}
     #endif
     private var previewPreparationWorker: Task<PreparedPreview?, Error>?
     private var recoveryParentLimit: Int {
@@ -1464,7 +1464,7 @@ final class DiskModel: ObservableObject {
                 #endif
                 let reopen = Task.detached { () throws -> (IndexSnapshot, PreparedFolder, Bool) in
                     #if ORBIT_TESTING
-                    beforeSessionReopen()
+                    await beforeSessionReopen()
                     #endif
                     if let previousRefresh { _ = try? await previousRefresh.value }
                     guard !session.token.isCancelled else { throw CancellationError() }
@@ -3113,7 +3113,7 @@ final class DiskModel: ObservableObject {
                     }
                     guard let validation = validateCollectionNodes(candidates, root: root.url, cancellation: token) else { return nil }
                     #if ORBIT_TESTING
-                    testCollectionPrepare()
+                    await testCollectionPrepare()
                     #endif
                     guard let result = prepareCollectionApplication(validation, existing: collectionSnapshot, identities: identities, collected: collectedSnapshot,
                                                         includedCount: includedCount, cancellation: token),

@@ -3,18 +3,44 @@ import Combine
 import Foundation
 import OrbitCore
 final class Gate: @unchecked Sendable {
-    private let lock = NSLock(), semaphore = DispatchSemaphore(value: 0)
-    private var first = true, waitingValue = false
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var first = true, waitingValue = false, released = false
     var waiting: Bool { lock.lock(); defer { lock.unlock() }; return waitingValue }
-    func pause() { precondition(!Thread.isMainThread); lock.lock(); let block = first; first = false; if block { waitingValue = true }; lock.unlock(); if block { semaphore.wait(); lock.lock(); waitingValue = false; lock.unlock() } }
-    func release() { semaphore.signal() }
+    func pause() async {
+        precondition(!Thread.isMainThread)
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            let shouldWait = first && !released
+            first = false
+            if shouldWait { self.continuation = continuation; waitingValue = true }
+            lock.unlock()
+            if !shouldWait { continuation.resume() }
+        }
+    }
+    func release() {
+        lock.lock()
+        released = true; waitingValue = false
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume()
+    }
 }
 @main struct Check {
+    private static let timeoutQueue = DispatchQueue(label: "OrbitCollectionSessionChecks.timeout")
     @MainActor static func wait(_ label: String, _ f: () -> Bool) async throws {
+        fputs("CHECK collection session: \(label)\n", stderr)
         for _ in 0..<1000 { if f() { return }; try await Task.sleep(nanoseconds: 10_000_000) }
         fatalError("Timeout: \(label)")
     }
     @MainActor static func main() async throws {
+        let deadline = DispatchWorkItem {
+            fputs("FAIL collection session did not finish within 60 seconds; see the last CHECK line\n", stderr)
+            exit(EXIT_FAILURE)
+        }
+        timeoutQueue.asyncAfter(deadline: .now() + 60, execute: deadline)
+        defer { deadline.cancel() }
         let base=URL(fileURLWithPath:CommandLine.arguments[1]), fm=FileManager.default
         let a=base.appendingPathComponent("a"), b=base.appendingPathComponent("b")
         for dir in [a,b] { try fm.createDirectory(at:dir,withIntermediateDirectories:true); try Data([1]).write(to:dir.appendingPathComponent("file")) }
@@ -25,15 +51,15 @@ final class Gate: @unchecked Sendable {
         m.scan(b); try await wait("B map") { m.root?.id == b.path && !m.isScanning }
         let bItem=m.current!.children.first { $0.name == "file" }!, staleItem=m.current!.children.first { $0.name == "stale" }!, bGate=Gate()
         try fm.removeItem(at:stale)
-        m.testCollectionPrepare={bGate.pause()}
+        m.testCollectionPrepare={await bGate.pause()}
         precondition(m.testCollectInBackground([bItem, staleItem]))
         try await wait("B validation") {bGate.waiting && m.isValidatingCollection}
         m.scan(a); try await wait("A map") {m.root?.id == a.path && !m.isScanning}
         let aItem=m.current!.children.first!, aGate=Gate()
-        m.testCollectionPrepare={aGate.pause()}
+        m.testCollectionPrepare={await aGate.pause()}
         precondition(m.testCollectInBackground([aItem]))
         try await wait("A validation") {aGate.waiting && m.isValidatingCollection}
-        let reopen=Gate(); m.testBeforeSessionReopen={reopen.pause()}
+        let reopen=Gate(); m.testBeforeSessionReopen={await reopen.pause()}
         var fired=false
         let observer=m.objectWillChange.sink { _ in
             guard !fired else {return}; fired=true; m.testActivateResolved(b)
@@ -59,7 +85,7 @@ final class Gate: @unchecked Sendable {
         m.scan(b); try await wait("B retained") {m.root?.id == b.path && !m.isScanning && m.collection.map(\.id) == [bItem.id]}
         let next=m.current!.children.first { $0.name == "stale2" }!
         try fm.removeItem(at:stale2)
-        let secondGate=Gate(); m.testCollectionPrepare={secondGate.pause()}
+        let secondGate=Gate(); m.testCollectionPrepare={await secondGate.pause()}
         precondition(m.testCollectInBackground([next])); try await wait("newer error held") {secondGate.waiting}
         m.errorMessage="newer error"; secondGate.release()
         try await wait("newer error retained") {!m.isValidatingCollection}
@@ -77,7 +103,7 @@ final class Gate: @unchecked Sendable {
         m.errorMessage=nil
         let third=m.current!.children.first { $0.name == "stale3" }!
         try fm.removeItem(at:stale3)
-        let thirdGate=Gate(); m.testCollectionPrepare={thirdGate.pause()}
+        let thirdGate=Gate(); m.testCollectionPrepare={await thirdGate.pause()}
         precondition(m.testCollectInBackground([third])); try await wait("return rejection held") {thirdGate.waiting}
         m.scan(a); try await wait("return rejection away") {m.root?.id == a.path && !m.isScanning}
         m.scan(b); try await wait("return rejection back") {m.root?.id == b.path && !m.isScanning && m.isValidatingCollection}
@@ -90,7 +116,7 @@ final class Gate: @unchecked Sendable {
         }
         precondition(!m.testCollectInBackground([fresh2Item]), "validation started despite reentrant row edit")
         launchObserver.cancel(); precondition(launchObserved); m.testSetCollectionEdit(b,pending:false)
-        let sameStatusGate=Gate(); m.testCollectionPrepare={sameStatusGate.pause()}
+        let sameStatusGate=Gate(); m.testCollectionPrepare={await sameStatusGate.pause()}
         precondition(m.testCollectInBackground([fresh2Item])); try await wait("same status held") {sameStatusGate.waiting}
         precondition(m.statusMessage == "Checking items for collection…")
         m.statusMessage="Checking items for collection…"
@@ -103,7 +129,7 @@ final class Gate: @unchecked Sendable {
         precondition(m.testTransferFeedback(b) == "queued collection status", "force refresh lost inherited collection feedback")
         try await wait("feedback transfer refresh") {m.root?.id == b.path && !m.isScanning && !m.isRefreshing}
         let freshItem=m.current!.children.first { $0.name == "fresh" }!, failureGate=Gate()
-        m.testCollectionPrepare={failureGate.pause()}; m.testForceCollectionFailure=true
+        m.testCollectionPrepare={await failureGate.pause()}; m.testForceCollectionFailure=true
         precondition(m.testCollectInBackground([freshItem])); try await wait("failure held") {failureGate.waiting}
         var forced=false
         let failureObserver=m.objectWillChange.sink { _ in
@@ -123,7 +149,7 @@ final class Gate: @unchecked Sendable {
         let other=DiskModel(cacheDirectory:base.appendingPathComponent("owner-cache"),preferences:prefs)
         other.scan(ownerA); try await wait("owner A map") {other.root?.id == ownerA.path && !other.isScanning}
         let ownerItem=other.current!.children[0], ownerGate=Gate()
-        other.testCollectionPrepare={ownerGate.pause()}
+        other.testCollectionPrepare={await ownerGate.pause()}
         precondition(other.testCollectInBackground([ownerItem]))
         try await wait("owner A job held") {ownerGate.waiting}
         other.scan(ownerB); try await wait("owner B map") {other.root?.id == ownerB.path && !other.isScanning}
