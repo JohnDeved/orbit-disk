@@ -6,6 +6,12 @@
     }
 
     func installMarketingFixture(root: DiskNode, selected: DiskNode, collected: [DiskNode]) {
+        let session = MappingSession(url: root.url, identity: root.fileIdentity,
+                                     token: ScanCancellation(), preview: nil)
+        session.finished = true
+        sessions = [root.id: session]
+        activeSessionID = session.id
+        showCollection = false
         self.root = root
         navigation = [root]
         nodesByID = [:]
@@ -22,5 +28,8 @@
         collectionEligibility = [selected.id: CollectionEligibility(identity: selected.fileIdentity, rejection: nil)]
         selectedID = selected.id
         collection = collected
+        session.collectionState = collectionState
+        precondition(displayedCollection.map(\.id) == collected.map(\.id),
+                     "Marketing fixture must display the requested collection")
     }
 }

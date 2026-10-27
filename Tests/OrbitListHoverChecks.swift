@@ -2,6 +2,15 @@ import AppKit
 
 @main
 enum OrbitListHoverChecks {
+    private static func precondition(_ condition: @autoclosure () -> Bool,
+                                     _ message: @autoclosure () -> String = "",
+                                     file: StaticString = #filePath, line: UInt = #line) {
+        guard condition() else {
+            fputs("FAIL \(file):\(line): \(message())\n", stderr)
+            exit(1)
+        }
+    }
+
     final class HoverWindow: NSWindow {
         var keyForChecks = true
         override var isKeyWindow: Bool { keyForChecks }
@@ -33,6 +42,7 @@ enum OrbitListHoverChecks {
     }
 
     static func main() {
+        setbuf(stdout, nil)
         _ = NSApplication.shared
         let window = HoverWindow(contentRect: NSRect(x: 80, y: 80, width: 360, height: 260),
                               styleMask: .borderless, backing: .buffered, defer: false)

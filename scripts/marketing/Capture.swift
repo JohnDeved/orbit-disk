@@ -123,11 +123,15 @@ private final class CaptureWindow: NSWindow {
         try await capture("orbit-collection.png", selected: downloads, collected: [downloads])
         try await capture("orbit-projects.png", selected: projects.children[0], collected: [], folder: projects)
 
-        model.installMarketingFixture(root: root, selected: downloads, collected: [downloads])
+        let reviewModel = DiskModel(cacheDirectory: output.appendingPathComponent("review-cache"), preferences: prefs)
+        reviewModel.installMarketingFixture(root: root, selected: downloads, collected: [downloads])
+        guard let reviewOwner = reviewModel.beginCollectionReview(), reviewModel.collectionReviewMatches(reviewOwner) else {
+            fatalError("Marketing collection review has no active owner")
+        }
         let reviewWindow = CaptureWindow(contentRect: CGRect(x: -20_000, y: -20_000, width: 720, height: 470),
                                          styleMask: [.borderless], backing: .buffered, defer: false)
         reviewWindow.appearance = NSAppearance(named: .darkAqua)
-        let reviewHost = NSHostingController(rootView: CollectionView(model: model)
+        let reviewHost = NSHostingController(rootView: CollectionView(model: reviewModel, reviewOwner: reviewOwner)
             .preferredColorScheme(.dark).environment(\.controlActiveState, .key))
         reviewHost.sizingOptions = []
         reviewWindow.contentViewController = reviewHost
