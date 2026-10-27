@@ -439,7 +439,7 @@ struct ContentView: View {
                     }
                 }.controlSize(.regular).frame(height: 26).disabled(selected == nil)
                 Button(action: model.collectSelection) {
-                    Label(collected ? "In Collection" : selected?.isScanComplete == false ? "Available when mapped" : "Add to Collection", systemImage: collected ? "checkmark" : selected?.isScanComplete == false ? "clock" : "plus")
+                    Label(collected ? "In Collection" : "Add to Collection", systemImage: collected ? "checkmark" : "plus")
                         .frame(maxWidth: .infinity).padding(.vertical, 3)
                         .foregroundStyle(model.canCollectSelection ? OrbitStyle.canvas : OrbitStyle.muted)
                 }
