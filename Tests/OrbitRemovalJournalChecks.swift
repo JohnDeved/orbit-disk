@@ -2,9 +2,42 @@ import CSQLite
 import Darwin
 import Foundation
 import OrbitCore
+
+#if ORBIT_TESTING
+private final class RecoveryTailProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var failure: Error?
+
+    func visit(_ mutation: () throws -> Void) {
+        lock.lock()
+        count += 1
+        let first = count == 1
+        lock.unlock()
+        guard first else { return }
+        do { try mutation() }
+        catch {
+            lock.lock()
+            failure = error
+            lock.unlock()
+        }
+    }
+
+    func result() throws -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        if let failure { throw failure }
+        return count
+    }
+}
+#endif
+
 @main struct Checks {
  static func main() throws {
   let args=CommandLine.arguments, base=URL(fileURLWithPath:args[2],isDirectory:true), root=base.appendingPathComponent("root"), nested=root.appendingPathComponent("nested"), target=nested.appendingPathComponent("target"), other=nested.appendingPathComponent("other"), cache=base.appendingPathComponent("cache")
+  #if ORBIT_TESTING
+  if args[1] == "captured-tail" { try checkCapturedTailChanges(base: base); return }
+  #endif
   if args[1]=="child" {
    #if ORBIT_TESTING
    if args[3]=="uncommitted" { RemovalJournal.testBeforePendingCommit = { _exit(47) } }
@@ -186,7 +219,104 @@ import OrbitCore
   do { _ = try history.recover(root:movingRoot,cursor:nil,cancellation:ScanCancellation());fatalError("changed root alias accepted") }
   catch RemovalRecoveryError.journalChanged {}
   RemovalJournal.testAfterRecoveryProbe = nil
+  try checkCapturedTailChanges(base: base.appendingPathComponent("captured-tail"))
   #endif
   print("PASS: rollback before commit, crash/liveness, partial deletion, replacement identity, overlapping aliases, missing/replaced parents, bounded 50k-item pages, cancellation and unsafe-lock rejection")
  }
+
+ #if ORBIT_TESTING
+    private static func withJournalDatabase(_ url: URL, _ body: (OpaquePointer) throws -> Void) throws {
+        var raw: OpaquePointer?
+        let status = sqlite3_open_v2(url.path, &raw, SQLITE_OPEN_READWRITE, nil)
+        defer { if let raw { sqlite3_close(raw) } }
+        guard status == SQLITE_OK, let raw else { throw NSError(domain: "Cannot open recovery fixture journal", code: 1) }
+        try body(raw)
+    }
+
+    private static func executeJournalSQL(_ sql: String, on database: OpaquePointer) throws {
+        guard sqlite3_exec(database, sql, nil, nil, nil) == SQLITE_OK else {
+            throw NSError(domain: "Recovery fixture SQL: \(String(cString: sqlite3_errmsg(database)))", code: 1)
+        }
+    }
+
+    private static func checkCapturedTailChanges(base: URL) throws {
+        for removesTail in [true, false] {
+            let directory = base.appendingPathComponent(removesTail ? "missing" : "append")
+            let root = directory.appendingPathComponent("root")
+            let cache = directory.appendingPathComponent("cache")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let journal = try RemovalJournal(cache: cache)
+            _ = try journal.withFence { $0.highWater }
+            let databaseURL = directory.appendingPathComponent("cache.staging/.orbit-removals/journal.sqlite")
+            try withJournalDatabase(databaseURL) { database in
+                try executeJournalSQL("""
+                    BEGIN IMMEDIATE;
+                    WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<256)
+                    INSERT INTO operations(seq, root, root_identity, lock_name, complete)
+                    SELECT n, CAST('/unrelated' AS BLOB), '1:1',
+                           printf('%08x-0000-0000-0000-000000000000.operation', n), 1 FROM numbers;
+                    INSERT INTO items(op, path, identity, canonical, parent_identity)
+                    SELECT seq, CAST('/unrelated/file' AS BLOB), '1:2', CAST('/unrelated/file' AS BLOB), '1:1'
+                    FROM operations;
+                    COMMIT;
+                    """, on: database)
+            }
+
+            let cancellation = ScanCancellation()
+            let probe = RecoveryTailProbe()
+            let deadline = DispatchWorkItem { cancellation.cancel() }
+            DispatchQueue(label: "OrbitRemovalJournalChecks.captured-tail.timeout")
+                .asyncAfter(deadline: .now() + 10, execute: deadline)
+            defer { deadline.cancel(); RemovalJournal.testAfterRecoveryProbe = nil }
+            RemovalJournal.testAfterRecoveryProbe = {
+                probe.visit {
+                    // Simulate a damaged captured tail and a later append without acquiring the reader's fence again.
+                    try withJournalDatabase(databaseURL) { database in
+                        try executeJournalSQL("BEGIN IMMEDIATE", on: database)
+                        do {
+                            if removesTail {
+                                try executeJournalSQL("DELETE FROM items WHERE op > 128; DELETE FROM operations WHERE seq > 128", on: database)
+                            }
+                            try executeJournalSQL("""
+                                INSERT INTO operations(seq, root, root_identity, lock_name, complete)
+                                VALUES(257, CAST('/unrelated' AS BLOB), '1:1',
+                                       '00000101-0000-0000-0000-000000000000.operation', 1);
+                                INSERT INTO items(op, path, identity, canonical, parent_identity)
+                                VALUES(257, CAST('/unrelated/new' AS BLOB), '1:2', CAST('/unrelated/new' AS BLOB), '1:1');
+                                COMMIT;
+                                """, on: database)
+                        } catch {
+                            try? executeJournalSQL("ROLLBACK", on: database)
+                            throw error
+                        }
+                    }
+                }
+            }
+
+            var recovery: RemovalRecovery?
+            var observedError: Error?
+            do { recovery = try journal.recover(root: root, cursor: nil, cancellation: cancellation) }
+            catch { observedError = error }
+            deadline.cancel()
+            RemovalJournal.testAfterRecoveryProbe = nil
+            let count = try probe.result()
+            if removesTail {
+                guard count == 128 else { throw NSError(domain: "Recovery did not consume the retained captured prefix", code: 1) }
+                guard let failure = observedError as? RemovalJournal.Failure,
+                      case .invalid("Missing removal journal entries") = failure else {
+                    throw NSError(domain: "Missing captured tail was accepted or needed cancellation: \(String(describing: observedError))", code: 1)
+                }
+                print("PASS: saved recovery rejects a missing captured tail instead of looping over newer headers")
+            } else {
+                if let observedError { throw observedError }
+                guard count == 256, recovery?.cursor.sequence == 256 else {
+                    throw NSError(domain: "A later append changed the captured recovery range", code: 1)
+                }
+                let next = try journal.recover(root: root, cursor: recovery?.cursor, cancellation: ScanCancellation())
+                guard next.cursor.sequence == 257 else { throw NSError(domain: "The next recovery lost the later append", code: 1) }
+                print("PASS: saved recovery keeps its captured highwater and consumes a later append next time")
+            }
+        }
+    }
+ #endif
 }

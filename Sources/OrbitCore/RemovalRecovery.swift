@@ -66,13 +66,13 @@ extension RemovalJournal {
         while sequence < captured.sequence {
             let (nextSequence, operation) = try withFence(cancellation: cancellation) { fence -> (Int64, RemovalJournal.Entry?) in
                 guard fence.identity == captured.identity, fence.highWater >= captured.sequence else { throw RemovalRecoveryError.journalChanged }
-                let operations = try fence.operations(after: sequence, limit: 128)
+                let operations = try fence.operations(after: sequence, limit: 128).filter { $0.sequence <= captured.sequence }
                 guard !operations.isEmpty else { throw RemovalJournal.Failure.invalid("Missing removal journal entries") }
                 var scanned = sequence
                 guard fence.recoveryRootIdentity(root) == expectedRoot else { throw RemovalRecoveryError.journalChanged }
                 // The budget applies between probes; one filesystem lookup or SQLite step can take longer.
                 let deadline = ProcessInfo.processInfo.systemUptime + 0.005
-                for operation in operations where operation.sequence <= captured.sequence {
+                for operation in operations {
                     let relevant = try !fence.intersections(sequence: operation.sequence, root: root, limit: 1).isEmpty
                     #if ORBIT_TESTING
                     RemovalJournal.testAfterRecoveryProbe?()
