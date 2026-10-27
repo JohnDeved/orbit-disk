@@ -42,7 +42,7 @@ private struct Signature: Equatable {
         precondition(sqlite3_open_v2(stage.testPreviewSnapshot.databaseURL.path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK)
         defer { sqlite3_close(db) }
         var update: OpaquePointer?
-        precondition(sqlite3_prepare_v2(db, "UPDATE nodes SET path=? WHERE name=?", -1, &update, nil) == SQLITE_OK)
+        precondition(sqlite3_prepare_v2(db, "UPDATE nodes SET name=? WHERE name=?", -1, &update, nil) == SQLITE_OK)
         defer { sqlite3_finalize(update) }
         let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         let punctuation = [" ", "!", "#", "%20", "%2F", "'", "(", ")", "+", ",", "-", ".", "..", ";", "=", "@", "[", "]", "_", "~", "\n", "\t", "\\", "💾"]
@@ -53,11 +53,10 @@ private struct Signature: Equatable {
             } else {
                 suffix = "\(punctuation[(i - 1200) % punctuation.count])-\(i)"
             }
-            let path = root.path + "/" + suffix
             let name = String(format: "file-%04d", i)
             sqlite3_reset(update)
             sqlite3_clear_bindings(update)
-            precondition(sqlite3_bind_text(update, 1, path, -1, transient) == SQLITE_OK)
+            precondition(sqlite3_bind_text(update, 1, suffix, -1, transient) == SQLITE_OK)
             precondition(sqlite3_bind_text(update, 2, name, -1, transient) == SQLITE_OK)
             precondition(sqlite3_step(update) == SQLITE_DONE && sqlite3_changes(db) == 1)
         }

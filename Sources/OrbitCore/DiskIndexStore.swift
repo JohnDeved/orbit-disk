@@ -56,11 +56,22 @@ public struct DiskIndexStore: Sendable {
     package static var testDuringRefreshAncestors: (@Sendable () -> Void)?
     package static var testBeforeUpdatePublish: (@Sendable () -> Void)?
     #endif
-    private static let version: Int64 = 3
-    private static let applicationID: Int64 = 0x4F524254
+    private static let version = InventorySchema.version
+    private static let applicationID = InventorySchema.applicationID
     private static let mutationLock = NSLock()
     private static let searchIndexes = PreparedNameIndexes()
-    private static let nodeColumns = "path,name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,file_identity"
+    private static let nodeColumns = InventorySchema.pathSQL() + ",n.name,n.is_dir,n.is_link,n.accessible,n.size,n.allocated,n.file_count,n.raw_alloc,n.dev,n.inode"
+    private static let nodeFrom = " FROM nodes n JOIN directory_paths p ON p.id=COALESCE(n.parent,n.id)"
+    private static let lookupIDSQL = "COALESCE((SELECT id FROM directory_paths WHERE path=?),(SELECT id FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=?) AND name=?))"
+
+    private static func stagedFrom(indexHint: String = "") -> String {
+        " FROM nodes n \(indexHint) JOIN directory_paths p ON p.id=COALESCE(n.parent,n.id) LEFT JOIN directory_paths own ON own.id=n.id LEFT JOIN directories d ON d.path=CAST(own.path AS BLOB) LEFT JOIN epochs e ON e.parent=d.path LEFT JOIN directories pd ON pd.path=CAST(p.path AS BLOB)"
+    }
+
+    private static func lookupValues(_ path: String) -> [IndexValue] {
+        let url = URL(fileURLWithPath: path)
+        return [.text(path), .text(url.deletingLastPathComponent().path), .text(url.lastPathComponent)]
+    }
 
     public init(directory: URL) {
         self.directory = IndexLocations.canonicalCache(directory)
@@ -191,21 +202,8 @@ public struct DiskIndexStore: Sendable {
         let db = try IndexDatabase(temporary, writable: true, cancellation: cancellation)
         try db.execute("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA cache_size=-8192;")
         try db.execute("PRAGMA application_id=\(Self.applicationID); PRAGMA user_version=\(Self.version); BEGIN IMMEDIATE;")
-        try db.execute("""
-            CREATE TABLE metadata (singleton INTEGER PRIMARY KEY CHECK(singleton=1), snapshot_id TEXT NOT NULL,
-              root_path TEXT NOT NULL, scanned_at REAL NOT NULL, elapsed REAL NOT NULL, skipped INTEGER NOT NULL,
-              issues TEXT NOT NULL, event_id TEXT NOT NULL, event_identity TEXT NOT NULL);
-            CREATE TABLE nodes (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, parent INTEGER, name TEXT NOT NULL, search_name TEXT NOT NULL,
-              is_dir INTEGER NOT NULL, is_link INTEGER NOT NULL, accessible INTEGER NOT NULL,
-              size INTEGER NOT NULL, allocated INTEGER NOT NULL, file_count INTEGER NOT NULL,
-              raw_alloc INTEGER NOT NULL, file_identity TEXT);
-            """)
+        try db.execute(InventorySchema.createSQL)
         try insertTree(result.root, parent: nil, db: db, cancellation: cancellation)
-        try db.execute("""
-            CREATE INDEX children_by_size ON nodes(parent,size DESC,name);
-            CREATE INDEX nodes_by_size ON nodes(size DESC,id,search_name,parent);
-            CREATE INDEX file_identities ON nodes(file_identity) WHERE is_dir=0 AND file_identity IS NOT NULL;
-            """)
         try writeSnapshot(snapshot, db: db)
         try db.execute("COMMIT;")
         try db.close()
@@ -247,7 +245,7 @@ public struct DiskIndexStore: Sendable {
         try validate(snapshot, db: db)
         try db.registerHardLinkOrder()
         try db.execute("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")
-        try db.execute("CREATE TEMP TABLE refresh_identities (identity TEXT PRIMARY KEY) WITHOUT ROWID;")
+        try db.execute("CREATE TEMP TABLE refresh_identities (dev INTEGER, inode INTEGER, PRIMARY KEY(dev,inode)) WITHOUT ROWID; CREATE TEMP TABLE refresh_nodes(id INTEGER PRIMARY KEY);")
         var affectedParents = Set<String>()
         var issues = snapshot.issues
         var skipped = snapshot.skippedCount
@@ -257,8 +255,11 @@ public struct DiskIndexStore: Sendable {
                 throw DiskIndexError.invalid("The indexed folder no longer exists.")
             }
             let predicate = subtreePredicate(path)
-            try db.run("INSERT OR IGNORE INTO refresh_identities SELECT file_identity FROM nodes WHERE is_dir=0 AND file_identity IS NOT NULL AND (\(predicate.sql))", predicate.values)
-            try db.run("DELETE FROM nodes WHERE \(predicate.sql)", predicate.values)
+            // Keep the deletion set stable while directory-path delete triggers run.
+            try db.execute("DELETE FROM refresh_nodes")
+            try db.run("INSERT INTO refresh_nodes SELECT id FROM nodes WHERE \(predicate.sql)", predicate.values)
+            try db.execute("INSERT OR IGNORE INTO refresh_identities SELECT dev,inode FROM nodes WHERE is_dir=0 AND dev IS NOT NULL AND inode IS NOT NULL AND id IN (SELECT id FROM refresh_nodes)")
+            try db.execute("DELETE FROM nodes WHERE id IN (SELECT id FROM refresh_nodes)")
             let parent = path == root ? nil : URL(fileURLWithPath: path).deletingLastPathComponent().path
             if let parent {
                 guard try readNode(parent, db: db)?.isDirectory == true else {
@@ -269,25 +270,27 @@ public struct DiskIndexStore: Sendable {
             if let result = replacement.result {
                 guard Self.path(result.root.url) == path else { throw DiskIndexError.invalid("An updated scan has the wrong root.") }
                 try insertTree(result.root, parent: parent, db: db, cancellation: cancellation)
-                try db.run("INSERT OR IGNORE INTO refresh_identities SELECT file_identity FROM nodes WHERE is_dir=0 AND file_identity IS NOT NULL AND (\(predicate.sql))", predicate.values)
+                try db.run("INSERT OR IGNORE INTO refresh_identities SELECT dev,inode FROM nodes WHERE is_dir=0 AND dev IS NOT NULL AND inode IS NOT NULL AND (\(predicate.sql))", predicate.values)
                 skipped += result.skippedCount
                 for issue in result.issues where !issues.contains(issue) && issues.count < 100 { issues.append(issue) }
                 if path == root { skipped = result.skippedCount; issues = result.issues }
             }
         }
         try db.execute("""
-            CREATE TEMP TABLE refresh_owners (identity TEXT PRIMARY KEY, path TEXT NOT NULL) WITHOUT ROWID;
+            CREATE TEMP TABLE refresh_owners (dev INTEGER, inode INTEGER, path TEXT NOT NULL, PRIMARY KEY(dev,inode)) WITHOUT ROWID;
             INSERT INTO refresh_owners
-              SELECT i.identity, MIN(n.path COLLATE ORBIT_HARDLINK_ORDER) FROM refresh_identities i
-              CROSS JOIN nodes n ON n.file_identity=i.identity AND n.is_dir=0 GROUP BY i.identity;
+              SELECT i.dev,i.inode,MIN(\(InventorySchema.pathSQL()) COLLATE ORBIT_HARDLINK_ORDER) FROM refresh_identities i
+              CROSS JOIN nodes n ON n.dev=i.dev AND n.inode=i.inode AND n.is_dir=0
+              JOIN directory_paths p ON p.id=COALESCE(n.parent,n.id) GROUP BY i.dev,i.inode;
             CREATE TEMP TABLE refresh_allocations (node_id INTEGER PRIMARY KEY, allocated INTEGER NOT NULL);
             INSERT INTO refresh_allocations
-              SELECT n.id, CASE WHEN n.path=o.path THEN n.raw_alloc ELSE 0 END
-              FROM refresh_owners o CROSS JOIN nodes n ON n.file_identity=o.identity AND n.is_dir=0
-              WHERE n.allocated != CASE WHEN n.path=o.path THEN n.raw_alloc ELSE 0 END;
+              SELECT n.id,CASE WHEN \(InventorySchema.pathSQL())=o.path THEN n.raw_alloc ELSE 0 END
+              FROM refresh_owners o CROSS JOIN nodes n ON n.dev=o.dev AND n.inode=o.inode AND n.is_dir=0
+              JOIN directory_paths p ON p.id=COALESCE(n.parent,n.id)
+              WHERE n.allocated != CASE WHEN \(InventorySchema.pathSQL())=o.path THEN n.raw_alloc ELSE 0 END;
             """)
         do {
-            let changedPaths = try db.statement("SELECT n.path FROM refresh_allocations a JOIN nodes n ON n.id=a.node_id")
+            let changedPaths = try db.statement("SELECT \(InventorySchema.pathSQL()) FROM refresh_allocations a JOIN nodes n ON n.id=a.node_id JOIN directory_paths p ON p.id=COALESCE(n.parent,n.id)")
             while try changedPaths.step() {
                 #if ORBIT_TESTING
                 Self.testDuringRefreshAncestors?()
@@ -302,8 +305,8 @@ public struct DiskIndexStore: Sendable {
             try check(cancellation)
             try db.run("""
                 UPDATE nodes SET (size,allocated,file_count)=(SELECT COALESCE(SUM(size),0),
-                  COALESCE(SUM(allocated),0),COALESCE(SUM(file_count),0) FROM nodes WHERE parent=(SELECT id FROM nodes WHERE path=?))
-                WHERE path=? AND is_dir=1
+                  COALESCE(SUM(allocated),0),COALESCE(SUM(file_count),0) FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=?))
+                WHERE id=(SELECT id FROM directory_paths WHERE path=?) AND is_dir=1
                 """, Array(repeating: .text(parent), count: 2))
         }
         let next = IndexSnapshot(id: UUID().uuidString, rootURL: snapshot.rootURL, databaseURL: snapshot.databaseURL,
@@ -346,11 +349,11 @@ public struct DiskIndexStore: Sendable {
         let db = try open(snapshot)
         try db.execute("BEGIN")
         defer { try? db.execute("ROLLBACK") }
-        let query = try db.statement("SELECT n.is_dir,COALESCE(d.pending,0) FROM nodes n LEFT JOIN directories d ON d.path=CAST(n.path AS BLOB) WHERE n.path=?")
+        let query = try db.statement("SELECT n.is_dir,COALESCE(d.pending,0) FROM nodes n LEFT JOIN directory_paths own ON own.id=n.id LEFT JOIN directories d ON d.path=CAST(own.path AS BLOB) WHERE n.id=\(Self.lookupIDSQL)")
         var current = Self.path(URL(fileURLWithPath: path))
         var first = true
         while true {
-            try query.bind([.text(current)])
+            try query.bind(Self.lookupValues(current))
             if try query.step() {
                 let directory = query.integer(0) != 0, pending = query.integer(1) != 0
                 return first ? !directory : (!directory || !pending)
@@ -413,10 +416,8 @@ public struct DiskIndexStore: Sendable {
         let indexHint = sizeOrdered ? "INDEXED BY nodes_by_size" : ""
         let order = sizeOrdered ? "ORDER BY n.size DESC" : ""
         let statement = try db.statement("""
-            SELECT n.path,n.name,n.is_dir,n.is_link,n.accessible,n.size,n.allocated,n.file_count,n.raw_alloc,n.file_identity,
-                   COALESCE(d.pending,0),CASE WHEN e.value IS NULL THEN 0 ELSE 1 END,COALESCE(pd.pending,0)
-            FROM nodes n \(indexHint) LEFT JOIN directories d ON d.path=CAST(n.path AS BLOB) LEFT JOIN epochs e ON e.parent=d.path
-            LEFT JOIN nodes p ON p.id=n.parent LEFT JOIN directories pd ON pd.path=CAST(p.path AS BLOB)
+            SELECT \(Self.nodeColumns),COALESCE(d.pending,0),CASE WHEN e.value IS NULL THEN 0 ELSE 1 END,COALESCE(pd.pending,0)
+            \(Self.stagedFrom(indexHint: indexHint))
             WHERE n.parent IS NOT NULL AND \(namePredicate) \(order)
             """)
         try statement.bind(parameters)
@@ -460,9 +461,9 @@ public struct DiskIndexStore: Sendable {
                 #endif
                 continue
             }
-            let initialState: NodeScanState = !directory ? (statement.integer(12) == 0 ? .complete : .pending)
-                : (statement.integer(10) == 0 ? .complete : (statement.integer(11) == 0 ? .pending : .scanning))
-            let identity = statement.text(9)
+            let initialState: NodeScanState = !directory ? (statement.integer(13) == 0 ? .complete : .pending)
+                : (statement.integer(11) == 0 ? .complete : (statement.integer(12) == 0 ? .pending : .scanning))
+            let identity = statement.identity()
             var state = initialState
             if let activeDirectory, initialState == .pending, directory, activeDirectory.identity == identity, path.utf8.elementsEqual(activeDirectory.path) { state = .scanning }
             let raw = DiskNode(url: url, name: name,
@@ -485,8 +486,8 @@ public struct DiskIndexStore: Sendable {
         let db = try open(snapshot, cancellation: cancellation)
         try db.execute("BEGIN")
         defer { try? db.execute("ROLLBACK") }
-        let columns = "n.path,n.name,n.is_dir,n.is_link,n.accessible,n.size,n.allocated,n.file_count,n.raw_alloc,n.file_identity,COALESCE(d.pending,0),CASE WHEN e.value IS NULL THEN 0 ELSE 1 END,COALESCE(pd.pending,0)"
-        let from = " FROM nodes n LEFT JOIN directories d ON d.path=CAST(n.path AS BLOB) LEFT JOIN epochs e ON e.parent=d.path LEFT JOIN nodes p ON p.id=n.parent LEFT JOIN directories pd ON pd.path=CAST(p.path AS BLOB)"
+        let columns = Self.nodeColumns + ",COALESCE(d.pending,0),CASE WHEN e.value IS NULL THEN 0 ELSE 1 END,COALESCE(pd.pending,0)"
+        let from = Self.stagedFrom()
         func rows(_ query: IndexStatement) throws -> [DiskNode] {
             var nodes: [DiskNode] = []
             while try query.step() {
@@ -496,9 +497,9 @@ public struct DiskIndexStore: Sendable {
                     throw DiskIndexError.invalid("A staged disk index entry is damaged.")
                 }
                 let isDirectory = query.integer(2) != 0
-                let initialState: NodeScanState = !isDirectory ? (query.integer(12) == 0 ? .complete : .pending)
-                    : (query.integer(10) == 0 ? .complete : (query.integer(11) == 0 ? .pending : .scanning))
-                let identity = query.text(9)
+                let initialState: NodeScanState = !isDirectory ? (query.integer(13) == 0 ? .complete : .pending)
+                    : (query.integer(11) == 0 ? .complete : (query.integer(12) == 0 ? .pending : .scanning))
+                let identity = query.identity()
                 var state = initialState
                 if let activeDirectory, initialState == .pending, isDirectory, activeDirectory.identity == identity, path.utf8.elementsEqual(activeDirectory.path) { state = .scanning }
                 nodes.append(DiskNode(url: URL(fileURLWithPath: path, isDirectory: isDirectory), name: name,
@@ -508,9 +509,9 @@ public struct DiskIndexStore: Sendable {
             }
             return nodes
         }
-        let one = try db.statement("SELECT \(columns)\(from) WHERE n.path=?")
+        let one = try db.statement("SELECT \(columns)\(from) WHERE n.id=\(Self.lookupIDSQL)")
         func node(_ path: String) throws -> DiskNode? {
-            try one.bind([.text(path)])
+            try one.bind(Self.lookupValues(path))
             let found = try rows(one).first
             try one.reset()
             return found
@@ -521,7 +522,7 @@ public struct DiskIndexStore: Sendable {
         guard targetBytes == rootBytes || (rootBytes == [47] && targetBytes.first == 47)
                 || (targetBytes.count > rootBytes.count && targetBytes.starts(with: rootBytes) && targetBytes[rootBytes.count] == 47),
               let root = try node(rootPath), let rawFolder = try node(target), rawFolder.isDirectory else { return nil }
-        let childrenQuery = try db.statement("SELECT \(columns)\(from) WHERE n.parent=(SELECT id FROM nodes WHERE path=?) ORDER BY n.size DESC,n.name LIMIT ?")
+        let childrenQuery = try db.statement("SELECT \(columns)\(from) WHERE n.parent=(SELECT id FROM directory_paths WHERE path=?) ORDER BY n.size DESC,n.name LIMIT ?")
         func children(_ parent: String, limit: Int) throws -> [DiskNode] {
             try childrenQuery.bind([.text(parent), .integer(Int64(limit))])
             let found = try rows(childrenQuery)
@@ -565,16 +566,18 @@ public struct DiskIndexStore: Sendable {
     private func stagedRemovalSources(_ removals: [ScanRemoval], db: IndexDatabase,
                                       cancellation: ScanCancellation) throws -> [DiskNode] {
         guard !removals.isEmpty else { return [] }
-        try db.execute("CREATE TEMP TABLE stage_removal_paths(path TEXT NOT NULL,identity TEXT NOT NULL,PRIMARY KEY(path,identity)) WITHOUT ROWID")
-        let insert = try db.statement("INSERT OR IGNORE INTO stage_removal_paths VALUES(?,?)")
+        let query = try db.statement("SELECT \(Self.nodeColumns)\(Self.nodeFrom) WHERE n.id=\(Self.lookupIDSQL)")
+        var nodes: [DiskNode] = []
+        var seen = Set<Data>()
         for removal in removals {
             try check(cancellation)
-            try insert.bind([.text(removal.path), .text(removal.identity)])
-            _ = try insert.step(); try insert.reset()
+            try query.bind(Self.lookupValues(removal.path))
+            let node = try readNodes(query, cancellation: cancellation).first
+            try query.reset()
+            if let node, node.fileIdentity == removal.identity,
+               seen.insert(Data(removal.path.utf8)).inserted { nodes.append(node) }
         }
-        let columns = "n.path,n.name,n.is_dir,n.is_link,n.accessible,n.size,n.allocated,n.file_count,n.raw_alloc,n.file_identity"
-        let query = try db.statement("SELECT " + columns + " FROM stage_removal_paths r JOIN nodes n ON n.path=r.path AND n.file_identity=r.identity")
-        return try readNodes(query, cancellation: cancellation)
+        return nodes
     }
 
     public func loadFolder(path: String, snapshot: IndexSnapshot, cancellation: ScanCancellation? = nil) throws -> DiskNode {
@@ -587,7 +590,7 @@ public struct DiskIndexStore: Sendable {
             throw DiskIndexError.invalid("This folder is no longer in the index.")
         }
         var budget = 2_000
-        let previewQuery = try db.statement("SELECT \(Self.nodeColumns) FROM nodes WHERE parent=(SELECT id FROM nodes WHERE path=?) ORDER BY size DESC,name LIMIT ?")
+        let previewQuery = try db.statement("SELECT \(Self.nodeColumns)\(Self.nodeFrom) WHERE n.parent=(SELECT id FROM directory_paths WHERE path=?) ORDER BY n.size DESC,n.name LIMIT ?")
         let directChildren = try readChildren(path, limit: nil, db: db)
         var children: [DiskNode] = []
         children.reserveCapacity(directChildren.count)
@@ -755,24 +758,24 @@ public struct DiskIndexStore: Sendable {
         guard count > 0, resultLimit > 0 else {
             return IndexSearchResult(nodes: [], totalCount: Int(count))
         }
-        let order = stablePathOrder ? "size DESC,path COLLATE BINARY" : "size DESC,id"
+        let order = stablePathOrder ? "n.size DESC,\(InventorySchema.pathSQL()) COLLATE BINARY" : "n.size DESC,n.id"
         let predicate: String
         let parameters: [IndexValue]
         if let ids = matches?.ids, let prepared {
-            let indexed = ids.isEmpty ? "0" : "id IN (" + Array(repeating: "?", count: ids.count).joined(separator: ",") + ")"
+            let indexed = ids.isEmpty ? "0" : "n.id IN (" + Array(repeating: "?", count: ids.count).joined(separator: ",") + ")"
             if prepared.complete {
                 predicate = indexed
                 parameters = ids.map(IndexValue.integer)
             } else {
-                let narrowed = ids.isEmpty ? "id>?" : "(\(indexed) OR id>?)"
-                predicate = narrowed + " AND parent IS NOT NULL AND instr(search_name,?)>0"
+                let narrowed = ids.isEmpty ? "n.id>?" : "(\(indexed) OR n.id>?)"
+                predicate = narrowed + " AND n.parent IS NOT NULL AND instr(n.search_name,?)>0"
                 parameters = ids.map(IndexValue.integer) + [.integer(prepared.index.highWaterID), .text(needle)]
             }
         } else {
-            predicate = "parent IS NOT NULL AND instr(search_name,?)>0"
+            predicate = "n.parent IS NOT NULL AND instr(n.search_name,?)>0"
             parameters = values
         }
-        let nodes = try readNodes("SELECT \(Self.nodeColumns) FROM nodes WHERE \(predicate) ORDER BY \(order) LIMIT ?",
+        let nodes = try readNodes("SELECT \(Self.nodeColumns)\(Self.nodeFrom) WHERE \(predicate) ORDER BY \(order) LIMIT ?",
                                   parameters + [.integer(Int64(resultLimit))], db: db)
         try check(cancellation)
         return IndexSearchResult(nodes: nodes, totalCount: Int(count))
@@ -781,39 +784,39 @@ public struct DiskIndexStore: Sendable {
     private func projectedSearch(needle: String, limit: Int, stablePathOrder: Bool, removals: [ScanRemoval],
                                  db: IndexDatabase, cancellation: ScanCancellation) throws -> IndexSearchResult {
         try db.execute("BEGIN")
-        try db.execute("CREATE TEMP TABLE removal_paths(path TEXT NOT NULL, identity TEXT NOT NULL, PRIMARY KEY(path,identity)) WITHOUT ROWID")
-        let removalInsert = try db.statement("INSERT OR IGNORE INTO removal_paths VALUES(?,?)")
-        for removal in removals {
+        defer { try? db.execute("ROLLBACK") }
+        try db.execute("CREATE TEMP TABLE removal_nodes(id INTEGER PRIMARY KEY) WITHOUT ROWID")
+        let source = try stagedRemovalSources(removals, db: db, cancellation: cancellation)
+        let removalInsert = try db.statement("INSERT OR IGNORE INTO removal_nodes SELECT \(Self.lookupIDSQL)")
+        for node in source {
             try check(cancellation)
-            try removalInsert.bind([.text(removal.path), .text(removal.identity)])
+            try removalInsert.bind(Self.lookupValues(node.id))
             _ = try removalInsert.step(); try removalInsert.reset()
         }
-        let sourceColumns = "n.path,n.name,n.is_dir,n.is_link,n.accessible,n.size,n.allocated,n.file_count,n.raw_alloc,n.file_identity"
-        let source = try readNodes("SELECT " + sourceColumns + " FROM removal_paths r JOIN nodes n ON n.path=r.path AND n.file_identity=r.identity", [], db: db)
         let projection = try DiskRemovalProjection(removals: removals, source: source, cancellation: cancellation)
         try db.execute("CREATE TEMP TABLE hidden_nodes(id INTEGER PRIMARY KEY) WITHOUT ROWID")
         try db.execute("""
             INSERT INTO hidden_nodes
             WITH RECURSIVE hidden(id) AS (
-                SELECT n.id FROM nodes n JOIN removal_paths r ON n.path=r.path AND n.file_identity=r.identity
+                SELECT id FROM removal_nodes
                 UNION SELECT child.id FROM nodes child JOIN hidden h ON child.parent=h.id
             ) SELECT id FROM hidden
             """)
-        try db.execute("CREATE TEMP TABLE adjustments(path TEXT PRIMARY KEY, size INTEGER, allocated INTEGER, count INTEGER) WITHOUT ROWID")
-        let adjustmentInsert = try db.statement("INSERT INTO adjustments VALUES(?,?,?,?)")
+        try db.execute("CREATE TEMP TABLE adjustments(node_id INTEGER PRIMARY KEY, size INTEGER, allocated INTEGER, count INTEGER) WITHOUT ROWID")
+        let adjustmentInsert = try db.statement("INSERT INTO adjustments SELECT id,?,?,? FROM directory_paths WHERE path=?")
         for (path, delta) in projection.indexedDeltas {
             try check(cancellation)
-            try adjustmentInsert.bind([.text(path), .integer(delta.size), .integer(delta.allocated), .integer(Int64(delta.count))])
+            try adjustmentInsert.bind([.integer(delta.size), .integer(delta.allocated), .integer(Int64(delta.count)), .text(path)])
             _ = try adjustmentInsert.step(); try adjustmentInsert.reset()
         }
         try db.execute("COMMIT")
-        let from = "FROM nodes n LEFT JOIN adjustments a ON n.path=a.path WHERE n.parent IS NOT NULL AND instr(n.search_name,?)>0 AND NOT EXISTS (SELECT 1 FROM hidden_nodes h WHERE h.id=n.id) AND n.size>=COALESCE(a.size,0) AND n.allocated>=COALESCE(a.allocated,0) AND n.file_count>=COALESCE(a.count,0)"
+        let from = Self.nodeFrom + " LEFT JOIN adjustments a ON n.id=a.node_id WHERE n.parent IS NOT NULL AND instr(n.search_name,?)>0 AND NOT EXISTS (SELECT 1 FROM hidden_nodes h WHERE h.id=n.id) AND n.size>=COALESCE(a.size,0) AND n.allocated>=COALESCE(a.allocated,0) AND n.file_count>=COALESCE(a.count,0)"
         let count = try db.integer("SELECT COUNT(*) " + from, [.text(needle)])
         try check(cancellation)
         let resultLimit = max(0, min(limit, 10_000))
         guard count > 0, resultLimit > 0 else { return IndexSearchResult(nodes: [], totalCount: Int(count)) }
-        let columns = "n.path,n.name,n.is_dir,n.is_link,n.accessible,n.size-COALESCE(a.size,0),n.allocated-COALESCE(a.allocated,0),n.file_count-COALESCE(a.count,0),n.raw_alloc,n.file_identity"
-        let tie = stablePathOrder ? "n.path COLLATE BINARY" : "n.id"
+        let columns = InventorySchema.pathSQL() + ",n.name,n.is_dir,n.is_link,n.accessible,n.size-COALESCE(a.size,0),n.allocated-COALESCE(a.allocated,0),n.file_count-COALESCE(a.count,0),n.raw_alloc,n.dev,n.inode"
+        let tie = stablePathOrder ? InventorySchema.pathSQL() + " COLLATE BINARY" : "n.id"
         let nodes = try readNodes("SELECT " + columns + " " + from + " ORDER BY 6 DESC," + tie + " LIMIT ?",
                                   [.text(needle), .integer(Int64(resultLimit))], db: db)
         try check(cancellation)
@@ -875,7 +878,9 @@ public struct DiskIndexStore: Sendable {
         if cancellation?.isCancelled == true { throw CancellationError() }
     }
     private func subtreePredicate(_ path: String) -> (sql: String, values: [IndexValue]) {
-        path == "/" ? ("1", []) : ("path=? OR (path>=? AND path<?)", [.text(path), .text(path + "/"), .text(path + "0")])
+        path == "/" ? ("1", []) : (
+            "id=\(Self.lookupIDSQL) OR parent IN (SELECT id FROM directory_paths WHERE path=? OR (path>=? AND path<?))",
+            Self.lookupValues(path) + [.text(path), .text(path + "/"), .text(path + "0")])
     }
     private func addAncestors(_ path: String, root: String, to result: inout Set<String>) {
         var current = path
@@ -920,13 +925,17 @@ public struct DiskIndexStore: Sendable {
         ])
     }
     private func insertTree(_ root: DiskNode, parent: String?, db: IndexDatabase, cancellation: ScanCancellation) throws {
-        let statement = try db.statement("INSERT INTO nodes(path,parent,name,search_name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,file_identity) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
-        let parentID = try parent.map { try db.integer("SELECT id FROM nodes WHERE path=?", [.text($0)]) }
+        let statement = try db.statement("INSERT INTO nodes(parent,name,search_name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,dev,inode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+        let directoryPath = try db.statement("INSERT INTO directory_paths(id,path) VALUES(?,?)")
+        let parentID = try parent.map { try db.integer("SELECT id FROM directory_paths WHERE path=?", [.text($0)]) }
         var pending: [(DiskNode, String?, Int64?)] = [(root, parent, parentID)]
         while let (node, parent, parentID) = pending.popLast() {
             try check(cancellation)
             let path = Self.path(node.url)
-            guard node.size >= 0, node.allocatedSize >= 0, node.fileCount >= 0 else {
+            let name = parent == nil ? node.name : URL(fileURLWithPath: path).lastPathComponent
+            let identity = InventorySchema.parseIdentity(node.fileIdentity)
+            guard node.size >= 0, node.allocatedSize >= 0, node.fileCount >= 0, node.rawAllocatedSize >= 0,
+                  node.fileIdentity == nil || identity != nil else {
                 throw DiskIndexError.invalid("A scanned file has invalid metadata or parentage.")
             }
             if let parent {
@@ -940,25 +949,33 @@ public struct DiskIndexStore: Sendable {
                 } else {
                     validParent = URL(fileURLWithPath: path, isDirectory: node.isDirectory).deletingLastPathComponent().path == parent
                 }
-                guard validParent else { throw DiskIndexError.invalid("A scanned file has invalid metadata or parentage.") }
+                guard validParent, node.name == name else {
+                    throw DiskIndexError.invalid("A scanned file has invalid metadata or parentage.")
+                }
             }
-            try statement.bind([.text(path), parentID.map(IndexValue.integer) ?? .null, .text(node.name), .text(Self.fold(node.name)),
+            try statement.bind([parentID.map(IndexValue.integer) ?? .null, .text(name), .text(Self.fold(name)),
                                 .integer(node.isDirectory ? 1 : 0), .integer(node.isSymbolicLink ? 1 : 0),
                                 .integer(node.isAccessible ? 1 : 0), .integer(node.size), .integer(node.allocatedSize),
-                                .integer(Int64(node.fileCount)), .integer(node.rawAllocatedSize), node.fileIdentity.map(IndexValue.text) ?? .null])
+                                .integer(Int64(node.fileCount)), .integer(node.rawAllocatedSize),
+                                identity.map { .integer(Int64($0.device)) } ?? .null,
+                                identity.map { .integer(Int64(bitPattern: $0.inode)) } ?? .null])
             _ = try statement.step()
             let nodeID = sqlite3_last_insert_rowid(db.handle)
             try statement.reset()
+            if node.isDirectory {
+                try directoryPath.bind([.integer(nodeID), .text(path)])
+                _ = try directoryPath.step(); try directoryPath.reset()
+            }
             pending.append(contentsOf: node.children.map { ($0, path, nodeID) })
         }
     }
     private func readNode(_ path: String, db: IndexDatabase) throws -> DiskNode? {
-        try readNodes("SELECT \(Self.nodeColumns) FROM nodes WHERE path=?", [.text(path)], db: db).first
+        try readNodes("SELECT \(Self.nodeColumns)\(Self.nodeFrom) WHERE n.id=\(Self.lookupIDSQL)", Self.lookupValues(path), db: db).first
     }
     private func readChildren(_ parent: String, limit: Int?, db: IndexDatabase) throws -> [DiskNode] {
         var values: [IndexValue] = [.text(parent)]
         if let limit { values.append(.integer(Int64(limit))) }
-        return try readNodes("SELECT \(Self.nodeColumns) FROM nodes WHERE parent=(SELECT id FROM nodes WHERE path=?) ORDER BY size DESC,name" + (limit == nil ? "" : " LIMIT ?"), values, db: db)
+        return try readNodes("SELECT \(Self.nodeColumns)\(Self.nodeFrom) WHERE n.parent=(SELECT id FROM directory_paths WHERE path=?) ORDER BY n.size DESC,n.name" + (limit == nil ? "" : " LIMIT ?"), values, db: db)
     }
     private func readNodes(_ sql: String, _ values: [IndexValue], db: IndexDatabase) throws -> [DiskNode] {
         let statement = try db.statement(sql)
@@ -978,7 +995,7 @@ public struct DiskIndexStore: Sendable {
                                   isSymbolicLink: statement.integer(3) != 0, size: statement.integer(5),
                                   allocatedSize: statement.integer(6), fileCount: Int(statement.integer(7)),
                                   isAccessible: statement.integer(4) != 0, rawAllocatedSize: statement.integer(8),
-                                  fileIdentity: statement.text(9)))
+                                  fileIdentity: statement.identity()))
         }
         return nodes
     }
@@ -1114,6 +1131,7 @@ private final class IndexStatement {
         guard sqlite3_reset(handle) == SQLITE_OK, sqlite3_clear_bindings(handle) == SQLITE_OK else { throw db.error() }
     }
     func text(_ index: Int32) -> String? { sqlite3_column_text(handle, index).map { String(cString: $0) } }
+    func identity() -> String? { handle.flatMap { InventorySchema.identity($0, device: 9, inode: 10) } }
     func integer(_ index: Int32) -> Int64 { sqlite3_column_int64(handle, index) }
     func real(_ index: Int32) -> Double { sqlite3_column_double(handle, index) }
 }

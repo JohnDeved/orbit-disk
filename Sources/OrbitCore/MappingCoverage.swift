@@ -198,10 +198,10 @@ public struct MappingCoverage: Sendable {
             return statement
         }
         guard let application = row("PRAGMA application_id") else { return false }
-        let validApplication = sqlite3_column_int64(application, 0) == 0x4F524254
+        let validApplication = sqlite3_column_int64(application, 0) == InventorySchema.applicationID
         sqlite3_finalize(application)
         guard validApplication, let version = row("PRAGMA user_version") else { return false }
-        let validVersion = sqlite3_column_int64(version, 0) == 3
+        let validVersion = sqlite3_column_int64(version, 0) == InventorySchema.version
         sqlite3_finalize(version)
         guard validVersion, let state = row("""
             SELECT d.device,d.inode,g.generation,m.root_path,EXISTS(SELECT 1 FROM sealed WHERE singleton=1)
@@ -214,10 +214,10 @@ public struct MappingCoverage: Sendable {
               let storedGeneration = sqlite3_column_text(state, 2), let storedRoot = sqlite3_column_text(state, 3),
               String(cString: storedRoot).utf8.elementsEqual(root.path.utf8),
               String(cString: storedGeneration) == generation(root: root, locks: locks) else { return false }
-        if let node = row("SELECT is_dir,file_identity FROM nodes WHERE path=CAST(? AS TEXT)", path: requested.path) {
+        if let node = row("SELECT n.is_dir,n.dev,n.inode FROM directory_paths p JOIN nodes n ON n.id=p.id WHERE p.path=CAST(? AS TEXT)", path: requested.path) {
             defer { sqlite3_finalize(node) }
-            guard sqlite3_column_int(node, 0) == 1, let identity = sqlite3_column_text(node, 1),
-                  String(cString: identity) == target.identity else { return false }
+            guard sqlite3_column_int(node, 0) == 1,
+                  InventorySchema.identity(node, device: 1, inode: 2) == target.identity else { return false }
         } else if sqlite3_column_int(state, 4) != 0 { return false }
         try check(cancellation)
         return !failedQuery && pathsMatch()

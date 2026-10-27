@@ -35,7 +35,7 @@ private struct Signature: Equatable {
             let suffix = ["café", "cafe\u{301}", "K", "が", "नमस्ते", "%_", "[x]", "'", "💾"][i % 9]
             let name = "\(i % 100 == 0 ? "rare-needle" : "file")-\(suffix)-\(i)"
             children.append(DiskNode(url: root.appendingPathComponent(name), name: name, isDirectory: false,
-                size: Int64(i % 41), allocatedSize: Int64(i % 41), fileCount: 1, fileIdentity: "id-\(i)"))
+                size: Int64(i % 41), allocatedSize: Int64(i % 41), fileCount: 1, fileIdentity: "1:\(i + 100)"))
         }
         let node = DiskNode(url: root, name: "root", isDirectory: true, size: children.reduce(0) { $0 + $1.size },
             allocatedSize: children.reduce(0) { $0 + $1.allocatedSize }, fileCount: children.count, children: children)
@@ -116,7 +116,7 @@ private struct Signature: Equatable {
         sql("UPDATE nodes SET size=0 WHERE name='file-0'")
         let highWater = store.testSearchIndex(snapshot: snapshot, staged: true)!.highWater
         sql("DELETE FROM nodes WHERE id=\(highWater)")
-        sql("INSERT INTO nodes(path,parent,name,search_name,size,file_count,file_identity) VALUES('/new-tail',1,'rare-needle-tail','rare-needle-tail',9999,1,'new-tail')")
+        sql("INSERT INTO nodes(parent,name,search_name,size,file_count,dev,inode) VALUES(1,'rare-needle-tail','rare-needle-tail',9999,1,1,9000001)")
         var lastID: Int64 = sqlite3_last_insert_rowid(db)
         precondition(lastID > highWater)
         try verify("rare-needle"); try verify("file")
@@ -125,7 +125,7 @@ private struct Signature: Equatable {
         let renewed = try store.prepareStagedSearch(snapshot: snapshot); precondition(renewed)
         try verify("renamed-hit")
         sql("DELETE FROM nodes WHERE id=\(lastID)")
-        sql("INSERT INTO nodes(path,parent,name,search_name,size,file_count,file_identity) VALUES('/replacement-tail',1,'replacement-needle','replacement-needle',99999,1,'replacement-tail')")
+        sql("INSERT INTO nodes(parent,name,search_name,size,file_count,dev,inode) VALUES(1,'replacement-needle','replacement-needle',99999,1,1,9000002)")
         precondition(sqlite3_last_insert_rowid(db) > lastID); lastID = sqlite3_last_insert_rowid(db)
         try verify("replacement-needle"); try verify("rare-needle")
         let file = try stage.search(query: "file-1", cancellation: ScanCancellation(), removals: [], limit: 1).nodes.first!

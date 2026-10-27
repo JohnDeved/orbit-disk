@@ -145,6 +145,25 @@ private final class RecoveryTailProbe: @unchecked Sendable {
    return try fence.pendingOperations(after:0,limit:512).map(\.sequence)
   }
   precondition(migrated == pendingSequences, "migration must preserve the journal and its pending operations")
+  let inventory = DiskIndexStore(directory: cache)
+  let oldSnapshot = try inventory.save(DiskScanner().scan(root), eventID: 0, eventIdentity: "fixture")
+  var oldDatabase: OpaquePointer?
+  precondition(sqlite3_open_v2(oldSnapshot.databaseURL.path, &oldDatabase, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK)
+  precondition(sqlite3_exec(oldDatabase, "PRAGMA user_version=3", nil, nil, nil) == SQLITE_OK)
+  sqlite3_close(oldDatabase)
+  precondition(inventory.savedSnapshot(for: root) == nil, "old inventory format must be rebuilt")
+  try inventory.invalidate(for: root)
+  _ = try inventory.save(DiskScanner().scan(root), eventID: 1, eventIdentity: "fixture")
+  let preserved = try journal.withFence { fence -> [Int64] in
+   precondition(fence.identity == initialIdentity, "inventory rebuild replaced the removal journal")
+   return try fence.pendingOperations(after: 0, limit: 512).map(\.sequence)
+  }
+  precondition(preserved == pendingSequences, "inventory rebuild discarded pending removal operations")
+  var journalDatabase: OpaquePointer?, journalVersion: OpaquePointer?
+  precondition(sqlite3_open_v2(database.path, &journalDatabase, SQLITE_OPEN_READONLY, nil) == SQLITE_OK)
+  precondition(sqlite3_prepare_v2(journalDatabase, "PRAGMA user_version", -1, &journalVersion, nil) == SQLITE_OK)
+  precondition(sqlite3_step(journalVersion) == SQLITE_ROW && sqlite3_column_int64(journalVersion, 0) == 3)
+  sqlite3_finalize(journalVersion); sqlite3_close(journalDatabase)
   let token=ScanCancellation();token.cancel();do {_ = try journal.withFence(cancellation:token) { _ in true };fatalError("cancel ignored")} catch is CancellationError {}
   do {_ = try journal.begin(root:root,rootIdentity:"root-id",items:[ScanRemoval(path:base.appendingPathComponent("escape").path,identity:"id")]);fatalError("outside root")} catch RemovalJournal.Failure.invalid {}
   let held=DispatchSemaphore(value:0), release=DispatchSemaphore(value:0), finished=DispatchSemaphore(value:0)

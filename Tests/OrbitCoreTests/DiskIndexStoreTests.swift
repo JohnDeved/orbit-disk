@@ -1,4 +1,5 @@
 import CSQLite
+import Darwin
 import Foundation
 import OrbitCore
 
@@ -80,6 +81,120 @@ final class DiskIndexStoreTests: CheckCase {
         let rootSnapshot = try store.save(scan(folder(slash, children: [folder(URL(fileURLWithPath: "/Users"), children: [])])), eventID: 0, eventIdentity: "root")
         checkEqual(try store.loadFolder(path: "/", snapshot: rootSnapshot).children.first?.name, "Users")
         checkTrue(rootSnapshot.databaseURL != saved.databaseURL)
+    }
+
+    func testCompactInventoryPathsAndIdentityBits() throws {
+        let slash = URL(fileURLWithPath: "/", isDirectory: true)
+        let branchURL = URL(string: "file:///R%C3%A9sum%C3%A9-%25_%0A")!
+        let itemURL = branchURL.appendingPathComponent("size-💾% +.txt")
+        let identity = "\(Int32.min):\(UInt64.max)"
+        let exactSize: Int64 = 9_007_199_254_740_993
+        let item = DiskNode(url: itemURL, name: itemURL.lastPathComponent, isDirectory: false,
+                            isSymbolicLink: true, size: exactSize, allocatedSize: 4096, fileCount: 1,
+                            isAccessible: false, rawAllocatedSize: 8192, fileIdentity: identity)
+        let top = leaf(slash.appendingPathComponent("top-level"), size: 7)
+        let branch = folder(branchURL, children: [item])
+        let tree = DiskNode(url: slash, name: "/", isDirectory: true, size: exactSize + 7,
+                            allocatedSize: 4103, fileCount: 2, children: [branch, top],
+                            fileIdentity: "-1:9223372036854775808")
+        let snapshot = try store.save(scan(tree), eventID: UInt64.max, eventIdentity: "compact")
+        let hydrated = try checkUnwrap(store.node(path: item.id, snapshot: snapshot))
+        checkEqual(Data(hydrated.id.utf8), Data(item.url.standardizedFileURL.path.utf8))
+        checkEqual(hydrated.name, item.name)
+        checkEqual(hydrated.fileIdentity, identity)
+        checkEqual(hydrated.size, exactSize)
+        checkEqual(hydrated.allocatedSize, 4096)
+        checkEqual(hydrated.rawAllocatedSize, 8192)
+        checkTrue(hydrated.isSymbolicLink && !hydrated.isAccessible)
+        checkNil(try store.node(path: top.id, snapshot: snapshot)?.fileIdentity)
+        checkEqual(try store.loadFolder(path: "/", snapshot: snapshot).children.map(\.id), [branch.id, "/top-level"])
+        checkEqual(try store.ancestors(path: item.id, snapshot: snapshot).map(\.id), ["/", branch.id, item.id])
+        checkEqual(try store.search(query: "💾% +", snapshot: snapshot).nodes.map(\.id), [item.id])
+
+        func scalar(_ url: URL, _ sql: String) throws -> Int64 {
+            var db: OpaquePointer?, statement: OpaquePointer?
+            guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+                throw CheckFailure("Could not inspect compact inventory")
+            }
+            defer { sqlite3_close(db) }
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw CheckFailure("Could not prepare inventory invariant: \(sql)")
+            }
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_step(statement) == SQLITE_ROW else { throw CheckFailure("Missing inventory invariant result") }
+            return sqlite3_column_int64(statement, 0)
+        }
+        checkEqual(try scalar(snapshot.databaseURL, "PRAGMA user_version"), 4)
+        checkEqual(try scalar(snapshot.databaseURL, "SELECT COUNT(*) FROM nodes"), 4)
+        checkEqual(try scalar(snapshot.databaseURL, "SELECT COUNT(*) FROM directory_paths"), 2)
+        checkEqual(try scalar(snapshot.databaseURL, "SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name IN ('path','st_parent','st_name','st_size','st_allocated','directory','charged','file_identity')"), 0)
+        checkEqual(try scalar(snapshot.databaseURL, "SELECT COUNT(*) FROM nodes n LEFT JOIN directory_paths p ON p.id=n.id WHERE n.is_dir=1 AND p.id IS NULL"), 0)
+        checkEqual(try scalar(snapshot.databaseURL, "SELECT COUNT(*) FROM directory_paths p JOIN nodes n ON n.id=p.id WHERE n.is_dir=0"), 0)
+        checkEqual(try scalar(snapshot.databaseURL, "SELECT COUNT(*) FROM nodes WHERE dev=-2147483648 AND inode=-1"), 1)
+        checkEqual(try scalar(snapshot.databaseURL, "SELECT inode FROM nodes WHERE parent IS NULL"), Int64.min)
+        checkThrowsError(try mutate(snapshot.databaseURL, sql: "INSERT INTO nodes(parent,name) SELECT parent,name FROM nodes WHERE dev=-2147483648 AND inode=-1"))
+
+        let removed = try store.update(snapshot: snapshot, replacements: [IndexReplacement(path: branch.id, result: nil)],
+                                       eventID: UInt64.max, eventIdentity: "compact")
+        checkNil(try store.node(path: item.id, snapshot: removed))
+        checkEqual(try store.loadFolder(path: "/", snapshot: removed).children.map(\.id), ["/top-level"])
+        checkEqual(try store.node(path: "/", snapshot: removed)?.size, 7)
+        checkEqual(try scalar(removed.databaseURL, "SELECT COUNT(*) FROM nodes"), 2)
+        checkEqual(try scalar(removed.databaseURL, "SELECT COUNT(*) FROM directory_paths"), 1)
+    }
+
+    func testFilesystemUnicodeLookupAndRefresh() throws {
+        let names = [("café-nfc", "été-nfc"), ("cafe\u{301}-nfd", "e\u{301}te\u{301}-nfd")]
+        var rawFiles: [String] = []
+        for (index, names) in names.enumerated() {
+            let directory = root.path + "/" + names.0
+            guard mkdir(directory, 0o700) == 0 else { throw CheckFailure("Could not create Unicode directory") }
+            let path = directory + "/" + names.1
+            // POSIX keeps the requested APFS spelling; Foundation normalizes file URL paths.
+            let descriptor = open(path, O_CREAT | O_EXCL | O_WRONLY, 0o600)
+            guard descriptor >= 0 else { throw CheckFailure("Could not create Unicode file") }
+            let status = ftruncate(descriptor, Int64(index + 1))
+            close(descriptor)
+            guard status == 0 else { throw CheckFailure("Could not resize Unicode file") }
+            rawFiles.append(path)
+        }
+        let scanner = DiskScanner()
+        let initial = try scanner.scan(root)
+        checkEqual(initial.root.fileCount, 2)
+        let snapshot = try store.save(initial, eventID: 1, eventIdentity: "unicode-filesystem")
+        for branch in initial.root.children {
+            let hydrated = try checkUnwrap(store.loadFolder(path: branch.id, snapshot: snapshot).children.first)
+            let original = try checkUnwrap(branch.children.first)
+            checkEqual(hydrated.fileIdentity, original.fileIdentity)
+            checkEqual(hydrated.name, original.name)
+            checkEqual(Data(hydrated.id.utf8), Data(original.url.standardizedFileURL.path.utf8))
+        }
+        var identities: [String?] = []
+        for (index, path) in rawFiles.enumerated() {
+            let saved = try checkUnwrap(store.node(path: path, snapshot: snapshot))
+            identities.append(saved.fileIdentity)
+            var info = stat()
+            guard lstat(path, &info) == 0 else { throw CheckFailure("Could not stat Unicode file") }
+            checkEqual(saved.fileIdentity, "\(info.st_dev):\(info.st_ino)")
+            checkEqual(saved.size, Int64(index + 1))
+            let descriptor = open(path, O_WRONLY)
+            guard descriptor >= 0 else { throw CheckFailure("Could not reopen Unicode file") }
+            let status = ftruncate(descriptor, Int64(index + 11))
+            close(descriptor)
+            guard status == 0 else { throw CheckFailure("Could not refresh Unicode file") }
+        }
+        let replacements = try initial.root.children.map {
+            IndexReplacement(path: $0.id, result: try scanner.scan($0.url))
+        }
+        let refreshed = try store.update(snapshot: snapshot, replacements: replacements,
+                                         eventID: 2, eventIdentity: "unicode-filesystem")
+        for (index, path) in rawFiles.enumerated() {
+            let after = try checkUnwrap(store.node(path: path, snapshot: refreshed))
+            checkEqual(after.fileIdentity, identities[index])
+            checkEqual(after.size, Int64(index + 11))
+        }
+        checkEqual(try store.loadFolder(path: root.path, snapshot: refreshed).fileCount, 2)
+        checkEqual(try store.loadFolder(path: root.path, snapshot: refreshed).size, 23)
     }
 
     func testParentValidationPreservesSnapshot() throws {
@@ -182,7 +297,9 @@ final class DiskIndexStoreTests: CheckCase {
         checkNil(store.savedSnapshot(for: root))
         try mutate(next.databaseURL, sql: "PRAGMA user_version=2")
         checkNil(store.savedSnapshot(for: root), "Older caches without directory identities must be rebuilt")
-        try mutate(next.databaseURL, sql: "PRAGMA user_version=3; UPDATE metadata SET root_path='/wrong'")
+        try mutate(next.databaseURL, sql: "PRAGMA user_version=3")
+        checkNil(store.savedSnapshot(for: root), "Full-path inventories must be rebuilt")
+        try mutate(next.databaseURL, sql: "PRAGMA user_version=4; UPDATE metadata SET root_path='/wrong'")
         checkNil(store.savedSnapshot(for: root))
         try Data("damaged".utf8).write(to: next.databaseURL)
         checkNil(store.savedSnapshot(for: root))
@@ -203,7 +320,7 @@ final class DiskIndexStoreTests: CheckCase {
         checkEqual(try store.node(path: root.path, snapshot: created)?.size, 57)
         checkEqual(try store.node(path: root.path, snapshot: created)?.allocatedSize, 57)
         checkEqual(try store.node(path: changedURL.path, snapshot: created)?.allocatedSize, 40)
-        checkEqual(try store.node(path: changedURL.path, snapshot: created)?.fileIdentity, "directory:\(changedURL.path)")
+        checkEqual(try store.node(path: changedURL.path, snapshot: created)?.fileIdentity, directoryIdentity(changedURL))
         checkEqual(try store.node(path: root.path, snapshot: created)?.fileCount, 3)
         checkEqual(try store.node(path: untouched.id, snapshot: created)?.size, 17)
         let renamed = leaf(changedURL.appendingPathComponent("renamed"), size: 30)
@@ -224,9 +341,9 @@ final class DiskIndexStoreTests: CheckCase {
     func testIncrementalCrossSubtreeHardLinks() throws {
         let a = root.appendingPathComponent("a")
         let z = root.appendingPathComponent("z")
-        let original = leaf(z.appendingPathComponent("original"), size: 4096, identity: "device:inode")
+        let original = leaf(z.appendingPathComponent("original"), size: 4096, identity: "1:101")
         let initial = try store.save(scan(folder(root, children: [folder(a, children: []), folder(z, children: [original])])), eventID: 1, eventIdentity: "v")
-        let newLink = leaf(a.appendingPathComponent("link"), size: 4096, identity: "device:inode")
+        let newLink = leaf(a.appendingPathComponent("link"), size: 4096, identity: "1:101")
         let linked = try store.update(snapshot: initial, replacements: [IndexReplacement(path: a.path, result: scan(folder(a, children: [newLink])))], eventID: 2, eventIdentity: "v")
         checkEqual(try store.node(path: root.path, snapshot: linked)?.size, 8192)
         checkEqual(try store.node(path: root.path, snapshot: linked)?.allocatedSize, 4096)
@@ -243,10 +360,10 @@ final class DiskIndexStoreTests: CheckCase {
         let a = root.appendingPathComponent("a")
         let nested = a.appendingPathComponent("nested")
         let z = root.appendingPathComponent("z")
-        let original = leaf(z.appendingPathComponent("original"), size: 4096, identity: "shared")
-        let unrelated = leaf(z.appendingPathComponent("unrelated"), size: 123, identity: "unique")
+        let original = leaf(z.appendingPathComponent("original"), size: 4096, identity: "1:102")
+        let unrelated = leaf(z.appendingPathComponent("unrelated"), size: 123, identity: "1:103")
         let initial = try store.save(scan(folder(root, children: [folder(a, children: [folder(nested, children: [])]), folder(z, children: [original, unrelated])])), eventID: 1, eventIdentity: "v")
-        let newLink = leaf(nested.appendingPathComponent("link"), size: 4096, identity: "shared")
+        let newLink = leaf(nested.appendingPathComponent("link"), size: 4096, identity: "1:102")
         let linked = try store.update(snapshot: initial, replacements: [IndexReplacement(path: nested.path, result: scan(folder(nested, children: [newLink])))], eventID: 2, eventIdentity: "v")
         checkEqual(try store.node(path: nested.path, snapshot: linked)?.allocatedSize, 4096)
         checkEqual(try store.node(path: a.path, snapshot: linked)?.allocatedSize, 4096)
@@ -320,7 +437,7 @@ final class DiskIndexStoreTests: CheckCase {
 
     func testInterruptedIncrementalUpdatePreservesSnapshot() throws {
         let branch = root.appendingPathComponent("branch")
-        let files = (0..<10_000).map { leaf(branch.appendingPathComponent("file-\($0)"), size: 1, identity: "identity-\($0)") }
+        let files = (0..<10_000).map { leaf(branch.appendingPathComponent("file-\($0)"), size: 1, identity: "1:\($0 + 1)") }
         let updatedBranch = folder(branch, children: files)
         let initial = try store.save(scan(folder(root, children: [updatedBranch])), eventID: 1, eventIdentity: "v")
         let readCancellation = ScanCancellation()
@@ -343,11 +460,15 @@ final class DiskIndexStoreTests: CheckCase {
         DiskNode(url: url, name: url.lastPathComponent, isDirectory: false, size: size, allocatedSize: size,
                  fileCount: 1, rawAllocatedSize: size, fileIdentity: identity)
     }
+    private func directoryIdentity(_ url: URL) -> String {
+        let inode = url.path.utf8.reduce(UInt64(14_695_981_039_346_656_037)) { ($0 ^ UInt64($1)) &* 1_099_511_628_211 }
+        return "2:\(inode)"
+    }
     private func folder(_ url: URL, children: [DiskNode]) -> DiskNode {
         DiskNode(url: url, name: url.lastPathComponent, isDirectory: true,
                  size: children.reduce(0) { $0 + $1.size }, allocatedSize: children.reduce(0) { $0 + $1.allocatedSize },
                  fileCount: children.reduce(0) { $0 + $1.fileCount }, children: children,
-                 fileIdentity: "directory:\(url.path)")
+                 fileIdentity: directoryIdentity(url))
     }
     private func scan(_ root: DiskNode, skipped: Int = 0, issues: [String] = []) -> ScanResult {
         ScanResult(root: root, elapsed: 0.125, skippedCount: skipped, issues: issues)

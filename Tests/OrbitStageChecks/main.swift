@@ -2,6 +2,24 @@ import CSQLite
 import Darwin
 import Foundation
 struct SimulatedCrash: Error {}
+func checkRejectedStageFormats(_ base: URL) throws {
+  try FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+  for version in [0, 3] {
+    let url = base.appendingPathComponent("format-\(version).sqlite")
+    var db: OpaquePointer?
+    precondition(sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK)
+    precondition(sqlite3_exec(db, "CREATE TABLE nodes(path TEXT); INSERT INTO nodes VALUES('/kept'); PRAGMA user_version=\(version)", nil, nil, nil) == SQLITE_OK)
+    sqlite3_close(db)
+    let original = try Data(contentsOf: url)
+    do { _ = try ListingStage(path: url.path); fatalError("old inventory format accepted") }
+    catch ListingStage.Failure.sqlite {}
+    let retained = try Data(contentsOf: url)
+    precondition(retained == original, "rejected inventory must remain unchanged")
+  }
+  let fresh = try ListingStage(path: base.appendingPathComponent("fresh.sqlite").path)
+  fresh.close()
+  print("PASS: old and unversioned inventories are rejected intact; empty databases initialize")
+}
 func checkDirectoryRegistrationRollback(_ base: URL) throws {
   let root = base.appendingPathComponent("root", isDirectory: true)
   try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -93,6 +111,7 @@ func checkLookupPreflight(_ base: URL) throws {
    return
   }
   let base=URL(fileURLWithPath:CommandLine.arguments[1],isDirectory:true).standardizedFileURL, fm=FileManager.default
+  try checkRejectedStageFormats(base.appendingPathComponent("rejected-formats",isDirectory:true))
   try ListingEpochChecks.run(base.appendingPathComponent("listing-epochs",isDirectory:true))
   try checkDirectoryRegistrationRollback(base.appendingPathComponent("directory-rollback",isDirectory:true))
   try checkIdentityLookup(base.appendingPathComponent("identity",isDirectory:true))
@@ -102,24 +121,24 @@ func checkLookupPreflight(_ base: URL) throws {
   let first=root.appendingPathComponent("z0000"); try Data(repeating:7,count:4096).write(to:first)
   for i in 1..<1500 { try fm.linkItem(at:first,to:root.appendingPathComponent(String(format:"z%04d",i))) }
   let checkpoint=StageCheckpoint(rootPath:root.path,identity:"test",eventID:0)
-  var legacyDatabase = ""
+  var resumeDatabase = ""
   do {
    let stage=try ResumableStage(cache:cache,root:root,current:checkpoint)
-   legacyDatabase = stage.lease.databasePath
+   resumeDatabase = stage.lease.databasePath
    do { _ = try stage.crawler.step(beforeAccounting:{throw SimulatedCrash()}); fatalError("expected interruption") }
    catch is SimulatedCrash {}
   }
-  var legacy: OpaquePointer?
-  guard sqlite3_open_v2(legacyDatabase, &legacy, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else { fatalError("legacy stage open") }
-  guard sqlite3_exec(legacy, "CREATE INDEX listing_identity ON nodes(dev,inode,directory,path)", nil, nil, nil) == SQLITE_OK else { fatalError("legacy stage index") }
-  sqlite3_close(legacy)
+  var resume: OpaquePointer?
+  guard sqlite3_open_v2(resumeDatabase, &resume, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else { fatalError("resume stage open") }
+  guard sqlite3_exec(resume, "CREATE INDEX listing_identity ON nodes(dev,inode,is_dir,parent,name)", nil, nil, nil) == SQLITE_OK else { fatalError("resume stage index") }
+  sqlite3_close(resume)
   let changed=StageCheckpoint(rootPath:root.path,identity:"replacement-journal",eventID:42)
   let stage=try ResumableStage(cache:cache,root:root,current:changed)
-  guard sqlite3_open_v2(legacyDatabase, &legacy, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { fatalError("legacy stage reopen") }
-  var legacyIndex: OpaquePointer?
-  guard sqlite3_prepare_v2(legacy, "SELECT 1 FROM sqlite_master WHERE name='listing_identity'", -1, &legacyIndex, nil) == SQLITE_OK,
-        sqlite3_step(legacyIndex) == SQLITE_ROW else { fatalError("legacy index removed during resume") }
-  sqlite3_finalize(legacyIndex); sqlite3_close(legacy)
+  guard sqlite3_open_v2(resumeDatabase, &resume, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { fatalError("resume stage reopen") }
+  var resumeIndex: OpaquePointer?
+  guard sqlite3_prepare_v2(resume, "SELECT 1 FROM sqlite_master WHERE name='listing_identity'", -1, &resumeIndex, nil) == SQLITE_OK,
+        sqlite3_step(resumeIndex) == SQLITE_ROW else { fatalError("resume index removed during resume") }
+  sqlite3_finalize(resumeIndex); sqlite3_close(resume)
   guard stage.checkpoint.identity == checkpoint.identity, stage.checkpoint.eventID == checkpoint.eventID else { throw NSError(domain:"original checkpoint changed",code:1) }
   func finish() throws { while try stage.advance(progress:{_ in}) {} }
   func verify(_ label:String) throws {

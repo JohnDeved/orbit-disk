@@ -26,6 +26,8 @@ final class StageLease {
         var bytes = Data(root.path.utf8)
         bytes.append(0)
         bytes.append(contentsOf: "\(info.st_dev):\(info.st_ino)".utf8)
+        bytes.append(0)
+        bytes.append(contentsOf: "inventory:\(InventorySchema.version)".utf8)
         return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
 
@@ -150,10 +152,10 @@ final class StageLease {
         }
         let applicationID = try integer("PRAGMA application_id")
         let version = try integer("PRAGMA user_version")
-        let stageTables = try integer("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('scan','nodes','directories')")
+        let stageTables = try integer("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('scan','nodes','directories','directory_paths')")
         let userObjects = try integer("SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
         let empty = applicationID == 0 && version == 0 && userObjects == 0
-        guard empty || (applicationID == 0x4F524254 && version == 3 && stageTables == 3) else {
+        guard empty || (applicationID == InventorySchema.applicationID && version == InventorySchema.version && stageTables == 4) else {
             throw Failure.incompatible
         }
     }

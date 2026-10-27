@@ -52,6 +52,7 @@ enum ListingEpochChecks {
         try checkFallback(base.appendingPathComponent("fallback"))
         try checkActiveListing(base.appendingPathComponent("active"))
         try checkBoundedBatches(base.appendingPathComponent("batches"))
+        try checkInterruptedCompactPrune(base.appendingPathComponent("compact-prune"))
     }
     static func checkCrashes(_ base: URL) throws {
         for boundary in ["batch-epoch", "batch-committed", "empty-epoch", "empty-committed"] {
@@ -215,7 +216,10 @@ enum ListingEpochChecks {
             precondition(counts.count == 2 && counts[0] == 128)
             precondition(counts[1] > counts[0] && counts[1] - counts[0] <= 1024)
             precondition(database.scalar("SELECT COUNT(*) FROM directories WHERE pending=1") == 1)
-            precondition(database.scalar("SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name IN ('st_path','st_is_link','folded','identity')") == 0)
+            precondition(database.scalar("SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name IN ('path','st_path','st_parent','st_name','st_size','st_allocated','st_is_link','folded','identity','file_identity','directory','charged')") == 0)
+            precondition(database.scalar("PRAGMA user_version") == 4)
+            precondition(database.scalar("SELECT COUNT(*) FROM directory_paths") == 1, "leaf paths must not be persisted")
+            precondition(database.scalar("SELECT COUNT(*) FROM directory_paths p JOIN nodes n ON n.id=p.id WHERE n.is_dir=0") == 0)
             savedCount = counts[1]
         }
         let stage = try makeStage(base), database = Database(stage.crawler.store.databasePath)
@@ -225,5 +229,54 @@ enum ListingEpochChecks {
         precondition(view.scanState == .complete && view.fileCount == 4097 && view.size == 4097)
         precondition(view.children.count == 4097)
         print("PASS: first 128 rows are durable immediately; bounded background batches survive reopen without losing rows")
+    }
+
+    static func checkInterruptedCompactPrune(_ base: URL) throws {
+        let root = base.appendingPathComponent("root", isDirectory: true)
+        let removed = root.appendingPathComponent("a-remove", isDirectory: true)
+        let deepest = removed.appendingPathComponent("nested/さらに", isDirectory: true)
+        let sibling = root.appendingPathComponent("a-remove-other", isDirectory: true)
+        try fm.createDirectory(at: deepest, withIntermediateDirectories: true)
+        try fm.createDirectory(at: sibling, withIntermediateDirectories: true)
+        try Data([4, 5]).write(to: sibling.appendingPathComponent("kept"))
+        for index in 0..<320 {
+            try Data(repeating: 1, count: index == 0 ? 4096 : 3)
+                .write(to: deepest.appendingPathComponent(String(format: "file-%03d", index)))
+        }
+        let survivor = root.appendingPathComponent("z-surviving-link")
+        try fm.linkItem(at: deepest.appendingPathComponent("file-000"), to: survivor)
+        var remaining: Int64 = 0
+        do {
+            let stage = try makeStage(base)
+            try finish(stage)
+            let database = Database(stage.crawler.store.databasePath)
+            let before = database.scalar("SELECT COUNT(*) FROM nodes")
+            try fm.removeItem(at: removed)
+            try stage.crawler.markChanged(directory: root.path)
+            try stage.crawler.store.startPrune(path: Data(removed.path.utf8), parent: Data(root.path.utf8), name: Data(removed.lastPathComponent.utf8))
+            let advanced = try stage.crawler.store.pruneOneChunk()
+            precondition(advanced)
+            remaining = database.scalar("SELECT COUNT(*) FROM nodes")
+            precondition(remaining < before && remaining > 128, "fixture must interrupt a multi-batch prune")
+            precondition(database.scalar("SELECT COUNT(*) FROM prune") == 1)
+            precondition(database.scalar("SELECT COUNT(*) FROM nodes n LEFT JOIN nodes p ON p.id=n.parent WHERE n.parent IS NOT NULL AND p.id IS NULL") == 0, "pruning orphaned live descendants")
+            precondition(database.scalar("SELECT COUNT(*) FROM nodes n LEFT JOIN directory_paths p ON p.id=n.parent WHERE n.parent IS NOT NULL AND p.id IS NULL") == 0, "pruning removed a parent path before its children")
+        }
+        let stage = try makeStage(base), database = Database(stage.crawler.store.databasePath)
+        precondition(database.scalar("SELECT COUNT(*) FROM nodes") == remaining, "reopen lost committed pruning progress")
+        precondition(database.scalar("SELECT COUNT(*) FROM prune") == 1, "reopen lost the prune continuation")
+        try finish(stage)
+        let actual = try stage.view(path: root.path, removals: [], cancellation: ScanCancellation())!.folder
+        let expected = try DiskScanner().scan(root).root
+        precondition(actual.size == expected.size && actual.allocatedSize == expected.allocatedSize && actual.fileCount == expected.fileCount)
+        precondition(actual.children.map(\.id) == expected.children.map(\.id))
+        precondition(actual.children.first { $0.id == survivor.path }?.allocatedSize == expected.children.first { $0.id == survivor.path }?.allocatedSize)
+        let siblingView = try stage.view(path: sibling.path, removals: [], cancellation: ScanCancellation())
+        precondition(siblingView!.folder.children.count == 1)
+        precondition(database.scalar("SELECT COUNT(*) FROM prune") == 0)
+        precondition(database.scalar("SELECT COUNT(*) FROM directory_paths") == database.scalar("SELECT COUNT(*) FROM nodes WHERE is_dir=1"))
+        precondition(database.scalar("SELECT COUNT(*) FROM directory_paths p LEFT JOIN nodes n ON n.id=p.id WHERE n.id IS NULL OR n.is_dir=0") == 0)
+        precondition(database.scalar("SELECT COUNT(*) FROM owners o LEFT JOIN nodes n ON n.id=o.node_id WHERE n.id IS NULL") == 0)
+        print("PASS: compact multi-batch pruning resumes with parent paths, sibling boundaries and surviving hard-link ownership intact")
     }
 }

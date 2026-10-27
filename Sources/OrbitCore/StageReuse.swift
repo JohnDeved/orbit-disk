@@ -59,15 +59,19 @@ final class StageReuseSource {
                 return Unmanaged<ScanCancellation>.fromOpaque(context).takeUnretainedValue().isCancelled || Task<Never, Never>.isCancelled ? 1 : 0
             }, Unmanaged.passUnretained(cancellation).toOpaque())
             guard sqlite3_exec(opened, "BEGIN", nil, nil, nil) == SQLITE_OK else { throw Failure.unsuitable }
+            let version = try Self.statement(opened, "PRAGMA user_version")
+            defer { sqlite3_finalize(version) }
+            guard sqlite3_step(version) == SQLITE_ROW,
+                  sqlite3_column_int64(version, 0) == InventorySchema.version else { throw Failure.unsuitable }
             let metadata = try Self.statement(opened, "SELECT snapshot_id,root_path,event_id,event_identity,skipped FROM metadata WHERE singleton=1")
             defer { sqlite3_finalize(metadata) }
             guard sqlite3_step(metadata) == SQLITE_ROW,
                   Self.text(metadata, 0) == snapshot.id, Self.text(metadata, 1).map({ Data($0.utf8) }) == path,
                   Self.text(metadata, 2) == String(snapshot.eventID), Self.text(metadata, 3) == snapshot.eventIdentity,
                   sqlite3_column_int64(metadata, 4) == 0 else { throw Failure.unsuitable }
-            let root = try Self.statement(opened, "SELECT file_identity FROM nodes WHERE parent IS NULL AND is_dir=1 AND accessible=1")
+            let root = try Self.statement(opened, "SELECT dev,inode FROM nodes WHERE parent IS NULL AND is_dir=1 AND accessible=1")
             defer { sqlite3_finalize(root) }
-            guard sqlite3_step(root) == SQLITE_ROW, let identity = Self.text(root, 0),
+            guard sqlite3_step(root) == SQLITE_ROW, let identity = InventorySchema.identity(root, device: 0, inode: 1),
                   try MappingCoverage.canReach(root: parentRoot, target: snapshot.rootURL,
                     expectedRootIdentity: parentIdentity, expectedTargetIdentity: identity, cancellation: cancellation) else { throw Failure.unsuitable }
             let savedCursor = try Self.statement(opened, "SELECT identity,sequence FROM orbit_removal_cursor WHERE singleton=1")
@@ -96,11 +100,11 @@ final class StageReuseSource {
     func listing(_ directory: ListingStage.QueuedDirectory, allowSmall: Bool = false) throws -> StageReusableListing? {
         guard !rejected, contains(directory.path), let db else { return nil }
         do {
-            let parent = try Self.statement(db, "SELECT id,file_identity FROM nodes WHERE path=CAST(? AS TEXT) AND is_dir=1 AND accessible=1")
+            let parent = try Self.statement(db, "SELECT n.id,n.dev,n.inode FROM directory_paths p JOIN nodes n ON n.id=p.id WHERE p.path=CAST(? AS TEXT) AND n.is_dir=1 AND n.accessible=1")
             defer { sqlite3_finalize(parent) }
             directory.path.withUnsafeBytes { _ = sqlite3_bind_blob(parent, 1, $0.baseAddress, Int32($0.count), transient) }
             guard sqlite3_step(parent) == SQLITE_ROW,
-                  Self.text(parent, 1) == "\(directory.device):\(directory.inode)" else { return nil }
+                  InventorySchema.identity(parent, device: 1, inode: 2) == "\(directory.device):\(directory.inode)" else { return nil }
             let parentID = sqlite3_column_int64(parent, 0)
             if !allowSmall {
                 let count = try Self.statement(db, "SELECT COUNT(*) FROM (SELECT 1 FROM nodes WHERE parent=? LIMIT 32)")
@@ -112,9 +116,9 @@ final class StageReuseSource {
             guard recovered.removals.isEmpty, recovered.affectedParents.isEmpty, !recovered.overlayOverflow,
                   !recovered.hasLiveOperation, !recovered.requiresFullRefresh else { throw Failure.changed }
             cursor = recovered.cursor
-            let rows = try Self.statement(db, "SELECT path,name,is_dir,is_link,accessible,size,raw_alloc,file_identity FROM nodes WHERE parent=?")
+            let rows = try Self.statement(db, "SELECT name,is_dir,is_link,accessible,size,raw_alloc,dev,inode,is_mount,links FROM nodes WHERE parent=?")
             sqlite3_bind_int64(rows, 1, parentID)
-            return StageReusableListing(source: self, rows: rows, directory: directory.path)
+            return StageReusableListing(source: self, rows: rows)
         } catch {
             if cancellation.isCancelled || Task<Never, Never>.isCancelled { throw CancellationError() }
             rejected = true
@@ -147,10 +151,9 @@ final class StageReuseSource {
 final class StageReusableListing {
     let source: StageReuseSource
     private let rows: OpaquePointer
-    private let directory: Data
     private var finished = false
-    init(source: StageReuseSource, rows: OpaquePointer, directory: Data) {
-        self.source = source; self.rows = rows; self.directory = directory
+    init(source: StageReuseSource, rows: OpaquePointer) {
+        self.source = source; self.rows = rows
     }
     deinit { sqlite3_finalize(rows) }
     func page(limit: Int) throws -> [FileMetadata] {
@@ -159,20 +162,17 @@ final class StageReusableListing {
         while records.count < limit {
             let status = sqlite3_step(rows)
             if status == SQLITE_DONE { finished = true; return records }
-            guard status == SQLITE_ROW, let path = StageReuseSource.text(rows, 0), let name = StageReuseSource.text(rows, 1),
+            guard status == SQLITE_ROW, let name = StageReuseSource.text(rows, 0),
                   !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.utf8.contains(0),
-                  let identity = StageReuseSource.text(rows, 7) else { throw StageReuseSource.Failure.unsuitable }
-            var expected = directory
-            if expected.last != 47 { expected.append(47) }
-            expected.append(contentsOf: name.utf8)
-            let parts = identity.split(separator: ":")
-            guard Data(path.utf8) == expected, parts.count == 2, let device = Int32(parts[0]), let inode = UInt64(parts[1]),
-                  sqlite3_column_int(rows, 4) == 1, sqlite3_column_int64(rows, 5) >= 0,
-                  sqlite3_column_int64(rows, 6) >= 0 else { throw StageReuseSource.Failure.unsuitable }
-            let isDirectory = sqlite3_column_int(rows, 2) != 0
-            records.append(FileMetadata(name: name, device: device, inode: inode, isDirectory: isDirectory,
-                isSymbolicLink: sqlite3_column_int(rows, 3) != 0, isMountPoint: false, linkCount: 1,
-                size: isDirectory ? 0 : sqlite3_column_int64(rows, 5), allocatedSize: isDirectory ? 0 : sqlite3_column_int64(rows, 6)))
+                  let identity = InventorySchema.identity(rows, device: 6, inode: 7),
+                  let parsed = InventorySchema.parseIdentity(identity),
+                  sqlite3_column_int(rows, 3) == 1, sqlite3_column_int64(rows, 4) >= 0,
+                  sqlite3_column_int64(rows, 5) >= 0,
+                  let links = UInt32(exactly: sqlite3_column_int64(rows, 9)) else { throw StageReuseSource.Failure.unsuitable }
+            let isDirectory = sqlite3_column_int(rows, 1) != 0
+            records.append(FileMetadata(name: name, device: parsed.device, inode: parsed.inode, isDirectory: isDirectory,
+                isSymbolicLink: sqlite3_column_int(rows, 2) != 0, isMountPoint: sqlite3_column_int(rows, 8) != 0, linkCount: links,
+                size: isDirectory ? 0 : sqlite3_column_int64(rows, 4), allocatedSize: isDirectory ? 0 : sqlite3_column_int64(rows, 5)))
         }
         return records
     }

@@ -47,8 +47,8 @@ final class Gate: @unchecked Sendable {
         precondition(retried.nodes.contains { $0.id == oldFile.id && $0.fileIdentity == "replacement" })
         let unicodeRoot = base.appendingPathComponent("unicode-root"), unicodePreview = DiskScanPreview()
         let names = ["x-é", "y-e\u{301}", "x-नमस्ते", "y-が", "z-か\u{3099}"]
-        let unicodeNodes = names.enumerated().map { index, name in DiskNode(url: unicodeRoot.appendingPathComponent(name), name: name, isDirectory: false, size: Int64(index + 1), allocatedSize: 1, fileCount: 1, fileIdentity: "unicode-\(index)") }
-        let unicodeTree = DiskNode(url: unicodeRoot, name: "unicode-root", isDirectory: true, size: 15, allocatedSize: 5, fileCount: 5, children: unicodeNodes, fileIdentity: "unicode-root")
+        let unicodeNodes = names.enumerated().map { index, name in DiskNode(url: unicodeRoot.appendingPathComponent(name), name: name, isDirectory: false, size: Int64(index + 1), allocatedSize: 1, fileCount: 1, fileIdentity: "1:\(index + 1)") }
+        let unicodeTree = DiskNode(url: unicodeRoot, name: "unicode-root", isDirectory: true, size: 15, allocatedSize: 5, fileCount: 5, children: unicodeNodes, fileIdentity: "2:1")
         unicodePreview.testBegin(unicodeTree);unicodePreview.testReplaceListing(unicodeRoot.path, children: unicodeNodes)
         let unicodeStore = DiskIndexStore(directory: base.appendingPathComponent("unicode-index"))
         let unicodeSnapshot = try unicodeStore.save(ScanResult(root: unicodeTree, elapsed: 0, skippedCount: 0, issues: []), eventID: 0, eventIdentity: "test")
@@ -60,10 +60,10 @@ final class Gate: @unchecked Sendable {
         let tieRoot = base.appendingPathComponent("tie-root"), tiePreview = DiskScanPreview()
         let tieFolders = ["a-é", "b-e\u{301}", "c-न", "d-が"].enumerated().map { folderIndex, folderName -> DiskNode in
             let folderURL = tieRoot.appendingPathComponent(folderName)
-            let files = (0..<110).map { i in DiskNode(url: folderURL.appendingPathComponent(String(format: "match-%03d", i)), name: String(format: "match-%03d", i), isDirectory: false, size: 1, allocatedSize: 1, fileCount: 1, fileIdentity: "tie-\(folderIndex)-\(i)") }
-            return DiskNode(url: folderURL, name: folderName, isDirectory: true, size: 110, allocatedSize: 110, fileCount: 110, children: files, fileIdentity: "tie-folder-\(folderIndex)")
+            let files = (0..<110).map { i in DiskNode(url: folderURL.appendingPathComponent(String(format: "match-%03d", i)), name: String(format: "match-%03d", i), isDirectory: false, size: 1, allocatedSize: 1, fileCount: 1, fileIdentity: "3:\(folderIndex * 110 + i + 1)") }
+            return DiskNode(url: folderURL, name: folderName, isDirectory: true, size: 110, allocatedSize: 110, fileCount: 110, children: files, fileIdentity: "4:\(folderIndex + 1)")
         }
-        let tieTree = DiskNode(url: tieRoot, name: "tie-root", isDirectory: true, size: 440, allocatedSize: 440, fileCount: 440, children: tieFolders, fileIdentity: "tie-root")
+        let tieTree = DiskNode(url: tieRoot, name: "tie-root", isDirectory: true, size: 440, allocatedSize: 440, fileCount: 440, children: tieFolders, fileIdentity: "4:100")
         tiePreview.testBegin(tieTree);tiePreview.testReplaceListing(tieRoot.path, children: tieFolders)
         for folder in tieFolders { tiePreview.testReplaceListing(folder.id, children: folder.children) }
         let tieStore = DiskIndexStore(directory: base.appendingPathComponent("tie-index"))

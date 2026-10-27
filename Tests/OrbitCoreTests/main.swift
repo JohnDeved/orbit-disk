@@ -79,6 +79,8 @@ for (name, check) in policyChecks { run(name, make: TrashPolicyTests.init, check
 let indexChecks: [(String, (DiskIndexStoreTests) throws -> Void)] = [
     ("Index replacement paths reject overlaps and remain cancellable", { try $0.testReplacementPathValidation() }),
     ("Index persistence and lazy folder queries", { try $0.testRoundTripAndLazyFolderQueries() }),
+    ("Compact inventory structure, root paths, Unicode and identity bits", { try $0.testCompactInventoryPathsAndIdentityBits() }),
+    ("Index filesystem NFC/NFD lookup and refresh", { try $0.testFilesystemUnicodeLookupAndRefresh() }),
     ("Index parent validation and atomic preservation", { try $0.testParentValidationPreservesSnapshot() }),
     ("Index preview across empty and nested folders", { try $0.testPreviewReusesQueryAcrossEmptyAndNestedFolders() }),
     ("Index literal search and ancestors", { try $0.testLiteralSearchAndAncestors() }),

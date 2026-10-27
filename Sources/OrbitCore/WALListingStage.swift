@@ -24,11 +24,28 @@ final class ListingStage {
             throw Failure.sqlite("open")
         }
         sqlite3_busy_timeout(db, 5000)
+        let format = try prepare("PRAGMA user_version")
+        let formatStatus = sqlite3_step(format)
+        let version = sqlite3_column_int64(format, 0)
+        sqlite3_finalize(format)
+        guard formatStatus == SQLITE_ROW, version == 0 || version == InventorySchema.version else {
+            close()
+            throw Failure.sqlite("unsupported inventory format")
+        }
+        if version == 0 {
+            let existing = try prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'")
+            let status = sqlite3_step(existing)
+            sqlite3_finalize(existing)
+            guard status == SQLITE_DONE else {
+                close()
+                throw Failure.sqlite("unversioned inventory")
+            }
+        }
         try exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
         try exec("PRAGMA cache_size=-16384;")
         try exec("BEGIN IMMEDIATE")
         do {
-            try exec("CREATE TABLE IF NOT EXISTS sealed (singleton INTEGER PRIMARY KEY CHECK(singleton=1),snapshot_id TEXT NOT NULL,published INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS stage_issues (path BLOB PRIMARY KEY,message TEXT NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS listing_issues (parent BLOB PRIMARY KEY,count INTEGER NOT NULL,messages TEXT NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS blocked_directories (path BLOB PRIMARY KEY) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS dirty_links (dev INTEGER NOT NULL,inode INTEGER NOT NULL,PRIMARY KEY(dev,inode)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS link_candidates (dev INTEGER NOT NULL,inode INTEGER NOT NULL,parent BLOB NOT NULL,name BLOB NOT NULL,PRIMARY KEY(dev,inode,parent,name)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS link_rebuild (dev INTEGER NOT NULL,inode INTEGER NOT NULL,PRIMARY KEY(dev,inode)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS owners (dev INTEGER NOT NULL,inode INTEGER NOT NULL,parent BLOB NOT NULL,name BLOB NOT NULL,PRIMARY KEY(dev,inode)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS epochs (parent BLOB PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS dirty (parent BLOB PRIMARY KEY, revision INTEGER NOT NULL, pending INTEGER NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS scan (root BLOB PRIMARY KEY, identity BLOB NOT NULL, event_id INTEGER NOT NULL, expected_snapshot TEXT NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS directories (path BLOB PRIMARY KEY, device INTEGER NOT NULL, inode INTEGER NOT NULL, pending INTEGER NOT NULL, full_generation INTEGER NOT NULL DEFAULT 0, logical INTEGER NOT NULL DEFAULT 0, allocated INTEGER NOT NULL DEFAULT 0, files INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS full_refresh (singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation INTEGER NOT NULL, pending INTEGER NOT NULL); INSERT OR IGNORE INTO full_refresh VALUES(1,0,0); CREATE TABLE IF NOT EXISTS prune (path BLOB PRIMARY KEY, parent BLOB NOT NULL, name BLOB NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS trim (parent BLOB PRIMARY KEY, epoch INTEGER NOT NULL, revision INTEGER NOT NULL, full_generation INTEGER NOT NULL) WITHOUT ROWID;")
+            try exec("CREATE TABLE IF NOT EXISTS sealed (singleton INTEGER PRIMARY KEY CHECK(singleton=1),snapshot_id TEXT NOT NULL,published INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS stage_issues (path BLOB PRIMARY KEY,message TEXT NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS listing_issues (parent BLOB PRIMARY KEY,count INTEGER NOT NULL,messages TEXT NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS blocked_directories (path BLOB PRIMARY KEY) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS dirty_links (dev INTEGER NOT NULL,inode INTEGER NOT NULL,PRIMARY KEY(dev,inode)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS link_candidates (dev INTEGER NOT NULL,inode INTEGER NOT NULL,node_id INTEGER NOT NULL,PRIMARY KEY(dev,inode,node_id)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS link_rebuild (dev INTEGER NOT NULL,inode INTEGER NOT NULL,PRIMARY KEY(dev,inode)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS owners (dev INTEGER NOT NULL,inode INTEGER NOT NULL,node_id INTEGER NOT NULL,PRIMARY KEY(dev,inode)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS epochs (parent BLOB PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS dirty (parent BLOB PRIMARY KEY, revision INTEGER NOT NULL, pending INTEGER NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS scan (root BLOB PRIMARY KEY, identity BLOB NOT NULL, event_id INTEGER NOT NULL, expected_snapshot TEXT NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS directories (path BLOB PRIMARY KEY, device INTEGER NOT NULL, inode INTEGER NOT NULL, pending INTEGER NOT NULL, full_generation INTEGER NOT NULL DEFAULT 0, logical INTEGER NOT NULL DEFAULT 0, allocated INTEGER NOT NULL DEFAULT 0, files INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS full_refresh (singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation INTEGER NOT NULL, pending INTEGER NOT NULL); INSERT OR IGNORE INTO full_refresh VALUES(1,0,0); CREATE TABLE IF NOT EXISTS prune (path BLOB PRIMARY KEY, parent BLOB NOT NULL, name BLOB NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS trim (parent BLOB PRIMARY KEY, epoch INTEGER NOT NULL, revision INTEGER NOT NULL, full_generation INTEGER NOT NULL) WITHOUT ROWID;")
             try exec("CREATE TABLE IF NOT EXISTS scan_generation (root BLOB PRIMARY KEY, generation TEXT NOT NULL) WITHOUT ROWID")
             try installMirror()
             try exec("COMMIT")
@@ -142,42 +159,44 @@ final class ListingStage {
     deinit { close() }
 
     private func installMirror() throws {
+        try exec(InventorySchema.createSQL)
+        try exec("PRAGMA application_id=\(InventorySchema.applicationID); PRAGMA user_version=\(InventorySchema.version)")
         try exec("""
-            PRAGMA application_id=1330790996; PRAGMA user_version=3;
-            CREATE TABLE IF NOT EXISTS metadata (singleton INTEGER PRIMARY KEY CHECK(singleton=1), snapshot_id TEXT NOT NULL,
-              root_path TEXT NOT NULL, scanned_at REAL NOT NULL, elapsed REAL NOT NULL, skipped INTEGER NOT NULL,
-              issues TEXT NOT NULL, event_id TEXT NOT NULL, event_identity TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS nodes (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, parent INTEGER, name TEXT NOT NULL DEFAULT '', search_name TEXT NOT NULL DEFAULT '',
-              is_dir INTEGER NOT NULL DEFAULT 0, is_link INTEGER NOT NULL DEFAULT 0, accessible INTEGER NOT NULL DEFAULT 1,
-              size INTEGER NOT NULL DEFAULT 0, allocated INTEGER NOT NULL DEFAULT 0, file_count INTEGER NOT NULL DEFAULT 0,
-              raw_alloc INTEGER NOT NULL DEFAULT 0, file_identity TEXT,
-              st_parent BLOB, st_name BLOB, dev INTEGER, inode INTEGER, directory INTEGER,
-              is_mount INTEGER, st_size INTEGER, st_allocated INTEGER, links INTEGER, epoch INTEGER,
-              charged INTEGER, UNIQUE(st_parent,st_name));
-            CREATE TABLE IF NOT EXISTS orbit_search_generation (singleton INTEGER PRIMARY KEY CHECK(singleton=1), value INTEGER NOT NULL);
-            INSERT OR IGNORE INTO orbit_search_generation VALUES(1,0);
-            CREATE TRIGGER IF NOT EXISTS node_search_generation AFTER UPDATE OF search_name ON nodes
-              WHEN OLD.search_name<>NEW.search_name BEGIN
-              UPDATE orbit_search_generation SET value=value+1 WHERE singleton=1;
-            END;
-            CREATE INDEX IF NOT EXISTS children_by_size ON nodes(parent,size DESC,name);
-            CREATE INDEX IF NOT EXISTS nodes_by_size ON nodes(size DESC,id,search_name,parent);
-            CREATE INDEX IF NOT EXISTS file_identities ON nodes(file_identity) WHERE is_dir=0 AND file_identity IS NOT NULL;
             CREATE TRIGGER IF NOT EXISTS node_directory_totals AFTER UPDATE OF logical,allocated,files ON directories BEGIN
-              UPDATE nodes SET size=NEW.logical,allocated=NEW.allocated,file_count=NEW.files WHERE path=CAST(NEW.path AS TEXT);
+              UPDATE nodes SET size=NEW.logical,allocated=NEW.allocated,file_count=NEW.files
+              WHERE id=(SELECT id FROM directory_paths WHERE path=CAST(NEW.path AS TEXT));
             END;
             """)
     }
 
-    func initializeMirrorRoot(url: URL, identity: DirectoryIdentity) throws {
-
-        let statement = try prepare("INSERT OR IGNORE INTO nodes(path,parent,name,search_name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,file_identity) VALUES(?,NULL,?,?,1,0,1,0,0,0,0,?)")
+    private func directoryID(path: Data) throws -> Int64? {
+        let statement = try prepare("SELECT p.id FROM directory_paths p JOIN nodes n ON n.id=p.id AND n.is_dir=1 WHERE p.path=CAST(? AS TEXT)")
         defer { sqlite3_finalize(statement) }
-        let name = url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
-        bindText(url.path, 1, statement); bindText(name, 2, statement)
-        bindText(name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX")), 3, statement)
-        bindText("\(identity.device):\(identity.inode)", 4, statement)
-        try step(statement)
+        bind(path, 1, statement)
+        let status = sqlite3_step(statement)
+        if status == SQLITE_DONE { return nil }
+        guard status == SQLITE_ROW else { throw Failure.sqlite("directory node lookup") }
+        return sqlite3_column_int64(statement, 0)
+    }
+
+    func initializeMirrorRoot(url: URL, identity: DirectoryIdentity) throws {
+        try exec("BEGIN IMMEDIATE")
+        do {
+            if try directoryID(path: Data(url.path.utf8)) == nil {
+                let statement = try prepare("INSERT INTO nodes(parent,name,search_name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,dev,inode) VALUES(NULL,?,?,1,0,1,0,0,0,0,?,?)")
+                defer { sqlite3_finalize(statement) }
+                let name = url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent
+                bindText(name, 1, statement)
+                bindText(name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX")), 2, statement)
+                sqlite3_bind_int64(statement, 3, Int64(identity.device))
+                sqlite3_bind_int64(statement, 4, Int64(bitPattern: identity.inode)); try step(statement)
+                let id = sqlite3_last_insert_rowid(db)
+                let path = try prepare("INSERT INTO directory_paths(id,path) VALUES(?,?)")
+                defer { sqlite3_finalize(path) }
+                sqlite3_bind_int64(path, 1, id); bindText(url.path, 2, path); try step(path)
+            }
+            try exec("COMMIT")
+        } catch { try? exec("ROLLBACK"); throw error }
     }
 
     // Private partial snapshot for a reader; final publication still requires sealMirror.
@@ -498,46 +517,49 @@ final class ListingStage {
             #if ORBIT_TESTING
             if epoch == nil { Self.testListingCommit?("batch-epoch") }
             #endif
-            let parentCheck = try prepare("SELECT id FROM nodes WHERE path=CAST(? AS TEXT) AND is_dir=1")
+            let parentCheck = try prepare("SELECT p.id FROM directory_paths p JOIN nodes n ON n.id=p.id AND n.is_dir=1 WHERE p.path=CAST(? AS TEXT)")
             defer { sqlite3_finalize(parentCheck) }
             bind(parent, 1, parentCheck)
             guard sqlite3_step(parentCheck) == SQLITE_ROW else { throw Failure.sqlite("missing node parent") }
             let parentID = sqlite3_column_int64(parentCheck, 0)
+            let sequence = try prepare("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='nodes'),0)")
+            defer { sqlite3_finalize(sequence) }
+            guard sqlite3_step(sequence) == SQLITE_ROW else { throw Failure.sqlite("node ID sequence") }
+            let previousID = sqlite3_column_int64(sequence, 0)
+            guard previousID >= 0, previousID < Int64.max else { throw Failure.sqlite("node ID sequence exhausted") }
+            var nextNodeID = previousID + 1
             let insert = try prepare("""
-                INSERT INTO nodes(st_parent,st_name,dev,inode,directory,is_mount,st_size,st_allocated,links,epoch,charged,
-                    path,parent,name,search_name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,file_identity)
-                VALUES(?1,?2,?3,?4,?5,?7,?8,?9,?10,?11,?13,
-                    CAST(?12 AS TEXT),?16,CAST(?2 AS TEXT),CAST(?14 AS TEXT),?5,?6,
+                INSERT INTO nodes(id,parent,name,search_name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,
+                    dev,inode,is_mount,links,epoch)
+                VALUES(?15,?1,CAST(?2 AS TEXT),CAST(?14 AS TEXT),?5,?6,
                     CASE WHEN ?5=1 AND (?7=1 OR ?3<>(SELECT device FROM directories WHERE path=(SELECT root FROM scan LIMIT 1))) THEN 0 ELSE 1 END,
                     CASE WHEN ?5=1 THEN COALESCE((SELECT logical FROM directories WHERE path=?12),0) ELSE ?8 END,
                     CASE WHEN ?5=1 THEN COALESCE((SELECT allocated FROM directories WHERE path=?12),0) ELSE ?13 END,
                     CASE WHEN ?5=1 THEN COALESCE((SELECT files FROM directories WHERE path=?12),0) ELSE 1 END,
-                    CASE WHEN ?5=1 THEN 0 ELSE ?9 END,CAST(?15 AS TEXT))
-                ON CONFLICT(st_parent,st_name) DO UPDATE SET
-                    charged=CASE WHEN nodes.dev=excluded.dev AND nodes.inode=excluded.inode AND nodes.directory=excluded.directory THEN nodes.charged ELSE 0 END,
-                    dev=excluded.dev,inode=excluded.inode,directory=excluded.directory,is_mount=excluded.is_mount,
-                    st_size=excluded.st_size,st_allocated=excluded.st_allocated,links=excluded.links,epoch=excluded.epoch,
-                    path=excluded.path,parent=excluded.parent,name=excluded.name,search_name=excluded.search_name,is_dir=excluded.is_dir,is_link=excluded.is_link,
+                    CASE WHEN ?5=1 THEN 0 ELSE ?9 END,?3,?4,?7,?10,?11)
+                ON CONFLICT(parent,name) DO UPDATE SET
+                    dev=excluded.dev,inode=excluded.inode,is_mount=excluded.is_mount,links=excluded.links,epoch=excluded.epoch,
+                    name=excluded.name,search_name=excluded.search_name,is_dir=excluded.is_dir,is_link=excluded.is_link,
                     accessible=excluded.accessible,size=excluded.size,
-                    allocated=CASE WHEN excluded.directory=1 THEN excluded.allocated WHEN nodes.dev=excluded.dev AND nodes.inode=excluded.inode AND nodes.directory=excluded.directory THEN nodes.charged ELSE 0 END,
-                    file_count=excluded.file_count,raw_alloc=excluded.raw_alloc,file_identity=excluded.file_identity
+                    allocated=CASE WHEN excluded.is_dir=1 THEN excluded.allocated WHEN nodes.dev=excluded.dev AND nodes.inode=excluded.inode AND nodes.is_dir=excluded.is_dir THEN nodes.allocated ELSE 0 END,
+                    file_count=excluded.file_count,raw_alloc=excluded.raw_alloc
                 """)
-            let existing = try prepare("SELECT dev,inode,directory,st_size,charged,st_allocated FROM nodes WHERE st_parent=? AND st_name=?")
+            let existing = try prepare("SELECT dev,inode,is_dir,size,allocated,raw_alloc,id FROM nodes WHERE parent=? AND name=CAST(? AS TEXT)")
             let dirtyLink = try prepare("INSERT OR IGNORE INTO dirty_links VALUES(?,?)")
             let rebuildLink = try prepare("INSERT OR IGNORE INTO link_rebuild VALUES(?,?)")
-            let candidate = try prepare("INSERT OR IGNORE INTO link_candidates VALUES(?,?,?,?)")
-            let singleOwner = try prepare("INSERT OR IGNORE INTO owners VALUES(?,?,?,?)")
+            let candidate = try prepare("INSERT OR IGNORE INTO link_candidates VALUES(?,?,?)")
+            let singleOwner = try prepare("INSERT OR IGNORE INTO owners VALUES(?,?,?)")
             let clearIssue = try prepare("DELETE FROM stage_issues WHERE path=?")
             let mountIssue = try prepare("INSERT OR REPLACE INTO stage_issues(path,message) VALUES(?,?)")
             defer { for statement in [insert,existing,dirtyLink,rebuildLink,candidate,singleOwner,clearIssue,mountIssue] { sqlite3_finalize(statement) } }
-            var registerInsert: OpaquePointer?, registerCheck: OpaquePointer?
-            defer { sqlite3_finalize(registerInsert); sqlite3_finalize(registerCheck) }
+            var registerInsert: OpaquePointer?, registerCheck: OpaquePointer?, directoryPathInsert: OpaquePointer?, directoryPathRemove: OpaquePointer?
+            defer { for statement in [registerInsert,registerCheck,directoryPathInsert,directoryPathRemove] { sqlite3_finalize(statement) } }
             let hasIssuesQuery = try prepare("SELECT 1 FROM stage_issues LIMIT 1")
             let issueState = sqlite3_step(hasIssuesQuery)
             sqlite3_finalize(hasIssuesQuery)
             guard issueState == SQLITE_ROW || issueState == SQLITE_DONE else { throw Failure.sqlite("issue preflight") }
             var mayHaveIssues = issueState == SQLITE_ROW
-            var nameForCandidate = Data()
+            var nodeForCandidate: Int64 = 0
             func markLink(_ device: Int64, _ inode: Int64, rebuild: Bool) throws {
                 sqlite3_reset(dirtyLink); sqlite3_clear_bindings(dirtyLink)
                 sqlite3_bind_int64(dirtyLink, 1, device); sqlite3_bind_int64(dirtyLink, 2, inode)
@@ -548,16 +570,24 @@ final class ListingStage {
                 } else {
                     sqlite3_reset(candidate); sqlite3_clear_bindings(candidate)
                     sqlite3_bind_int64(candidate, 1, device); sqlite3_bind_int64(candidate, 2, inode)
-                    bind(parent, 3, candidate); bind(nameForCandidate, 4, candidate); try step(candidate)
+                    sqlite3_bind_int64(candidate, 3, nodeForCandidate); try step(candidate)
                 }
             }
             var logicalDelta: Int64 = 0, allocatedDelta: Int64 = 0, fileDelta: Int64 = 0
             for record in records {
                 let name = Data(record.name.utf8)
-                nameForCandidate = name
                 sqlite3_reset(existing); sqlite3_clear_bindings(existing)
-                bind(parent, 1, existing); bind(name, 2, existing)
+                sqlite3_bind_int64(existing, 1, parentID); bind(name, 2, existing)
                 let old = sqlite3_step(existing)
+                guard old == SQLITE_ROW || old == SQLITE_DONE else { throw Failure.sqlite("existing node query") }
+                let nodeID: Int64
+                if old == SQLITE_ROW { nodeID = sqlite3_column_int64(existing, 6) }
+                else {
+                    guard nextNodeID < Int64.max else { throw Failure.sqlite("node ID sequence exhausted") }
+                    nodeID = nextNodeID; nextNodeID += 1
+                }
+                nodeForCandidate = nodeID
+                let wasDirectory = old == SQLITE_ROW && sqlite3_column_int(existing, 2) != 0
                 var oldSize: Int64 = 0, oldCharge: Int64 = 0, oldCount: Int64 = 0
                 var unchangedIdentity = false
                 if old == SQLITE_ROW && sqlite3_column_int(existing, 2) == 0 {
@@ -567,14 +597,14 @@ final class ListingStage {
                     if !unchangedIdentity || sqlite3_column_int64(existing, 5) != record.allocatedSize {
                         try markLink(oldDevice, oldInode, rebuild: true)
                     }
-                } else if old != SQLITE_ROW && old != SQLITE_DONE { throw Failure.sqlite("existing link query") }
+                }
                 var firstCharge: Int64 = 0
                 if !record.isDirectory {
                     if old == SQLITE_DONE && record.linkCount == 1 {
                         sqlite3_reset(singleOwner); sqlite3_clear_bindings(singleOwner)
                         sqlite3_bind_int64(singleOwner, 1, Int64(record.device))
                         sqlite3_bind_int64(singleOwner, 2, Int64(bitPattern: record.inode))
-                        bind(parent, 3, singleOwner); bind(name, 4, singleOwner)
+                        sqlite3_bind_int64(singleOwner, 3, nodeID)
                         try step(singleOwner)
                         if sqlite3_changes(db) == 1 { firstCharge = record.allocatedSize }
                         else { try markLink(Int64(record.device), Int64(bitPattern: record.inode), rebuild: true) }
@@ -587,7 +617,7 @@ final class ListingStage {
                 if fullPath.last != 47 { fullPath.append(47) }
                 fullPath.append(name)
                 sqlite3_reset(insert); sqlite3_clear_bindings(insert)
-                bind(parent, 1, insert); bind(name, 2, insert); sqlite3_bind_int64(insert, 16, parentID)
+                sqlite3_bind_int64(insert, 1, parentID); bind(name, 2, insert); sqlite3_bind_int64(insert, 15, nodeID)
                 sqlite3_bind_int64(insert, 3, Int64(record.device)); sqlite3_bind_int64(insert, 4, Int64(bitPattern: record.inode))
                 sqlite3_bind_int(insert, 5, record.isDirectory ? 1 : 0)
                 sqlite3_bind_int(insert, 6, record.isSymbolicLink ? 1 : 0)
@@ -605,8 +635,16 @@ final class ListingStage {
                 bind(fullPath, 12, insert); sqlite3_bind_int64(insert, 13, firstCharge)
                 let folded = record.name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
                 bind(Data(folded.utf8), 14, insert)
-                bind(Data("\(record.device):\(record.inode)".utf8), 15, insert)
                 try step(insert)
+                if record.isDirectory {
+                    if directoryPathInsert == nil { directoryPathInsert = try prepare("INSERT INTO directory_paths(id,path) VALUES(?,CAST(? AS TEXT)) ON CONFLICT(id) DO UPDATE SET path=excluded.path") }
+                    sqlite3_reset(directoryPathInsert); sqlite3_clear_bindings(directoryPathInsert)
+                    sqlite3_bind_int64(directoryPathInsert, 1, nodeID); bind(fullPath, 2, directoryPathInsert!); try step(directoryPathInsert!)
+                } else if wasDirectory {
+                    if directoryPathRemove == nil { directoryPathRemove = try prepare("DELETE FROM directory_paths WHERE id=?") }
+                    sqlite3_reset(directoryPathRemove); sqlite3_clear_bindings(directoryPathRemove)
+                    sqlite3_bind_int64(directoryPathRemove, 1, nodeID); try step(directoryPathRemove!)
+                }
                 if let rootDevice, record.isDirectory, !record.isMountPoint, record.device == rootDevice {
                     if registerInsert == nil { registerInsert = try prepare("INSERT OR IGNORE INTO directories(path,device,inode,pending) VALUES(?,?,?,1)") }
                     if registerCheck == nil { registerCheck = try prepare("SELECT device,inode FROM directories WHERE path=?") }
@@ -688,7 +726,7 @@ final class ListingStage {
                 try exec("COMMIT")
                 return true
             }
-            let stale = try prepare("SELECT st_name FROM nodes WHERE st_parent=? AND epoch<>? AND directory=1 LIMIT 1")
+            let stale = try prepare("SELECT CAST(name AS BLOB) FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(? AS TEXT)) AND epoch<>? AND is_dir=1 LIMIT 1")
             defer { sqlite3_finalize(stale) }
             bind(parent, 1, stale); sqlite3_bind_int64(stale, 2, epoch)
             let staleResult = sqlite3_step(stale)
@@ -703,16 +741,16 @@ final class ListingStage {
                 return true
             }
             guard staleResult == SQLITE_DONE else { throw Failure.sqlite("stale directory query") }
-            let dirty = try prepare("INSERT OR IGNORE INTO dirty_links SELECT dev,inode FROM nodes WHERE (st_parent,st_name) IN (SELECT st_parent,st_name FROM nodes WHERE st_parent=? AND epoch<>? AND directory=0 ORDER BY st_parent,st_name LIMIT 128)")
+            let dirty = try prepare("INSERT OR IGNORE INTO dirty_links SELECT dev,inode FROM nodes WHERE id IN (SELECT id FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(? AS TEXT)) AND epoch<>? AND is_dir=0 ORDER BY name LIMIT 128)")
             defer { sqlite3_finalize(dirty) }
             bind(parent, 1, dirty); sqlite3_bind_int64(dirty, 2, epoch); try step(dirty)
             try exec("INSERT OR IGNORE INTO link_rebuild SELECT dev,inode FROM dirty_links")
-            let sums = try prepare("SELECT COALESCE(SUM(st_size),0),COALESCE(SUM(charged),0),COUNT(*) FROM (SELECT st_size,charged FROM nodes WHERE st_parent=? AND epoch<>? AND directory=0 ORDER BY st_parent,st_name LIMIT 128)")
+            let sums = try prepare("SELECT COALESCE(SUM(size),0),COALESCE(SUM(allocated),0),COUNT(*) FROM (SELECT size,allocated FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(? AS TEXT)) AND epoch<>? AND is_dir=0 ORDER BY name LIMIT 128)")
             defer { sqlite3_finalize(sums) }
             bind(parent, 1, sums); sqlite3_bind_int64(sums, 2, epoch)
             guard sqlite3_step(sums) == SQLITE_ROW else { throw Failure.sqlite("trim totals") }
             let removedSize = sqlite3_column_int64(sums, 0), removedCharge = sqlite3_column_int64(sums, 1), removedFiles = sqlite3_column_int64(sums, 2)
-            let remove = try prepare("DELETE FROM nodes WHERE (st_parent,st_name) IN (SELECT st_parent,st_name FROM nodes WHERE st_parent=? AND epoch<>? AND directory=0 ORDER BY st_parent,st_name LIMIT 128)")
+            let remove = try prepare("DELETE FROM nodes WHERE id IN (SELECT id FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(? AS TEXT)) AND epoch<>? AND is_dir=0 ORDER BY name LIMIT 128)")
             defer { sqlite3_finalize(remove) }
             bind(parent, 1, remove); sqlite3_bind_int64(remove, 2, epoch)
             try step(remove)
@@ -834,7 +872,7 @@ final class ListingStage {
         return result == SQLITE_ROW
     }
 
-    // One transaction removes at most 128 descendant rows; the marker survives a crash.
+    // Deepest parents go first so surviving children retain their path after each 128-row commit.
     func pruneOneChunk() throws -> Bool {
         let select = try prepare("SELECT path,parent,name FROM prune ORDER BY path LIMIT 1")
         defer { sqlite3_finalize(select) }
@@ -851,11 +889,11 @@ final class ListingStage {
         var high = path; high.append(48)
         try exec("BEGIN IMMEDIATE")
         do {
-            let dirty = try prepare("INSERT OR IGNORE INTO dirty_links SELECT dev,inode FROM nodes WHERE directory=0 AND (st_parent,st_name) IN (SELECT st_parent,st_name FROM nodes WHERE st_parent=? OR (st_parent>=? AND st_parent<?) ORDER BY st_parent,st_name LIMIT 128)")
+            let dirty = try prepare("INSERT OR IGNORE INTO dirty_links SELECT dev,inode FROM nodes WHERE is_dir=0 AND id IN (SELECT n.id FROM nodes n JOIN directory_paths p ON p.id=n.parent WHERE p.path>=CAST(?1 AS TEXT) AND p.path<CAST(?3 AS TEXT) AND (p.path=CAST(?1 AS TEXT) OR p.path>=CAST(?2 AS TEXT)) ORDER BY p.path DESC,n.name LIMIT 128)")
             defer { sqlite3_finalize(dirty) }
             bind(path, 1, dirty); bind(low, 2, dirty); bind(high, 3, dirty); try step(dirty)
             try exec("INSERT OR IGNORE INTO link_rebuild SELECT dev,inode FROM dirty_links")
-            let sums = try prepare("SELECT st_parent,st_size,charged,directory FROM nodes WHERE st_parent=? OR (st_parent>=? AND st_parent<?) ORDER BY st_parent,st_name LIMIT 128")
+            let sums = try prepare("SELECT CAST(p.path AS BLOB),n.size,n.allocated,n.is_dir FROM nodes n JOIN directory_paths p ON p.id=n.parent WHERE p.path>=CAST(?1 AS TEXT) AND p.path<CAST(?3 AS TEXT) AND (p.path=CAST(?1 AS TEXT) OR p.path>=CAST(?2 AS TEXT)) ORDER BY p.path DESC,n.name LIMIT 128")
             defer { sqlite3_finalize(sums) }
             bind(path, 1, sums); bind(low, 2, sums); bind(high, 3, sums)
             var deltas: [Data: (Int64, Int64, Int64)] = [:]
@@ -868,7 +906,7 @@ final class ListingStage {
                 let previous = deltas[parent] ?? (0, 0, 0)
                 deltas[parent] = (previous.0 + sqlite3_column_int64(sums, 1), previous.1 + sqlite3_column_int64(sums, 2), previous.2 + 1)
             }
-            let removeRows = try prepare("DELETE FROM nodes WHERE (st_parent,st_name) IN (SELECT st_parent,st_name FROM nodes WHERE st_parent=? OR (st_parent>=? AND st_parent<?) ORDER BY st_parent,st_name LIMIT 128)")
+            let removeRows = try prepare("DELETE FROM nodes WHERE id IN (SELECT n.id FROM nodes n JOIN directory_paths p ON p.id=n.parent WHERE p.path>=CAST(?1 AS TEXT) AND p.path<CAST(?3 AS TEXT) AND (p.path=CAST(?1 AS TEXT) OR p.path>=CAST(?2 AS TEXT)) ORDER BY p.path DESC,n.name LIMIT 128)")
             defer { sqlite3_finalize(removeRows) }
             bind(path, 1, removeRows); bind(low, 2, removeRows); bind(high, 3, removeRows)
             try step(removeRows)
@@ -898,14 +936,14 @@ final class ListingStage {
                     let blockedResult = sqlite3_step(blocked)
                     guard blockedResult == SQLITE_ROW || blockedResult == SQLITE_DONE else { throw Failure.sqlite("blocked directory query") }
                     if blockedResult == SQLITE_ROW {
-                        let mark = try prepare("UPDATE nodes SET accessible=0,size=0,allocated=0,file_count=0 WHERE st_parent=? AND st_name=?")
+                        let mark = try prepare("UPDATE nodes SET accessible=0,size=0,allocated=0,file_count=0 WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(? AS TEXT)) AND name=CAST(? AS TEXT)")
                         defer { sqlite3_finalize(mark) }
                         bind(parent, 1, mark); bind(name, 2, mark); try step(mark)
                         let clearBlocked = try prepare("DELETE FROM blocked_directories WHERE path=?")
                         defer { sqlite3_finalize(clearBlocked) }
                         bind(path, 1, clearBlocked); try step(clearBlocked)
                     } else {
-                        let removeNode = try prepare("DELETE FROM nodes WHERE st_parent=? AND st_name=?")
+                        let removeNode = try prepare("DELETE FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(? AS TEXT)) AND name=CAST(? AS TEXT)")
                         defer { sqlite3_finalize(removeNode) }
                         bind(parent, 1, removeNode); bind(name, 2, removeNode); try step(removeNode)
                         let clearIssue = try prepare("DELETE FROM stage_issues WHERE path=?")
@@ -1058,16 +1096,16 @@ final class ListingStage {
             }
             sqlite3_finalize(select)
             guard !identities.isEmpty else { try exec("COMMIT"); return false }
-            let old = try prepare("SELECT parent,name FROM owners WHERE dev=? AND inode=?")
-            let values = try prepare("SELECT charged,st_allocated FROM nodes WHERE st_parent=? AND st_name=? AND dev=? AND inode=?")
-            let clear = try prepare("UPDATE nodes SET charged=0,allocated=0 WHERE st_parent=? AND st_name=? AND dev=? AND inode=?")
-            let next = try prepare("SELECT st_parent,st_name FROM nodes WHERE file_identity=? AND is_dir=0 AND directory=0")
-            let candidate = try prepare("SELECT c.parent,c.name FROM link_candidates c JOIN nodes n ON n.st_parent=c.parent AND n.st_name=c.name AND n.dev=c.dev AND n.inode=c.inode AND n.directory=0 WHERE c.dev=? AND c.inode=?")
+            let old = try prepare("SELECT n.id,CAST(p.path AS BLOB),CAST(n.name AS BLOB) FROM owners o JOIN nodes n ON n.id=o.node_id AND n.dev=o.dev AND n.inode=o.inode AND n.is_dir=0 JOIN directory_paths p ON p.id=n.parent WHERE o.dev=? AND o.inode=?")
+            let values = try prepare("SELECT allocated,raw_alloc FROM nodes WHERE id=? AND dev=? AND inode=? AND is_dir=0")
+            let clear = try prepare("UPDATE nodes SET allocated=0 WHERE id=? AND dev=? AND inode=? AND is_dir=0")
+            let next = try prepare("SELECT n.id,CAST(p.path AS BLOB),CAST(n.name AS BLOB) FROM nodes n JOIN directory_paths p ON p.id=n.parent WHERE n.dev=? AND n.inode=? AND n.is_dir=0")
+            let candidate = try prepare("SELECT n.id,CAST(p.path AS BLOB),CAST(n.name AS BLOB) FROM link_candidates c JOIN nodes n ON n.id=c.node_id AND n.dev=c.dev AND n.inode=c.inode AND n.is_dir=0 JOIN directory_paths p ON p.id=n.parent WHERE c.dev=? AND c.inode=?")
             let rebuild = try prepare("SELECT 1 FROM link_rebuild WHERE dev=? AND inode=?")
             let clearCandidates = try prepare("DELETE FROM link_candidates WHERE dev=? AND inode=?")
             let clearRebuild = try prepare("DELETE FROM link_rebuild WHERE dev=? AND inode=?")
-            let charge = try prepare("UPDATE nodes SET charged=st_allocated,allocated=st_allocated WHERE st_parent=? AND st_name=? AND dev=? AND inode=?")
-            let setOwner = try prepare("INSERT OR REPLACE INTO owners VALUES(?,?,?,?)")
+            let charge = try prepare("UPDATE nodes SET allocated=raw_alloc WHERE id=? AND dev=? AND inode=? AND is_dir=0")
+            let setOwner = try prepare("INSERT OR REPLACE INTO owners VALUES(?,?,?)")
             let removeOwner = try prepare("DELETE FROM owners WHERE dev=? AND inode=?")
             let done = try prepare("DELETE FROM dirty_links WHERE dev=? AND inode=?")
             defer { for statement in [old, values, clear, next, candidate, rebuild, clearCandidates, clearRebuild, charge, setOwner, removeOwner, done] { sqlite3_finalize(statement) } }
@@ -1075,18 +1113,23 @@ final class ListingStage {
                 sqlite3_reset(statement); sqlite3_clear_bindings(statement)
                 sqlite3_bind_int64(statement, 1, device); sqlite3_bind_int64(statement, 2, inode)
             }
-            func pair(_ statement: OpaquePointer) throws -> (Data, Data)? {
+            typealias Owner = (id: Int64, parent: Data, name: Data)
+            func owner(_ statement: OpaquePointer) throws -> Owner? {
                 let status = sqlite3_step(statement)
                 if status == SQLITE_DONE { return nil }
-                guard status == SQLITE_ROW, let parent = sqlite3_column_blob(statement, 0),
-                      let name = sqlite3_column_blob(statement, 1) else { throw Failure.sqlite("invalid link owner") }
-                return (Data(bytes: parent, count: Int(sqlite3_column_bytes(statement, 0))),
-                        Data(bytes: name, count: Int(sqlite3_column_bytes(statement, 1))))
+                guard status == SQLITE_ROW, let parent = sqlite3_column_blob(statement, 1),
+                      let name = sqlite3_column_blob(statement, 2) else { throw Failure.sqlite("invalid link owner") }
+                return (sqlite3_column_int64(statement, 0),
+                        Data(bytes: parent, count: Int(sqlite3_column_bytes(statement, 1))),
+                        Data(bytes: name, count: Int(sqlite3_column_bytes(statement, 2))))
             }
-            func currentValues(_ parent: Data, _ name: Data, _ device: Int64, _ inode: Int64) throws -> (Int64, Int64)? {
-                sqlite3_reset(values); sqlite3_clear_bindings(values)
-                bind(parent, 1, values); bind(name, 2, values)
-                sqlite3_bind_int64(values, 3, device); sqlite3_bind_int64(values, 4, inode)
+            func nodeIdentity(_ statement: OpaquePointer, _ id: Int64, _ device: Int64, _ inode: Int64) {
+                sqlite3_reset(statement); sqlite3_clear_bindings(statement)
+                sqlite3_bind_int64(statement, 1, id)
+                sqlite3_bind_int64(statement, 2, device); sqlite3_bind_int64(statement, 3, inode)
+            }
+            func currentValues(_ id: Int64, _ device: Int64, _ inode: Int64) throws -> (Int64, Int64)? {
+                nodeIdentity(values, id, device, inode)
                 let status = sqlite3_step(values)
                 if status == SQLITE_DONE { return nil }
                 guard status == SQLITE_ROW else { throw Failure.sqlite("link charge query") }
@@ -1094,44 +1137,38 @@ final class ListingStage {
             }
             for (device, inode) in identities {
                 identity(old, device, inode)
-                let oldOwner = try pair(old)
-                if let (parent, name) = oldOwner {
-                    let previous = try currentValues(parent, name, device, inode)?.0 ?? 0
-                    sqlite3_reset(clear); sqlite3_clear_bindings(clear)
-                    bind(parent, 1, clear); bind(name, 2, clear)
-                    sqlite3_bind_int64(clear, 3, device); sqlite3_bind_int64(clear, 4, inode); try step(clear)
-                    try adjustAncestors(parent: parent, logical: 0, allocated: -previous, files: 0)
+                let oldOwner = try owner(old)
+                if let oldOwner {
+                    let previous = try currentValues(oldOwner.id, device, inode)?.0 ?? 0
+                    nodeIdentity(clear, oldOwner.id, device, inode); try step(clear)
+                    try adjustAncestors(parent: oldOwner.parent, logical: 0, allocated: -previous, files: 0)
                 }
-                var winner: (Data, Data)?
+                var winner: Owner?
                 var inspected = 0
                 identity(rebuild, device, inode)
                 let rebuildStatus = sqlite3_step(rebuild)
                 guard rebuildStatus == SQLITE_ROW || rebuildStatus == SQLITE_DONE else { throw Failure.sqlite("link rebuild query") }
                 identity(candidate, device, inode)
-                let firstCandidate = try pair(candidate)
+                let firstCandidate = try owner(candidate)
                 let useFullScan = rebuildStatus == SQLITE_ROW || firstCandidate == nil
-                if !useFullScan, let (parent, name) = oldOwner,
-                   try currentValues(parent, name, device, inode) != nil { winner = (parent, name) }
+                if !useFullScan, let oldOwner,
+                   try currentValues(oldOwner.id, device, inode) != nil { winner = oldOwner }
                 let listing = useFullScan ? next : candidate
-                if useFullScan {
-                    sqlite3_reset(next); sqlite3_clear_bindings(next)
-                    bindText("\(Int32(truncatingIfNeeded: device)):\(UInt64(bitPattern: inode))", 1, next)
-                }
-                var item = useFullScan ? try pair(listing) : firstCandidate
+                if useFullScan { identity(next, device, inode) }
+                var item = useFullScan ? try owner(listing) : firstCandidate
                 while let candidate = item {
                     if inspected & 255 == 0, cancellation?.isCancelled == true { throw CancellationError() }
                     inspected += 1
-                    if let current = winner { if HardLinkPathOrder.precedes(HardLinkPathOrder.path(candidate.0, candidate.1), HardLinkPathOrder.path(current.0, current.1)) { winner = candidate } }
-                    else { winner = candidate }
-                    item = try pair(listing)
+                    if let current = winner {
+                        if HardLinkPathOrder.precedes(HardLinkPathOrder.path(candidate.parent, candidate.name), HardLinkPathOrder.path(current.parent, current.name)) { winner = candidate }
+                    } else { winner = candidate }
+                    item = try owner(listing)
                 }
-                if let (parent, name) = winner {
-                    guard let (previous, allocation) = try currentValues(parent, name, device, inode) else { throw Failure.sqlite("missing next link owner") }
-                    sqlite3_reset(charge); sqlite3_clear_bindings(charge)
-                    bind(parent, 1, charge); bind(name, 2, charge)
-                    sqlite3_bind_int64(charge, 3, device); sqlite3_bind_int64(charge, 4, inode); try step(charge)
-                    try adjustAncestors(parent: parent, logical: 0, allocated: allocation - previous, files: 0)
-                    identity(setOwner, device, inode); bind(parent, 3, setOwner); bind(name, 4, setOwner); try step(setOwner)
+                if let winner {
+                    guard let (previous, allocation) = try currentValues(winner.id, device, inode) else { throw Failure.sqlite("missing next link owner") }
+                    nodeIdentity(charge, winner.id, device, inode); try step(charge)
+                    try adjustAncestors(parent: winner.parent, logical: 0, allocated: allocation - previous, files: 0)
+                    identity(setOwner, device, inode); sqlite3_bind_int64(setOwner, 3, winner.id); try step(setOwner)
                 } else { identity(removeOwner, device, inode); try step(removeOwner) }
                 identity(clearCandidates, device, inode); try step(clearCandidates)
                 identity(clearRebuild, device, inode); try step(clearRebuild)
@@ -1143,9 +1180,12 @@ final class ListingStage {
     }
 
     func charge(path: Data) throws -> Int64? {
-        let statement = try prepare("SELECT charged FROM nodes WHERE path=CAST(? AS TEXT)")
+        guard let slash = path.lastIndex(of: 47) else { throw Failure.sqlite("invalid charge path") }
+        let parent = slash == path.startIndex ? Data([47]) : Data(path.prefix(upTo: slash))
+        let name = Data(path.suffix(from: path.index(after: slash)))
+        let statement = try prepare("SELECT CASE WHEN is_dir=1 THEN 0 ELSE allocated END FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(? AS TEXT)) AND name=CAST(? AS TEXT)")
         defer { sqlite3_finalize(statement) }
-        bind(path, 1, statement)
+        bind(parent, 1, statement); bind(name, 2, statement)
         let result = sqlite3_step(statement)
         if result == SQLITE_DONE { return nil }
         guard result == SQLITE_ROW else { throw Failure.sqlite("charge lookup") }
@@ -1153,7 +1193,7 @@ final class ListingStage {
     }
 
     func fileTotals() throws -> (logical: Int64, allocated: Int64, count: Int64) {
-        let statement = try prepare("SELECT COALESCE(SUM(st_size),0),COALESCE(SUM(charged),0),COUNT(*) FROM nodes WHERE directory=0")
+        let statement = try prepare("SELECT COALESCE(SUM(size),0),COALESCE(SUM(allocated),0),COUNT(*) FROM nodes WHERE is_dir=0")
         defer { sqlite3_finalize(statement) }
         guard sqlite3_step(statement) == SQLITE_ROW else { throw Failure.sqlite("file totals") }
         return (sqlite3_column_int64(statement, 0), sqlite3_column_int64(statement, 1), sqlite3_column_int64(statement, 2))
@@ -1161,18 +1201,16 @@ final class ListingStage {
 
     func testCrashDuringTransaction(parent: Data) throws -> Never {
         try exec("BEGIN IMMEDIATE")
-        let statement = try prepare("INSERT INTO nodes(st_parent,st_name,dev,inode,directory,is_mount,st_size,st_allocated,links,epoch,charged,path) VALUES(?,?,?,?,?,?,?,?,?,?,?,CAST(? AS TEXT))")
-        bind(parent, 1, statement); bind(Data("uncommitted".utf8), 2, statement)
-        for index in 3...11 { sqlite3_bind_int64(statement, Int32(index), 0) }
-        var path = parent; if path.last != 47 { path.append(47) }; path.append(contentsOf: "uncommitted".utf8)
-        bind(path, 12, statement)
+        guard let parentID = try directoryID(path: parent) else { throw Failure.sqlite("missing crash-test parent") }
+        let statement = try prepare("INSERT INTO nodes(parent,name,search_name,dev,inode) VALUES(?,'uncommitted','uncommitted',0,0)")
+        sqlite3_bind_int64(statement, 1, parentID)
         try step(statement)
         kill(getpid(), SIGKILL)
         fatalError("SIGKILL returned")
     }
 
     func count(parent: Data) throws -> Int {
-        let statement = try prepare("SELECT COUNT(*) FROM nodes WHERE st_parent=?")
+        let statement = try prepare("SELECT COUNT(*) FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(? AS TEXT))")
         defer { sqlite3_finalize(statement) }
         bind(parent, 1, statement)
         guard sqlite3_step(statement) == SQLITE_ROW else { throw Failure.sqlite("count") }
