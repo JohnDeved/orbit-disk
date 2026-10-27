@@ -69,8 +69,11 @@ public struct DiskIndexStore: Sendable {
     }
 
     private static func lookupValues(_ path: String) -> [IndexValue] {
-        let url = URL(fileURLWithPath: path)
-        return [.text(path), .text(url.deletingLastPathComponent().path), .text(url.lastPathComponent)]
+        let bytes = path.utf8
+        guard let slash = bytes.lastIndex(of: 47) else { return [.text(path), .text(""), .text(path)] }
+        let parent = slash == bytes.startIndex ? "/" : String(decoding: bytes[..<slash], as: UTF8.self)
+        let name = String(decoding: bytes[bytes.index(after: slash)...], as: UTF8.self)
+        return [.text(path), .text(parent), .text(name)]
     }
 
     public init(directory: URL) {
@@ -953,7 +956,8 @@ public struct DiskIndexStore: Sendable {
                     throw DiskIndexError.invalid("A scanned file has invalid metadata or parentage.")
                 }
             }
-            try statement.bind([parentID.map(IndexValue.integer) ?? .null, .text(name), .text(Self.fold(name)),
+            // Fold the observed name before URL normalization decomposes characters such as kana.
+            try statement.bind([parentID.map(IndexValue.integer) ?? .null, .text(name), .text(Self.fold(node.name)),
                                 .integer(node.isDirectory ? 1 : 0), .integer(node.isSymbolicLink ? 1 : 0),
                                 .integer(node.isAccessible ? 1 : 0), .integer(node.size), .integer(node.allocatedSize),
                                 .integer(Int64(node.fileCount)), .integer(node.rawAllocatedSize),

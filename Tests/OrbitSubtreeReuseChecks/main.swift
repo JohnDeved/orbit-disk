@@ -39,6 +39,74 @@ private final class Once: @unchecked Sendable {
     private let lock = NSLock(); private var taken = false
     func take() -> Bool { lock.lock(); defer { lock.unlock() }; if taken { return false }; taken = true; return true }
 }
+private struct PauseReuse: Error {}
+
+private func checkNameFoldFallback(_ base: URL) throws {
+    let files = FileManager.default, rawName = "が-file"
+    for interrupted in [false, true] {
+        let group = base.appendingPathComponent(interrupted ? "resumed" : "complete")
+        let root = group.appendingPathComponent("root"), child = root.appendingPathComponent("child")
+        let cache = group.appendingPathComponent("cache"), store = DiskIndexStore(directory: cache)
+        try files.createDirectory(at: child, withIntermediateDirectories: true)
+        for number in 0..<130 { try Data(repeating: 7, count: 25).write(to: child.appendingPathComponent(String(format: "%04d", number))) }
+        let descriptor = open(child.path + "/" + rawName, O_CREAT | O_EXCL | O_WRONLY, 0o600)
+        guard descriptor >= 0 else { throw Failure(message: "could not create raw kana filename") }
+        let resized = ftruncate(descriptor, 9); close(descriptor)
+        try require(resized == 0, "could not size raw kana file")
+        let scanned = try DiskScanner().scan(child)
+        try require(scanned.root.children.contains { $0.name.utf8.elementsEqual(rawName.utf8) }, "fixture lost raw kana spelling")
+        let initial = try save(child, cache)
+        let saved = try store.update(snapshot: initial, replacements: [IndexReplacement(path: child.path, result: scanned)],
+                                     eventID: 6, eventIdentity: "events")
+        let queries = [rawName, "か\u{3099}-file", "file"]
+        let expectedSearch = try queries.map { try store.search(query: $0, snapshot: saved) }
+        try require(expectedSearch[0].totalCount == 1, "saved kana search fixture did not match")
+        do {
+            let source = try StageReuseSource(StageReuseCandidate(snapshot: saved,
+                checkpoint: StageCheckpoint(rootPath: root.path, identity: "events", eventID: 6)),
+                cache: cache, parentRoot: root, parentIdentity: identity(root), cancellation: ScanCancellation())
+            var info = stat(); try require(lstat(child.path, &info) == 0, "missing kana source")
+            let listing = try source.listing(ListingStage.QueuedDirectory(path: Data(child.path.utf8),
+                device: info.st_dev, inode: info.st_ino))!
+            try require(try listing.page(limit: 128).count == 128, "fixture needs a reusable committed prefix")
+            do { _ = try listing.page(limit: 128); throw Failure(message: "refolding a normalized kana name was accepted") }
+            catch StageReuseSource.Failure.unsuitable {}
+        }
+        if interrupted {
+            do {
+                let parent = try stage(root, cache)
+                try parent.prepareRemovalReplay()
+                do {
+                    while try parent.crawler.step(onBatch: { path, count in
+                        if path == Data(child.path.utf8) && count == 1 { throw PauseReuse() }
+                    }) {}
+                    throw Failure(message: "reuse interruption was not reached")
+                } catch is PauseReuse {}
+                let totals = try parent.crawler.store.folderTotals(path: Data(child.path.utf8))
+                try require(totals?.count == 128 && parent.checkpoint.eventID == 6, "interrupted reuse lost its committed prefix")
+            }
+        }
+        let parent = try stage(root, cache, event: interrupted ? 30 : 20)
+        if interrupted {
+            let totals = try parent.crawler.store.folderTotals(path: Data(child.path.utf8))
+            try require(totals?.count == 128 && parent.checkpoint.eventID == 6, "reopen lost reuse progress or event floor")
+        }
+        try finish(parent)
+        let result = try parent.publish(elapsed: 0), expected = try DiskScanner().scan(root).root
+        let actual = try store.loadFolder(path: root.path, snapshot: result)
+        try require(actual.size == expected.size && actual.allocatedSize == expected.allocatedSize && actual.fileCount == 131,
+                    "native fallback duplicated or lost reused rows")
+        let actualFiles = try store.loadFolder(path: child.path, snapshot: result).children
+        try require(actualFiles.count == 131 && Set(actualFiles.compactMap(\.fileIdentity)) == Set(scanned.root.children.compactMap(\.fileIdentity)),
+                    "native fallback changed file identities")
+        for (index, query) in queries.enumerated() {
+            let found = try store.search(query: query, snapshot: result), reference = expectedSearch[index]
+            try require(found.totalCount == reference.totalCount && found.nodes.map(\.fileIdentity) == reference.nodes.map(\.fileIdentity),
+                        "saved-to-reused kana search changed matching semantics")
+        }
+    }
+    print("PASS: normalized kana reuse falls back to native names; copied prefix survives reopen without changing search or accounting")
+}
 
 @main struct SubtreeReuseChecks {
     static func main() throws {
@@ -182,6 +250,7 @@ private final class Once: @unchecked Sendable {
         try require(updated.testReusedDirectories == 1 && updated.checkpoint.eventID == 6, "normal saved replacement rows were not reused")
         try verify(updatedRoot, updatedCache, updated.publish(elapsed: 0))
         print("PASS: saved refresh replacements reuse normal metadata without private staging columns")
+        try checkNameFoldFallback(base.appendingPathComponent("name-fold"))
 
         for during in [false, true] {
             let group = during ? "during" : "before"

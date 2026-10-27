@@ -116,7 +116,7 @@ final class StageReuseSource {
             guard recovered.removals.isEmpty, recovered.affectedParents.isEmpty, !recovered.overlayOverflow,
                   !recovered.hasLiveOperation, !recovered.requiresFullRefresh else { throw Failure.changed }
             cursor = recovered.cursor
-            let rows = try Self.statement(db, "SELECT name,is_dir,is_link,accessible,size,raw_alloc,dev,inode,is_mount,links FROM nodes WHERE parent=?")
+            let rows = try Self.statement(db, "SELECT name,is_dir,is_link,accessible,size,raw_alloc,dev,inode,is_mount,links,search_name FROM nodes WHERE parent=?")
             sqlite3_bind_int64(rows, 1, parentID)
             return StageReusableListing(source: self, rows: rows)
         } catch {
@@ -164,6 +164,9 @@ final class StageReusableListing {
             if status == SQLITE_DONE { finished = true; return records }
             guard status == SQLITE_ROW, let name = StageReuseSource.text(rows, 0),
                   !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.utf8.contains(0),
+                  let searchName = StageReuseSource.text(rows, 10),
+                  searchName.utf8.elementsEqual(name.folding(options: [.caseInsensitive, .diacriticInsensitive],
+                      locale: Locale(identifier: "en_US_POSIX")).utf8),
                   let identity = InventorySchema.identity(rows, device: 6, inode: 7),
                   let parsed = InventorySchema.parseIdentity(identity),
                   sqlite3_column_int(rows, 3) == 1, sqlite3_column_int64(rows, 4) >= 0,

@@ -264,28 +264,28 @@ Folder and file lookups reconstruct only the requested rows through an indexed p
 
 The same commit boundaries, FULL synchronization, hard-link ownership, removal fences, queue epochs and publication checks remain in place. Old saved inventories are retained until their replacement is publishable. Old-format unfinished stages use a different versioned key and are not resumed; format-4 stages resume normally. Older saved and partial maps therefore rebuild once. Old partial stage files are not automatically deleted, since another app process may still own them. The separate removal journal stays at format 3 and retains pending operations and history.
 
-A saved file's basename follows the existing normalized saved-path representation; real APFS NFC and NFD fixture checks cover scan, save, lookup and subtree refresh. This does not resolve the separately documented raw-stage Unicode navigation limitation.
+A saved file's basename follows the existing normalized saved-path representation; search folding uses the observed filename, and literal removal lookups preserve path bytes. Real APFS NFC and NFD fixture checks cover scan, save, lookup and subtree refresh. A reuse listing falls back to filesystem enumeration if folding a stored basename would change its saved search spelling, including some Japanese kana. This does not resolve the separately documented raw-stage Unicode navigation limitation.
 
 ### Measurement
 
-Measured on 27 October 2026, Apple M5, macOS 27.0.1, Swift 6.3.3, optimized arm64 binaries with assertions enabled. Compare released `v0.9.6`, unreleased writer/search commit `8058bfa40d80bba3996c5bf28de505704b8cc21b`, and this compact-inventory implementation. Every variant used the same harness and existing generated APFS fixtures. Each initial map used a fresh process and empty inventory directory. One warmup per variant/fixture preceded five rotating, alternating-order samples. Filesystem caches were not cleared; development builds and tests were stopped during timing. SQLite synchronization and WAL checkpoint policy were unchanged. File count, logical size and allocated size matched the fixture manifests in every run. Every published database passed SQLite integrity and parentage checks.
+Measured on 27 October 2026, Apple M5, macOS 27.0.1, Swift 6.3.3, optimized arm64 binaries with assertions enabled. Compare released `v0.9.6`, unreleased writer/search commit `8058bfa40d80bba3996c5bf28de505704b8cc21b`, and this compact-inventory implementation. Every variant used the same harness and existing generated APFS fixtures. Each initial map used a fresh process and empty inventory directory. One warmup per variant/fixture preceded five rotating, alternating-order samples. Filesystem caches were not cleared; development builds and tests were stopped during timing. SQLite synchronization and WAL checkpoint policy were unchanged. File count, logical size and allocated size matched the fixture manifests in every run. Every initial-map database passed SQLite integrity and parentage checks.
 
 Initial mapping measures `ResumableStage` initialization, `advance` through completion, and `publish`. The first progress callback attempts a staged folder read. Reopen and full direct-child loading are measured separately after publication. The refresh measurement scans the same 10-file branch of the mixed fixture, updates a private working copy, and publishes it under the removal-journal fence. It exercises the separate incremental path. Optional app-model filename-cache preparation and UI delivery/rendering are excluded.
 
 | Median | 0.9.6 | Previous main | 0.9.7 |
 |---|---:|---:|---:|
-| Flat 100,000 files: durable mapping | 6,142.7 ms | 5,345.6 ms | 1,629.9 ms |
+| Flat 100,000 files: durable mapping | 6,952.9 ms | 5,252.3 ms | 2,198.3 ms |
 | Flat: published database | 121.01 MB | 99.68 MB | 20.32 MB |
-| Flat: first 128 readable entries | 25.9 ms | 27.9 ms | 25.5 ms |
-| Flat: final publication | 16.1 ms | 15.2 ms | 5.8 ms |
-| Flat: reopen root | 2.28 ms | 4.26 ms | 1.55 ms |
-| Flat: load all 100,000 direct children | 824.7 ms | 721.0 ms | 239.5 ms |
-| 10,000 files / 1,000 folders: durable mapping | 924.5 ms | 984.5 ms | 819.6 ms |
+| Flat: first 128 readable entries | 26.1 ms | 27.6 ms | 30.6 ms |
+| Flat: final publication | 37.5 ms | 38.1 ms | 31.6 ms |
+| Flat: reopen root | 4.22 ms | 3.25 ms | 3.73 ms |
+| Flat: load all 100,000 direct children | 756.8 ms | 636.9 ms | 259.1 ms |
+| 10,000 files / 1,000 folders: durable mapping | 1,282.3 ms | 1,315.3 ms | 1,039.9 ms |
 | Mixed: published database | 13.54 MB | 11.62 MB | 2.98 MB |
-| Mixed: refresh one 10-file branch | 77.7 ms | 72.7 ms | 24.5 ms |
-| 2,000 empty folders: durable mapping | 819.9 ms | 828.1 ms | 833.6 ms |
+| Mixed: refresh one 10-file branch | 85.8 ms | 84.4 ms | 30.6 ms |
+| 2,000 empty folders: durable mapping | 712.4 ms | 692.0 ms | 740.8 ms |
 | Empty folders: published database | 2.54 MB | 2.21 MB | 1.62 MB |
 
-The 100,000-file initial-map ranges were 5.01–10.34 s for 0.9.6, 3.50–8.55 s for previous main, and 1.52–1.77 s for this implementation. Older writers experienced substantial durable-write stalls. These local results do not establish a worst-case latency bound or a whole-home/cold-filesystem speedup. The empty-directory fixture showed no mapping improvement. Peak process RSS for the flat fixture, including eager loading of all direct children, increased from median 128.4 MB to 146.3 MB (previous main: 139.4 MB); disk-size savings are not a memory-reduction claim. Folder views still include all direct children and a bounded descendant preview.
+The 100,000-file initial-map ranges were 6.27–8.00 s for 0.9.6, 4.91–5.89 s for previous main, and 2.11–2.80 s for this implementation. Older writers experienced substantial durable-write stalls. These local results do not establish a worst-case latency bound or a whole-home/cold-filesystem speedup. The empty-directory fixture showed no material mapping improvement. Peak process RSS for the flat fixture, including eager loading of all direct children, increased from median 129.1 MB to 144.9 MB (previous main: 146.8 MB); disk-size savings are not a memory-reduction claim. Folder views still include all direct children and a bounded descendant preview.
 
 [Raw samples, summaries, method and exact source hashes](docs/benchmarks/v0.9.7.json) include warmups, all measured runs and separate single-run stop/reopen checks. Stop/reopen checks validate retained state; they are not a resume-latency benchmark. The schema tests additionally cover root `/`, Unicode, >2^53 logical sizes, UInt64.max inode values, directory-path lifetime after interrupted pruning, and preserving the version-3 removal journal when rebuilding an old inventory.

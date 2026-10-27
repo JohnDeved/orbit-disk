@@ -130,5 +130,15 @@ private struct Signature: Equatable {
         try verify("replacement-needle"); try verify("rare-needle")
         let file = try stage.search(query: "file-1", cancellation: ScanCancellation(), removals: [], limit: 1).nodes.first!
         try verify("file", removals: [ScanRemoval(path: file.id, identity: file.fileIdentity!)])
+
+        let literalName = "raw-é-file"
+        sql("INSERT INTO nodes(parent,name,search_name,size,file_count,dev,inode) VALUES(1,'\(literalName)','raw-e-file',1,1,1,9000003)")
+        let literalRemoval = ScanRemoval(path: root.path + "/" + literalName, identity: "1:9000003")
+        let literalSources = try store.removalNodes([literalRemoval], snapshot: snapshot)
+        precondition(literalSources.count == 1 && literalSources[0].fileIdentity == literalRemoval.identity,
+                     "Literal NFC removal lookup must preserve stored basename bytes")
+        let decomposedRemoval = ScanRemoval(path: root.path + "/raw-e\u{301}-file", identity: literalRemoval.identity)
+        let decomposedSources = try store.removalNodes([decomposedRemoval], snapshot: snapshot)
+        precondition(decomposedSources.isEmpty, "Literal removal lookup must not alias different stored path bytes")
     }
 }
