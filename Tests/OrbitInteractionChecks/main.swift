@@ -46,9 +46,69 @@ let markerCenter = large.collectionMarkerCenter(metrics: metrics, diameter: 16)!
 precondition(large.path(metrics: metrics).contains(markerCenter))
 print("PASS collection markings distinguish partial groups, full groups, and collected ancestors; tiny sectors omit badges")
 
+let unicodeMembers = ["/group/\u{00E9}", "/group/e\u{0301}", "/group/folder", "/group/last"]
+let unicodeBytes = Set(unicodeMembers.map { Data($0.utf8) })
+let groupCollections = [
+    [String](), ["/"], ["/group"], ["/group/"], ["/other/file"],
+    ["/group/\u{00E9}"], ["/group/e\u{0301}"], ["/group/folder/child"],
+    ["/group-sibling/folder/child"], ["/group/folder", "/group/folder/child"],
+    ["/group/\u{00E9}", "/group/e\u{0301}", "/group/folder"], unicodeMembers,
+]
+for paths in groupCollections {
+    let coverage = CollectionCoverage(paths: paths)
+    let optimized = coverage.state(forGroup: unicodeMembers, distinct: true, parent: "/group") { unicodeBytes.contains($0) }
+    precondition(optimized == coverage.state(for: unicodeMembers), "Grouped collection coverage must match individual members: \(paths)")
+}
+let onlyComposed = CollectionCoverage(paths: ["/group/\u{00E9}"])
+precondition(onlyComposed.state(forGroup: ["/group/e\u{0301}", "/group/last"], distinct: true, parent: "/group") {
+    Set([Data("/group/e\u{0301}".utf8), Data("/group/last".utf8)]).contains($0)
+} == .none, "Distinct Unicode encodings must remain distinct in grouped lookups")
+print("PASS grouped coverage matches per-member coverage across ancestors, descendants, unrelated paths, and Unicode")
+
 let presentationCache = SunburstPresentationCache()
 let mapRevision = UUID()
 let prepared = presentationCache.presentation(root: root, mapRevision: mapRevision, coverage: CollectionCoverage())
+let encodedChildren = [leaf("\u{00E9}", 1), leaf("e\u{0301}", 1), leaf("a\u{0301}", 1), leaf("other", 1)]
+let encodedRoot = DiskNode(url: root.url, name: root.name, isDirectory: true, size: 10_004,
+                           allocatedSize: 10_004, fileCount: 5, children: [leaf("large", 10_000)] + encodedChildren)
+let encodedLayout = SunburstPreparedLayout(root: encodedRoot, mapRevision: UUID())
+let encodedGroupIndex = encodedLayout.segments.firstIndex { $0.groupParentID != nil }!
+for member in encodedChildren {
+    precondition(encodedLayout.contains(groupMember: Data(member.id.utf8), at: encodedGroupIndex))
+}
+precondition(!encodedLayout.contains(groupMember: Data("/fixture/\u{00E1}".utf8), at: encodedGroupIndex),
+             "Canonical-equivalent names that are not members must stay distinct")
+let unicodeCoverage = CollectionCoverage(paths: [encodedChildren[1].id])
+let unicodePresentation = SunburstPresentationCache().presentation(root: encodedRoot, mapRevision: UUID(), coverage: unicodeCoverage)
+precondition(unicodePresentation.collectionStates[encodedGroupIndex] == .containsItems)
+let distinctChildren = [encodedChildren[0], encodedChildren[2], encodedChildren[3], leaf("four", 1), leaf("five", 1)]
+let distinctRoot = DiskNode(url: root.url, name: root.name, isDirectory: true, size: 10_005,
+                            allocatedSize: 10_005, fileCount: 6, children: [leaf("large", 10_000)] + distinctChildren)
+let distinctLayout = SunburstPreparedLayout(root: distinctRoot, mapRevision: UUID())
+let distinctGroupIndex = distinctLayout.segments.firstIndex { $0.groupParentID != nil }!
+precondition(distinctLayout.groupMembersAreDistinct(at: distinctGroupIndex))
+precondition(!encodedLayout.groupMembersAreDistinct(at: encodedGroupIndex))
+let candidates = ["/", "/fixture", "/fixture/", "/fixture-old/other", "/fixture/other",
+                  "/fixture/other/child", "/fixture/\u{00E9}", "/fixture/e\u{0301}",
+                  "/fixture/\u{00E1}", "/fixture/a\u{0301}/nested", "/outside", "/outside"]
+for (fixture, layout, groupIndex) in [(encodedRoot, encodedLayout, encodedGroupIndex), (distinctRoot, distinctLayout, distinctGroupIndex)] {
+    let parityCache = SunburstPresentationCache()
+    let parityRevision = UUID()
+    for mask in 0..<(1 << candidates.count) {
+        let paths = candidates.indices.compactMap { mask & (1 << $0) == 0 ? nil : candidates[$0] }
+        let coverage = CollectionCoverage(paths: paths)
+        let expected = coverage.state(for: layout.memberIDs[groupIndex])
+        let actual = parityCache.presentation(root: fixture, mapRevision: parityRevision, coverage: coverage)
+        precondition(actual.collectionStates[groupIndex] == expected, "Grouped collection parity failed for \(paths)")
+    }
+}
+let duplicatePaths = ["/group/a", "/group/a", "/group/b"]
+let duplicateCoverage = CollectionCoverage(paths: ["/group/a"])
+precondition(duplicateCoverage.state(forGroup: duplicatePaths, distinct: false, parent: "/group") { _ in false }
+             == duplicateCoverage.state(for: duplicatePaths))
+let allDuplicatePaths = ["/group/a", "/group/a"]
+precondition(duplicateCoverage.state(forGroup: allDuplicatePaths, distinct: false, parent: "/group") { _ in false } == .included)
+print("PASS grouped coverage matches member-by-member results for 8,192 combinations and duplicate members")
 let preparedGroup = prepared.layout.hoverGroup(for: group.id)!
 precondition(preparedGroup.id == group.id && preparedGroup.parentID == root.id && preparedGroup.rootID == root.id)
 precondition(preparedGroup.mapRevision == mapRevision && preparedGroup.memberIDs == Set(group.members.map(\.id)))
@@ -100,6 +160,31 @@ precondition(beforeIdentity.layout !== afterIdentity.layout)
 precondition(afterIdentity.layout.segment(for: originalMember.id)?.members.last?.fileIdentity == "replacement-inode")
 print("PASS chart cache reuses exact groups across selection and collection changes, and refreshes equal-size replacement data")
 
+let nestedRoot = DiskNode(url: URL(fileURLWithPath: "/outer"), name: "outer", isDirectory: true,
+                          size: root.size + 1, allocatedSize: root.allocatedSize + 1,
+                          fileCount: root.fileCount + 1, children: [root, leaf("outer-small.bin", 1)])
+let nestedColors = [root.id: 12]
+let baselineNested = SunburstPreparedLayout(root: nestedRoot, mapRevision: mapRevision, colorIndices: nestedColors)
+let reusedNested = SunburstPreparedLayout(root: nestedRoot, mapRevision: mapRevision, colorIndices: nestedColors,
+                                          rootChildIDs: nestedRoot.children.map(\.id))
+let wrongCount = SunburstPreparedLayout(root: nestedRoot, mapRevision: mapRevision, colorIndices: nestedColors,
+                                         rootChildIDs: ["wrong"])
+for layout in [reusedNested, wrongCount] {
+    precondition(layout.memberIDs == baselineNested.memberIDs)
+    precondition(layout.segments.count == baselineNested.segments.count)
+    for (expected, actual) in zip(baselineNested.segments, layout.segments) {
+        precondition(expected.id == actual.id && expected.start == actual.start && expected.end == actual.end
+                     && expected.branchIndex == actual.branchIndex && expected.depth == actual.depth)
+        precondition(layout.hoverGroup(for: actual.id)?.memberIDs == baselineNested.hoverGroup(for: expected.id)?.memberIDs)
+        for member in expected.members {
+            precondition(layout.index(for: member.id) == baselineNested.index(for: member.id))
+        }
+    }
+}
+precondition(reusedNested.memberIDs == reusedNested.segments.map { $0.members.map(\.id) })
+precondition(reusedNested.segments.contains { $0.depth > 0 && $0.groupParentID != nil })
+print("PASS prepared child IDs preserve nested segments, colors, hover groups, and member lookup")
+
 let pendingFolder = DiskNode(url: URL(fileURLWithPath: "/fixture/waiting"), name: "waiting", isDirectory: true,
                               size: 0, allocatedSize: 0, fileCount: 0, scanState: .pending)
 let scanningFolder = DiskNode(url: URL(fileURLWithPath: "/fixture/growing"), name: "growing", isDirectory: true,
@@ -113,7 +198,14 @@ precondition(partialGroup.scanState == .scanning && partialGroup.members.contain
 precondition(!partialSegments.contains { $0.matches(pendingFolder.id) })
 precondition(SunburstLayout.make(root: pendingFolder).isEmpty)
 precondition(SunburstText.size(0, state: pendingFolder.scanState) == "Waiting…")
-precondition(SunburstText.detail(root: pendingFolder, segment: nil, collection: .none) == "Waiting to map this folder")
+precondition(SunburstText.detail(root: pendingFolder, segment: nil, collection: .none) == "Waiting to map")
+let pendingFile = DiskNode(url: URL(fileURLWithPath: "/fixture/pending-file"), name: "pending-file", isDirectory: false,
+                           size: 42, allocatedSize: 0, fileCount: 1, scanState: .pending)
+let pendingFileRoot = DiskNode(url: root.url, name: root.name, isDirectory: true, size: 42,
+                               allocatedSize: 0, fileCount: 1, children: [pendingFile], scanState: .scanning)
+let pendingFileSegment = SunburstLayout.make(root: pendingFileRoot).first!
+precondition(pendingFileSegment.scanState == .pending)
+precondition(SunburstText.detail(root: pendingFileRoot, segment: pendingFileSegment, collection: .none) == "Waiting to map")
 precondition(SunburstText.detail(root: partialRoot, segment: nil, collection: .none) == "Mapped so far")
 precondition(SunburstText.detail(root: partialRoot, segment: partialGroup, collection: .none) == "Mapped so far")
 precondition(SunburstText.detail(root: partialRoot, segment: large, collection: .none).hasSuffix("of mapped bytes"))
@@ -193,9 +285,18 @@ let boundarySegments = (0..<72).map { index in
                            start: Double(sector) * 2 * .pi / 24, end: Double(sector + 1) * 2 * .pi / 24,
                            depth: index / 24, branchIndex: sector)
 }
-for testMetrics in [metrics, SunburstMetrics(size: CGSize(width: 360, height: 210))] {
-    for testSegments in [segments, boundarySegments] {
+let denseSegments = (0..<768).map { index in
+    let sector = index % 192
+    return SunburstSegment(id: "dense-\(index)", node: large.node, members: large.members,
+                           name: "Dense", size: 1,
+                           start: Double(sector) * 2 * .pi / 192, end: Double(sector + 1) * 2 * .pi / 192,
+                           depth: index / 192, branchIndex: sector)
+}
+for testMetrics in [metrics, SunburstMetrics(size: CGSize(width: 360, height: 210)),
+                    SunburstMetrics(size: CGSize(width: 10, height: 10))] {
+    for testSegments in [[], segments, boundarySegments, denseSegments] {
         let regions = MapHitRegions(segments: testSegments, metrics: testMetrics)
+        let referencePaths = testSegments.map { $0.path(metrics: testMetrics) }
         var probes: [CGPoint] = [testMetrics.center, .zero, CGPoint(x: 500, y: 500)]
         for x in stride(from: 0, through: 400, by: 8) {
             for y in stride(from: 0, through: 400, by: 8) {
@@ -216,8 +317,10 @@ for testMetrics in [metrics, SunburstMetrics(size: CGSize(width: 360, height: 21
             }
         }
         for probe in probes {
-            precondition(regions.index(at: probe) == testSegments.firstIndex { $0.path(metrics: testMetrics).contains(probe) },
-                         "Cached hit path changed a sector or gap boundary at \(probe)")
+            let actual = regions.index(at: probe)
+            let expected = referencePaths.firstIndex { $0.contains(probe) }
+            precondition(actual == expected,
+                         "Cached hit path changed at \(probe): got \(String(describing: actual)), expected \(String(describing: expected)), bounds \(expected.map { referencePaths[$0].boundingRect }.debugDescription)")
         }
     }
 }
@@ -353,6 +456,19 @@ row.mouseUp(with: rowEvent(.leftMouseUp, rowPoint, count: 2))
 precondition(openedRows == [children[0].id])
 precondition(rowActivity.suffix(2) == [true, false])
 print("PASS a row reordered between the two clicks is selected without opening the replacement item")
+
+var gutterConfiguration = rowConfiguration()
+gutterConfiguration.contentWidth = 283
+row.interaction = gutterConfiguration
+let gutterPoint = CGPoint(x: 290, y: 26)
+precondition(row.hitTest(row.convert(gutterPoint, to: table)) === row, "The reserved gutter must remain draggable")
+precondition(row.hitTest(row.convert(CGPoint(x: 250, y: 26), to: table)) == nil, "The folder arrow must remain clickable")
+let dragsBeforeGutter = draggedRows.count
+row.mouseDown(with: rowEvent(.leftMouseDown, gutterPoint))
+row.mouseDragged(with: rowEvent(.leftMouseDragged, CGPoint(x: 299, y: 26)))
+row.mouseUp(with: rowEvent(.leftMouseUp, CGPoint(x: 299, y: 26)))
+precondition(draggedRows.count == dragsBeforeGutter + 1 && draggedRows.last == children[0].id)
+print("PASS reserved gutter remains a row drag target without obscuring the folder arrow")
 
 view.interaction = configuration()
 let chartActivityCount = chartActivity.count

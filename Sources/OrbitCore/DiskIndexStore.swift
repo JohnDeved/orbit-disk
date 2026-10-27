@@ -45,12 +45,34 @@ public enum DiskIndexError: LocalizedError {
 
 public struct DiskIndexStore: Sendable {
     public let directory: URL
+    public let lockDirectory: URL
+    #if ORBIT_TESTING
+    package static var testSearchSQLiteProgress: (@Sendable () -> Void)?
+    package static var testEqualSizeSearchSkip: (@Sendable () -> Void)?
+    package static var testBeforePublish: (@Sendable () -> Void)?
+    package static var testBeforeRecoveryPublish: (@Sendable () -> Void)?
+    package static var testDuringRefreshAncestors: (@Sendable () -> Void)?
+    package static var testBeforeUpdatePublish: (@Sendable () -> Void)?
+    #endif
     private static let version: Int64 = 3
     private static let applicationID: Int64 = 0x4F524254
     private static let mutationLock = NSLock()
     private static let nodeColumns = "path,name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,file_identity"
 
-    public init(directory: URL) { self.directory = directory.standardizedFileURL }
+    public init(directory: URL) {
+        self.directory = IndexLocations.canonicalCache(directory)
+        self.lockDirectory = IndexLocations.locks(for: self.directory)
+    }
+
+    public func captureExpectedSnapshot(for root: URL, cancellation: ScanCancellation = ScanCancellation()) throws -> SnapshotExpectation {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        try FileManager.default.createDirectory(at: lockDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try IndexLocations.validateCache(directory)
+        let lease = try RootMutationLease(directory: lockDirectory, root: root, cancellation: cancellation)
+        defer { withExtendedLifetime(lease) {} }
+        return try SnapshotExpectation.capture(directory: directory, root: root)
+    }
 
     public func savedSnapshot(for root: URL) -> IndexSnapshot? {
         let rootPath = Self.path(root)
@@ -64,11 +86,90 @@ public struct DiskIndexStore: Sendable {
         } catch { return nil }
     }
 
+    public func removalCursor(snapshot: IndexSnapshot, cancellation: ScanCancellation = ScanCancellation()) throws -> RemovalCursor? {
+        let db = try open(snapshot, cancellation: cancellation)
+        guard try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='orbit_removal_cursor'") != 0 else { return nil }
+        let row = try db.statement("SELECT identity,sequence FROM orbit_removal_cursor WHERE singleton=1")
+        guard try row.step(), let identity = row.text(0), UUID(uuidString: identity) != nil, row.integer(1) >= 0 else {
+            throw DiskIndexError.invalid("The map's removal checkpoint is damaged.")
+        }
+        return RemovalCursor(identity: identity, sequence: row.integer(1))
+    }
+
+    private func writeRemovalCursor(_ cursor: RemovalCursor, db: IndexDatabase) throws {
+        try db.execute("CREATE TABLE IF NOT EXISTS orbit_removal_cursor(singleton INTEGER PRIMARY KEY CHECK(singleton=1),identity TEXT NOT NULL,sequence INTEGER NOT NULL)")
+        try db.run("INSERT OR REPLACE INTO orbit_removal_cursor VALUES(1,?,?)", [.text(cursor.identity), .integer(cursor.sequence)])
+    }
+
+    package func recoveryWorkingCopy(of snapshot: IndexSnapshot, cancellation: ScanCancellation) throws -> IndexSnapshot {
+        guard snapshot.databaseURL == databaseURL(for: snapshot.rootURL) else { throw DiskIndexError.staleSnapshot }
+        try IndexLocations.validateCache(directory)
+        let lease = try RootMutationLease(directory: lockDirectory, root: snapshot.rootURL, cancellation: cancellation)
+        defer { withExtendedLifetime(lease) {} }
+        Self.mutationLock.lock(); defer { Self.mutationLock.unlock() }
+        let original = try open(snapshot, cancellation: cancellation)
+        try original.close()
+        let temporary = directory.appendingPathComponent(".\(UUID().uuidString).sqlite")
+        if clonefile(snapshot.databaseURL.path, temporary.path, 0) != 0 {
+            var info = stat()
+            guard lstat(temporary.path, &info) != 0, errno == ENOENT else {
+                throw DiskIndexError.database("The recovery copy destination already exists.")
+            }
+            try FileManager.default.copyItem(at: snapshot.databaseURL, to: temporary)
+        }
+        do {
+            let copy = relocated(snapshot, to: temporary)
+            let db = try open(copy, cancellation: cancellation); try db.close()
+            try lease.validate()
+            return copy
+        } catch { removeTemporary(temporary); throw error }
+    }
+
+    package func publishRecoveryCopy(_ copy: IndexSnapshot, replacing original: IndexSnapshot,
+                                    cursor: RemovalCursor, cancellation: ScanCancellation) throws -> IndexSnapshot {
+        guard original.databaseURL == databaseURL(for: original.rootURL), copy.rootURL == original.rootURL,
+              copy.databaseURL.deletingLastPathComponent() == directory,
+              copy.databaseURL.lastPathComponent.hasPrefix("."), copy.databaseURL.pathExtension == "sqlite" else {
+            throw DiskIndexError.invalid("The recovery copy is invalid.")
+        }
+        let lease = try RootMutationLease(directory: lockDirectory, root: original.rootURL, cancellation: cancellation)
+        defer { withExtendedLifetime(lease) {} }
+        Self.mutationLock.lock(); defer { Self.mutationLock.unlock() }
+        let actual = try open(original, cancellation: cancellation); try actual.close()
+        let prepared = try open(copy, cancellation: cancellation); try prepared.close()
+        try RemovalJournal(cache: directory).withFence(cancellation: cancellation) { fence in
+            guard fence.identity == cursor.identity && fence.highWater == cursor.sequence else {
+                throw RemovalRecoveryError.changedDuringReconciliation
+            }
+            try lease.validate(); try fence.validate()
+            #if ORBIT_TESTING
+            Self.testBeforeRecoveryPublish?()
+            #endif
+            try publish(copy.databaseURL, to: original.databaseURL, cancellation: cancellation)
+        }
+        return relocated(copy, to: original.databaseURL)
+    }
+
+    package func discardRecoveryCopy(_ copy: IndexSnapshot) { removeTemporary(copy.databaseURL) }
+
+    private func relocated(_ snapshot: IndexSnapshot, to url: URL) -> IndexSnapshot {
+        IndexSnapshot(id: snapshot.id, rootURL: snapshot.rootURL, databaseURL: url, scannedAt: snapshot.scannedAt,
+                      elapsed: snapshot.elapsed, skippedCount: snapshot.skippedCount, issues: snapshot.issues,
+                      eventID: snapshot.eventID, eventIdentity: snapshot.eventIdentity)
+    }
+
     public func save(_ result: ScanResult, eventID: UInt64, eventIdentity: String,
-                     cancellation: ScanCancellation = ScanCancellation()) throws -> IndexSnapshot {
+                     cancellation: ScanCancellation = ScanCancellation(), expectedSnapshot: SnapshotExpectation? = nil) throws -> IndexSnapshot {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        try FileManager.default.createDirectory(at: lockDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try IndexLocations.validateCache(directory)
+        let rootLease = try RootMutationLease(directory: lockDirectory, root: result.root.url, cancellation: cancellation)
+        defer { withExtendedLifetime(rootLease) {} }
         Self.mutationLock.lock()
         defer { Self.mutationLock.unlock() }
         try check(cancellation)
+        if let expectedSnapshot { try expectedSnapshot.verify(directory: directory, root: result.root.url) }
         guard result.root.isDirectory else { throw DiskIndexError.invalid("The index root must be a folder.") }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
@@ -103,12 +204,23 @@ public struct DiskIndexStore: Sendable {
         try writeSnapshot(snapshot, db: db)
         try db.execute("COMMIT;")
         try db.close()
+        #if ORBIT_TESTING
+        Self.testBeforePublish?()
+        #endif
+        try rootLease.validate()
+        if let expectedSnapshot { try expectedSnapshot.verify(directory: directory, root: result.root.url) }
         try publish(temporary, to: destination, cancellation: cancellation)
         return snapshot
     }
 
     public func update(snapshot: IndexSnapshot, replacements: [IndexReplacement], eventID: UInt64,
-                       eventIdentity: String, cancellation: ScanCancellation = ScanCancellation()) throws -> IndexSnapshot {
+                       eventIdentity: String, cancellation: ScanCancellation = ScanCancellation(),
+                       removalCursor: RemovalCursor? = nil,
+                       journalFenceCursor: RemovalCursor? = nil) throws -> IndexSnapshot {
+        try FileManager.default.createDirectory(at: lockDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try IndexLocations.validateCache(directory)
+        let rootLease = try RootMutationLease(directory: lockDirectory, root: snapshot.rootURL, cancellation: cancellation)
+        defer { withExtendedLifetime(rootLease) {} }
         Self.mutationLock.lock()
         defer { Self.mutationLock.unlock() }
         try check(cancellation)
@@ -119,12 +231,7 @@ public struct DiskIndexStore: Sendable {
                 throw DiskIndexError.invalid("A changed folder could not be scanned completely. The saved index was preserved; check folder access and refresh.")
             }
         }
-        for (index, path) in paths.enumerated() {
-            guard Self.contains(path, in: root) else { throw DiskIndexError.invalid("An updated folder is outside the index.") }
-            for previous in paths.prefix(index) where Self.contains(path, in: previous) || Self.contains(previous, in: path) {
-                throw DiskIndexError.invalid("Updated folders overlap. Combine their refreshes first.")
-            }
-        }
+        try Self.validateReplacementPaths(paths, root: root, cancellation: cancellation)
         let temporary = directory.appendingPathComponent(".\(UUID().uuidString).sqlite")
         defer { removeTemporary(temporary) }
         if clonefile(snapshot.databaseURL.path, temporary.path, 0) != 0 {
@@ -133,8 +240,9 @@ public struct DiskIndexStore: Sendable {
         }
         let db = try IndexDatabase(temporary, writable: true, cancellation: cancellation)
         try validate(snapshot, db: db)
+        try db.registerHardLinkOrder()
         try db.execute("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")
-        var identities = Set<String>()
+        try db.execute("CREATE TEMP TABLE refresh_identities (identity TEXT PRIMARY KEY) WITHOUT ROWID;")
         var affectedParents = Set<String>()
         var issues = snapshot.issues
         var skipped = snapshot.skippedCount
@@ -144,8 +252,7 @@ public struct DiskIndexStore: Sendable {
                 throw DiskIndexError.invalid("The indexed folder no longer exists.")
             }
             let predicate = subtreePredicate(path)
-            let oldIDs = try db.strings("SELECT DISTINCT file_identity FROM nodes WHERE is_dir=0 AND file_identity IS NOT NULL AND (\(predicate.sql))", predicate.values)
-            identities.formUnion(oldIDs)
+            try db.run("INSERT OR IGNORE INTO refresh_identities SELECT file_identity FROM nodes WHERE is_dir=0 AND file_identity IS NOT NULL AND (\(predicate.sql))", predicate.values)
             try db.run("DELETE FROM nodes WHERE \(predicate.sql)", predicate.values)
             let parent = path == root ? nil : URL(fileURLWithPath: path).deletingLastPathComponent().path
             if let parent {
@@ -157,86 +264,396 @@ public struct DiskIndexStore: Sendable {
             if let result = replacement.result {
                 guard Self.path(result.root.url) == path else { throw DiskIndexError.invalid("An updated scan has the wrong root.") }
                 try insertTree(result.root, parent: parent, db: db, cancellation: cancellation)
-                let newIDs = try db.strings("SELECT DISTINCT file_identity FROM nodes WHERE is_dir=0 AND file_identity IS NOT NULL AND (\(predicate.sql))", predicate.values)
-                identities.formUnion(newIDs)
+                try db.run("INSERT OR IGNORE INTO refresh_identities SELECT file_identity FROM nodes WHERE is_dir=0 AND file_identity IS NOT NULL AND (\(predicate.sql))", predicate.values)
                 skipped += result.skippedCount
                 for issue in result.issues where !issues.contains(issue) && issues.count < 100 { issues.append(issue) }
                 if path == root { skipped = result.skippedCount; issues = result.issues }
             }
         }
-        for identity in identities {
-            try check(cancellation)
-            let linkedPaths = try db.strings("SELECT path FROM nodes WHERE is_dir=0 AND file_identity=? ORDER BY path", [.text(identity)])
-            guard let owner = linkedPaths.first else { continue }
-            try db.run("UPDATE nodes SET allocated=CASE WHEN path=? THEN raw_alloc ELSE 0 END WHERE is_dir=0 AND file_identity=?", [.text(owner), .text(identity)])
-            for path in linkedPaths { addAncestors(URL(fileURLWithPath: path).deletingLastPathComponent().path, root: root, to: &affectedParents) }
+        try db.execute("""
+            CREATE TEMP TABLE refresh_owners (identity TEXT PRIMARY KEY, path TEXT NOT NULL) WITHOUT ROWID;
+            INSERT INTO refresh_owners
+              SELECT i.identity, MIN(n.path COLLATE ORBIT_HARDLINK_ORDER) FROM refresh_identities i
+              CROSS JOIN nodes n ON n.file_identity=i.identity AND n.is_dir=0 GROUP BY i.identity;
+            CREATE TEMP TABLE refresh_allocations (node_id INTEGER PRIMARY KEY, allocated INTEGER NOT NULL);
+            INSERT INTO refresh_allocations
+              SELECT n.id, CASE WHEN n.path=o.path THEN n.raw_alloc ELSE 0 END
+              FROM refresh_owners o CROSS JOIN nodes n ON n.file_identity=o.identity AND n.is_dir=0
+              WHERE n.allocated != CASE WHEN n.path=o.path THEN n.raw_alloc ELSE 0 END;
+            """)
+        do {
+            let changedPaths = try db.statement("SELECT n.path FROM refresh_allocations a JOIN nodes n ON n.id=a.node_id")
+            while try changedPaths.step() {
+                #if ORBIT_TESTING
+                Self.testDuringRefreshAncestors?()
+                #endif
+                try check(cancellation)
+                guard let path = changedPaths.text(0) else { throw DiskIndexError.invalid("Invalid hard-link path.") }
+                addAncestors(URL(fileURLWithPath: path).deletingLastPathComponent().path, root: root, to: &affectedParents)
+            }
         }
+        try db.execute("UPDATE nodes SET allocated=(SELECT allocated FROM refresh_allocations WHERE node_id=nodes.id) WHERE id IN (SELECT node_id FROM refresh_allocations);")
         for parent in affectedParents.sorted(by: { $0.count > $1.count }) {
             try check(cancellation)
             try db.run("""
-                UPDATE nodes SET size=(SELECT COALESCE(SUM(size),0) FROM nodes WHERE parent=(SELECT id FROM nodes WHERE path=?)),
-                  allocated=(SELECT COALESCE(SUM(allocated),0) FROM nodes WHERE parent=(SELECT id FROM nodes WHERE path=?)),
-                  file_count=(SELECT COALESCE(SUM(file_count),0) FROM nodes WHERE parent=(SELECT id FROM nodes WHERE path=?))
+                UPDATE nodes SET (size,allocated,file_count)=(SELECT COALESCE(SUM(size),0),
+                  COALESCE(SUM(allocated),0),COALESCE(SUM(file_count),0) FROM nodes WHERE parent=(SELECT id FROM nodes WHERE path=?))
                 WHERE path=? AND is_dir=1
-                """, Array(repeating: .text(parent), count: 4))
+                """, Array(repeating: .text(parent), count: 2))
         }
         let next = IndexSnapshot(id: UUID().uuidString, rootURL: snapshot.rootURL, databaseURL: snapshot.databaseURL,
                                  scannedAt: Date(), elapsed: replacements.reduce(0) { $0 + ($1.result?.elapsed ?? 0) },
                                  skippedCount: skipped, issues: issues, eventID: eventID, eventIdentity: eventIdentity)
         try writeSnapshot(next, db: db)
+        if let removalCursor { try writeRemovalCursor(removalCursor, db: db) }
         try db.execute("COMMIT;")
         try db.close()
-        try publish(temporary, to: snapshot.databaseURL, cancellation: cancellation)
+        #if ORBIT_TESTING
+        Self.testBeforeUpdatePublish?()
+        #endif
+        try rootLease.validate()
+        if let fenceCursor = journalFenceCursor ?? removalCursor {
+            try RemovalJournal(cache: directory).withFence(cancellation: cancellation) { fence in
+                guard fence.identity == fenceCursor.identity && fence.highWater == fenceCursor.sequence else {
+                    throw RemovalRecoveryError.changedDuringReconciliation
+                }
+                try fence.validate()
+                try publish(temporary, to: snapshot.databaseURL, cancellation: cancellation)
+            }
+        } else {
+            try publish(temporary, to: snapshot.databaseURL, cancellation: cancellation)
+        }
         return next
     }
 
-    public func loadFolder(path: String, snapshot: IndexSnapshot) throws -> DiskNode {
+    public func removalNodes(_ removals: [ScanRemoval], snapshot: IndexSnapshot,
+                             cancellation: ScanCancellation? = nil) throws -> [DiskNode] {
+        let db = try open(snapshot, cancellation: cancellation)
+        var nodes: [DiskNode] = []
+        for removal in removals {
+            try check(cancellation)
+            if let node = try readNode(removal.path, db: db), node.fileIdentity == removal.identity { nodes.append(node) }
+        }
+        return nodes
+    }
+
+    public func stagedConfirmsMissingDirectory(_ path: String, snapshot: IndexSnapshot) throws -> Bool {
         let db = try open(snapshot)
+        try db.execute("BEGIN")
+        defer { try? db.execute("ROLLBACK") }
+        let query = try db.statement("SELECT n.is_dir,COALESCE(d.pending,0) FROM nodes n LEFT JOIN directories d ON d.path=CAST(n.path AS BLOB) WHERE n.path=?")
+        var current = Self.path(URL(fileURLWithPath: path))
+        var first = true
+        while true {
+            try query.bind([.text(current)])
+            if try query.step() {
+                let directory = query.integer(0) != 0, pending = query.integer(1) != 0
+                return first ? !directory : (!directory || !pending)
+            }
+            try query.reset()
+            if current == snapshot.rootURL.path || current == "/" { return false }
+            let parent = URL(fileURLWithPath: current).deletingLastPathComponent().path
+            if parent == current { return false }
+            current = parent; first = false
+        }
+    }
+
+    public func stagedSearch(query: String, snapshot: IndexSnapshot, revision: UInt64,
+                             removals: [ScanRemoval], cancellation: ScanCancellation, limit: Int = 300) throws -> (nodes: [DiskNode], count: Int, revision: UInt64, removalsChanged: Bool) {
+        try Task.checkCancellation()
+        let needle = Self.fold(query.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard !needle.isEmpty else { return ([], 0, revision, false) }
+        let db = try open(snapshot, cancellation: cancellation)
+        db.checkTaskCancellation()
+        try db.execute("BEGIN")
+        defer { try? db.execute("ROLLBACK") }
+        let sources = try stagedRemovalSources(removals, db: db, cancellation: cancellation)
+        let projection = try DiskRemovalProjection(removals: removals, source: sources, cancellation: cancellation)
+        let statement = try db.statement("""
+            SELECT n.path,n.name,n.is_dir,n.is_link,n.accessible,n.size,n.allocated,n.file_count,n.raw_alloc,n.file_identity,
+                   COALESCE(d.pending,0),CASE WHEN e.value IS NULL THEN 0 ELSE 1 END,COALESCE(pd.pending,0)
+            FROM nodes n LEFT JOIN directories d ON d.path=CAST(n.path AS BLOB) LEFT JOIN epochs e ON e.parent=d.path
+            LEFT JOIN nodes p ON p.id=n.parent LEFT JOIN directories pd ON pd.path=CAST(p.path AS BLOB)
+            WHERE n.parent IS NOT NULL AND instr(n.search_name,?)>0
+            """)
+        try statement.bind([.text(needle)])
+        let resultLimit = max(0, min(limit, 10_000))
+        var result: [DiskNode] = [], count = 0, scanned = 0
+        var worstID = ""
+        func worse(_ a: DiskNode, _ b: DiskNode) -> Bool {
+            a.size == b.size ? b.id.utf8.lexicographicallyPrecedes(a.id.utf8) : a.size < b.size
+        }
+        func retain(_ node: DiskNode) {
+            guard resultLimit > 0 else { return }
+            if result.count < resultLimit {
+                result.append(node); var child = result.count - 1
+                while child > 0 { let parent = (child - 1) / 2; if !worse(result[child], result[parent]) { break }; result.swapAt(child, parent); child = parent }
+            } else if worse(result[0], node) {
+                result[0] = node; var parent = 0
+                while true { let left = parent * 2 + 1; if left >= result.count { break }; let right = left + 1; let child = right < result.count && worse(result[right], result[left]) ? right : left; if !worse(result[child], result[parent]) { break }; result.swapAt(child, parent); parent = child }
+            }
+            if removals.isEmpty && result.count == resultLimit { worstID = result[0].id }
+        }
+        while try statement.step() {
+            if scanned & 255 == 0 { try Task.checkCancellation(); try check(cancellation) }; scanned += 1
+            guard let path = statement.text(0), let name = statement.text(1), statement.integer(5) >= 0,
+                  statement.integer(6) >= 0, statement.integer(7) >= 0, statement.integer(8) >= 0 else {
+                throw DiskIndexError.invalid("A staged disk index entry is damaged.")
+            }
+            if removals.isEmpty {
+                count += 1
+                if resultLimit == 0 || (result.count == resultLimit && statement.integer(5) < result[0].size) { continue }
+            }
+            let directory = statement.integer(2) != 0
+            let url = URL(fileURLWithPath: path, isDirectory: directory)
+            if removals.isEmpty, result.count == resultLimit, resultLimit > 0,
+               statement.integer(5) == result[0].size,
+               !url.path.utf8.lexicographicallyPrecedes(worstID.utf8) {
+                #if ORBIT_TESTING
+                Self.testEqualSizeSearchSkip?()
+                #endif
+                continue
+            }
+            let state: NodeScanState = !directory ? (statement.integer(12) == 0 ? .complete : .pending)
+                : (statement.integer(10) == 0 ? .complete : (statement.integer(11) == 0 ? .pending : .scanning))
+            let raw = DiskNode(url: url, name: name,
+                isDirectory: directory, isSymbolicLink: statement.integer(3) != 0, size: statement.integer(5),
+                allocatedSize: statement.integer(6), fileCount: Int(statement.integer(7)), isAccessible: statement.integer(4) != 0,
+                rawAllocatedSize: statement.integer(8), fileIdentity: statement.text(9), scanState: state)
+            if removals.isEmpty { retain(raw) }
+            else if let node = try projection.apply(raw, cancellation: cancellation) { count += 1; retain(node) }
+        }
+        result.sort { worse($1, $0) }
+        try Task.checkCancellation()
+        try check(cancellation)
+        return (result, count, revision, false)
+    }
+
+    // All rows in the returned partial view come from one read transaction.
+    public func stagedView(path: String?, snapshot: IndexSnapshot, revision: UInt64,
+                           removals: [ScanRemoval] = [], cancellation: ScanCancellation? = nil) throws -> ScanPreviewView? {
+        try check(cancellation)
+        let db = try open(snapshot, cancellation: cancellation)
+        try db.execute("BEGIN")
+        defer { try? db.execute("ROLLBACK") }
+        let columns = "n.path,n.name,n.is_dir,n.is_link,n.accessible,n.size,n.allocated,n.file_count,n.raw_alloc,n.file_identity,COALESCE(d.pending,0),CASE WHEN e.value IS NULL THEN 0 ELSE 1 END,COALESCE(pd.pending,0)"
+        let from = " FROM nodes n LEFT JOIN directories d ON d.path=CAST(n.path AS BLOB) LEFT JOIN epochs e ON e.parent=d.path LEFT JOIN nodes p ON p.id=n.parent LEFT JOIN directories pd ON pd.path=CAST(p.path AS BLOB)"
+        func rows(_ query: IndexStatement) throws -> [DiskNode] {
+            var nodes: [DiskNode] = []
+            while try query.step() {
+                if nodes.count & 255 == 0 { try check(cancellation) }
+                guard let path = query.text(0), let name = query.text(1), query.integer(5) >= 0,
+                      query.integer(6) >= 0, query.integer(7) >= 0, query.integer(8) >= 0 else {
+                    throw DiskIndexError.invalid("A staged disk index entry is damaged.")
+                }
+                let isDirectory = query.integer(2) != 0
+                let state: NodeScanState = !isDirectory ? (query.integer(12) == 0 ? .complete : .pending)
+                    : (query.integer(10) == 0 ? .complete : (query.integer(11) == 0 ? .pending : .scanning))
+                nodes.append(DiskNode(url: URL(fileURLWithPath: path, isDirectory: isDirectory), name: name,
+                    isDirectory: isDirectory, isSymbolicLink: query.integer(3) != 0, size: query.integer(5),
+                    allocatedSize: query.integer(6), fileCount: Int(query.integer(7)), isAccessible: query.integer(4) != 0,
+                    rawAllocatedSize: query.integer(8), fileIdentity: query.text(9), scanState: state))
+            }
+            return nodes
+        }
+        let one = try db.statement("SELECT \(columns)\(from) WHERE n.path=?")
+        func node(_ path: String) throws -> DiskNode? {
+            try one.bind([.text(path)])
+            let found = try rows(one).first
+            try one.reset()
+            return found
+        }
+        let rootPath = snapshot.rootURL.path
+        let target = path.map { Self.path(URL(fileURLWithPath: $0)) } ?? rootPath
+        let rootBytes = Array(rootPath.utf8), targetBytes = Array(target.utf8)
+        guard targetBytes == rootBytes || (rootBytes == [47] && targetBytes.first == 47)
+                || (targetBytes.count > rootBytes.count && targetBytes.starts(with: rootBytes) && targetBytes[rootBytes.count] == 47),
+              let root = try node(rootPath), let rawFolder = try node(target), rawFolder.isDirectory else { return nil }
+        let childrenQuery = try db.statement("SELECT \(columns)\(from) WHERE n.parent=(SELECT id FROM nodes WHERE path=?) ORDER BY n.size DESC,n.name LIMIT ?")
+        func children(_ parent: String, limit: Int) throws -> [DiskNode] {
+            try childrenQuery.bind([.text(parent), .integer(Int64(limit))])
+            let found = try rows(childrenQuery)
+            try childrenQuery.reset()
+            return found
+        }
+        var budget = 2_000
+        func hydrate(_ entry: DiskNode, depth: Int) throws -> DiskNode {
+            guard entry.isDirectory, depth < 4, budget > 0 else { return entry }
+            let childNodes = try children(entry.id, limit: min(96, budget))
+            budget -= childNodes.count
+            let hydrated = try childNodes.map { try hydrate($0, depth: depth + 1) }
+            return DiskNode(url: entry.url, name: entry.name, isDirectory: true, isSymbolicLink: entry.isSymbolicLink,
+                size: entry.size, allocatedSize: entry.allocatedSize, fileCount: entry.fileCount, children: hydrated,
+                isAccessible: entry.isAccessible, rawAllocatedSize: entry.rawAllocatedSize,
+                fileIdentity: entry.fileIdentity, scanState: entry.scanState)
+        }
+        let direct = try children(target, limit: Int.max)
+        let hydrated = try direct.map { try hydrate($0, depth: 1) }
+        let folder = DiskNode(url: rawFolder.url, name: rawFolder.name, isDirectory: true,
+            isSymbolicLink: rawFolder.isSymbolicLink, size: rawFolder.size, allocatedSize: rawFolder.allocatedSize,
+            fileCount: rawFolder.fileCount, children: hydrated, isAccessible: rawFolder.isAccessible,
+            rawAllocatedSize: rawFolder.rawAllocatedSize, fileIdentity: rawFolder.fileIdentity, scanState: rawFolder.scanState)
+        var ancestors = [folder], current = target
+        while Array(current.utf8) != rootBytes {
+            let parent = URL(fileURLWithPath: current).deletingLastPathComponent().path
+            guard Array(parent.utf8) != Array(current.utf8), let item = try node(parent) else { return nil }
+            ancestors.append(item); current = parent
+        }
+        let token = cancellation ?? ScanCancellation()
+        let source = try stagedRemovalSources(removals, db: db, cancellation: token)
+        let projection = try DiskRemovalProjection(removals: removals, source: source, cancellation: token)
+        guard let projectedFolder = try projection.apply(folder, cancellation: token), let projectedRoot = try projection.apply(root, cancellation: token) else { return nil }
+        let projectedAncestors = try ancestors.reversed().compactMap { try projection.apply($0, cancellation: token) }
+        guard projectedAncestors.count == ancestors.count else { return nil }
+        try check(cancellation)
+        return ScanPreviewView(root: targetBytes == rootBytes ? projectedFolder : projectedRoot, folder: projectedFolder, ancestors: projectedAncestors,
+                               revision: revision, isListing: rawFolder.scanState != .complete)
+    }
+
+    private func stagedRemovalSources(_ removals: [ScanRemoval], db: IndexDatabase,
+                                      cancellation: ScanCancellation) throws -> [DiskNode] {
+        guard !removals.isEmpty else { return [] }
+        try db.execute("CREATE TEMP TABLE stage_removal_paths(path TEXT NOT NULL,identity TEXT NOT NULL,PRIMARY KEY(path,identity)) WITHOUT ROWID")
+        let insert = try db.statement("INSERT OR IGNORE INTO stage_removal_paths VALUES(?,?)")
+        for removal in removals {
+            try check(cancellation)
+            try insert.bind([.text(removal.path), .text(removal.identity)])
+            _ = try insert.step(); try insert.reset()
+        }
+        let columns = "n.path,n.name,n.is_dir,n.is_link,n.accessible,n.size,n.allocated,n.file_count,n.raw_alloc,n.file_identity"
+        let query = try db.statement("SELECT " + columns + " FROM stage_removal_paths r JOIN nodes n ON n.path=r.path AND n.file_identity=r.identity")
+        return try readNodes(query, cancellation: cancellation)
+    }
+
+    public func loadFolder(path: String, snapshot: IndexSnapshot, cancellation: ScanCancellation? = nil) throws -> DiskNode {
+        try check(cancellation)
+        let db = try open(snapshot, cancellation: cancellation)
         let path = Self.path(URL(fileURLWithPath: path))
-        guard let folder = try readNode(path, db: db), folder.isDirectory else {
+        let candidate = try readNode(path, db: db)
+        try check(cancellation)
+        guard let folder = candidate, folder.isDirectory else {
             throw DiskIndexError.invalid("This folder is no longer in the index.")
         }
         var budget = 2_000
-        let children = try readChildren(path, limit: nil, db: db).map { try preview($0, depth: 1, budget: &budget, db: db) }
+        let previewQuery = try db.statement("SELECT \(Self.nodeColumns) FROM nodes WHERE parent=(SELECT id FROM nodes WHERE path=?) ORDER BY size DESC,name LIMIT ?")
+        let directChildren = try readChildren(path, limit: nil, db: db)
+        var children: [DiskNode] = []
+        children.reserveCapacity(directChildren.count)
+        for (index, child) in directChildren.enumerated() {
+            if index & 255 == 0 { try check(cancellation) }
+            children.append(try preview(child, depth: 1, budget: &budget, query: previewQuery))
+        }
+        try check(cancellation)
         return replacingChildren(folder, children)
     }
 
-    public func node(path: String, snapshot: IndexSnapshot) throws -> DiskNode? {
-        try readNode(Self.path(URL(fileURLWithPath: path)), db: open(snapshot))
+    public func node(path: String, snapshot: IndexSnapshot, cancellation: ScanCancellation? = nil) throws -> DiskNode? {
+        try check(cancellation)
+        let node = try readNode(Self.path(URL(fileURLWithPath: path)), db: open(snapshot, cancellation: cancellation))
+        try check(cancellation)
+        return node
     }
 
-    public func ancestors(path: String, snapshot: IndexSnapshot) throws -> [DiskNode] {
-        let db = try open(snapshot)
+    public func ancestors(path: String, snapshot: IndexSnapshot, cancellation: ScanCancellation? = nil) throws -> [DiskNode] {
+        try check(cancellation)
+        let db = try open(snapshot, cancellation: cancellation)
+        try check(cancellation)
         var path = Self.path(URL(fileURLWithPath: path))
         guard Self.contains(path, in: snapshot.rootURL.path) else { return [] }
         var result: [DiskNode] = []
         while let node = try readNode(path, db: db) {
+            try check(cancellation)
             result.append(node)
             if path == snapshot.rootURL.path { break }
             let parent = URL(fileURLWithPath: path).deletingLastPathComponent().path
             if parent == path { break }
             path = parent
         }
+        try check(cancellation)
         return result.reversed()
     }
 
     public func search(query: String, snapshot: IndexSnapshot, limit: Int = 300,
-                       cancellation: ScanCancellation = ScanCancellation()) throws -> IndexSearchResult {
+                       cancellation: ScanCancellation = ScanCancellation(), stablePathOrder: Bool = false,
+                       removals: [ScanRemoval] = []) throws -> IndexSearchResult {
         try check(cancellation)
         let needle = Self.fold(query.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !needle.isEmpty else { return IndexSearchResult(nodes: [], totalCount: 0) }
         let db = try open(snapshot, cancellation: cancellation)
+        if !removals.isEmpty {
+            return try projectedSearch(needle: needle, limit: limit, stablePathOrder: stablePathOrder,
+                                       removals: removals, db: db, cancellation: cancellation)
+        }
         let values: [IndexValue] = [.text(needle)]
         let count = try db.integer("SELECT COUNT(*) FROM nodes WHERE parent IS NOT NULL AND instr(search_name,?)>0", values)
-        let nodes = try readNodes("SELECT \(Self.nodeColumns) FROM nodes WHERE parent IS NOT NULL AND instr(search_name,?)>0 ORDER BY size DESC,id LIMIT ?",
-                                  values + [.integer(Int64(max(0, min(limit, 10_000))))], db: db)
+        try check(cancellation)
+        let resultLimit = max(0, min(limit, 10_000))
+        guard count > 0, resultLimit > 0 else {
+            return IndexSearchResult(nodes: [], totalCount: Int(count))
+        }
+        let order = stablePathOrder ? "size DESC,path COLLATE BINARY" : "size DESC,id"
+        let nodes = try readNodes("SELECT \(Self.nodeColumns) FROM nodes WHERE parent IS NOT NULL AND instr(search_name,?)>0 ORDER BY \(order) LIMIT ?",
+                                  values + [.integer(Int64(resultLimit))], db: db)
+        try check(cancellation)
+        return IndexSearchResult(nodes: nodes, totalCount: Int(count))
+    }
+
+    private func projectedSearch(needle: String, limit: Int, stablePathOrder: Bool, removals: [ScanRemoval],
+                                 db: IndexDatabase, cancellation: ScanCancellation) throws -> IndexSearchResult {
+        try db.execute("BEGIN")
+        try db.execute("CREATE TEMP TABLE removal_paths(path TEXT NOT NULL, identity TEXT NOT NULL, PRIMARY KEY(path,identity)) WITHOUT ROWID")
+        let removalInsert = try db.statement("INSERT OR IGNORE INTO removal_paths VALUES(?,?)")
+        for removal in removals {
+            try check(cancellation)
+            try removalInsert.bind([.text(removal.path), .text(removal.identity)])
+            _ = try removalInsert.step(); try removalInsert.reset()
+        }
+        let sourceColumns = "n.path,n.name,n.is_dir,n.is_link,n.accessible,n.size,n.allocated,n.file_count,n.raw_alloc,n.file_identity"
+        let source = try readNodes("SELECT " + sourceColumns + " FROM removal_paths r JOIN nodes n ON n.path=r.path AND n.file_identity=r.identity", [], db: db)
+        let projection = try DiskRemovalProjection(removals: removals, source: source, cancellation: cancellation)
+        try db.execute("CREATE TEMP TABLE hidden_nodes(id INTEGER PRIMARY KEY) WITHOUT ROWID")
+        try db.execute("""
+            INSERT INTO hidden_nodes
+            WITH RECURSIVE hidden(id) AS (
+                SELECT n.id FROM nodes n JOIN removal_paths r ON n.path=r.path AND n.file_identity=r.identity
+                UNION SELECT child.id FROM nodes child JOIN hidden h ON child.parent=h.id
+            ) SELECT id FROM hidden
+            """)
+        try db.execute("CREATE TEMP TABLE adjustments(path TEXT PRIMARY KEY, size INTEGER, allocated INTEGER, count INTEGER) WITHOUT ROWID")
+        let adjustmentInsert = try db.statement("INSERT INTO adjustments VALUES(?,?,?,?)")
+        for (path, delta) in projection.indexedDeltas {
+            try check(cancellation)
+            try adjustmentInsert.bind([.text(path), .integer(delta.size), .integer(delta.allocated), .integer(Int64(delta.count))])
+            _ = try adjustmentInsert.step(); try adjustmentInsert.reset()
+        }
+        try db.execute("COMMIT")
+        let from = "FROM nodes n LEFT JOIN adjustments a ON n.path=a.path WHERE n.parent IS NOT NULL AND instr(n.search_name,?)>0 AND NOT EXISTS (SELECT 1 FROM hidden_nodes h WHERE h.id=n.id) AND n.size>=COALESCE(a.size,0) AND n.allocated>=COALESCE(a.allocated,0) AND n.file_count>=COALESCE(a.count,0)"
+        let count = try db.integer("SELECT COUNT(*) " + from, [.text(needle)])
+        try check(cancellation)
+        let resultLimit = max(0, min(limit, 10_000))
+        guard count > 0, resultLimit > 0 else { return IndexSearchResult(nodes: [], totalCount: Int(count)) }
+        let columns = "n.path,n.name,n.is_dir,n.is_link,n.accessible,n.size-COALESCE(a.size,0),n.allocated-COALESCE(a.allocated,0),n.file_count-COALESCE(a.count,0),n.raw_alloc,n.file_identity"
+        let tie = stablePathOrder ? "n.path COLLATE BINARY" : "n.id"
+        let nodes = try readNodes("SELECT " + columns + " " + from + " ORDER BY 6 DESC," + tie + " LIMIT ?",
+                                  [.text(needle), .integer(Int64(resultLimit))], db: db)
         try check(cancellation)
         return IndexSearchResult(nodes: nodes, totalCount: Int(count))
     }
 
     public func invalidate(for root: URL) throws {
+        try FileManager.default.createDirectory(at: lockDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let rootLease = try RootMutationLease(directory: lockDirectory, root: root)
+        defer { withExtendedLifetime(rootLease) {} }
         Self.mutationLock.lock()
         defer { Self.mutationLock.unlock() }
+        try rootLease.validate()
+        try rootLease.invalidateGeneration()
+        var cacheInfo = stat()
+        if lstat(directory.path, &cacheInfo) != 0 {
+            guard errno == ENOENT else { throw DiskIndexError.database(String(cString: strerror(errno))) }
+            return
+        }
+        try IndexLocations.validateCache(directory)
         let url = databaseURL(for: root)
         if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
     }
@@ -253,8 +670,29 @@ public struct DiskIndexStore: Sendable {
     private static func contains(_ path: String, in root: String) -> Bool {
         path == root || root == "/" || path.hasPrefix(root + "/")
     }
-    private func check(_ cancellation: ScanCancellation) throws {
+    package static func validateReplacementPaths(_ paths: [String], root: String, cancellation: ScanCancellation) throws {
         if cancellation.isCancelled { throw CancellationError() }
+        var all = Set<String>()
+        all.reserveCapacity(paths.count)
+        for (index, path) in paths.enumerated() {
+            if index & 255 == 0, cancellation.isCancelled { throw CancellationError() }
+            guard contains(path, in: root) else { throw DiskIndexError.invalid("An updated folder is outside the index.") }
+            guard all.insert(path).inserted else { throw DiskIndexError.invalid("Updated folders overlap. Combine their refreshes first.") }
+        }
+        for (index, path) in paths.enumerated() {
+            if index & 255 == 0, cancellation.isCancelled { throw CancellationError() }
+            let bytes = Array(path.utf8)
+            for offset in bytes.indices where bytes[offset] == 47 && offset > 0 {
+                let prefix = String(decoding: bytes[..<offset], as: UTF8.self)
+                if let match = all.firstIndex(of: prefix), contains(path, in: all[match]) {
+                    throw DiskIndexError.invalid("Updated folders overlap. Combine their refreshes first.")
+                }
+            }
+            if path != "/", all.contains("/") { throw DiskIndexError.invalid("Updated folders overlap. Combine their refreshes first.") }
+        }
+    }
+    private func check(_ cancellation: ScanCancellation?) throws {
+        if cancellation?.isCancelled == true { throw CancellationError() }
     }
     private func subtreePredicate(_ path: String) -> (sql: String, values: [IndexValue]) {
         path == "/" ? ("1", []) : ("path=? OR (path>=? AND path<?)", [.text(path), .text(path + "/"), .text(path + "0")])
@@ -308,9 +746,21 @@ public struct DiskIndexStore: Sendable {
         while let (node, parent, parentID) = pending.popLast() {
             try check(cancellation)
             let path = Self.path(node.url)
-            guard node.size >= 0, node.allocatedSize >= 0, node.fileCount >= 0,
-                  parent == nil || URL(fileURLWithPath: path, isDirectory: node.isDirectory).deletingLastPathComponent().path == parent else {
+            guard node.size >= 0, node.allocatedSize >= 0, node.fileCount >= 0 else {
                 throw DiskIndexError.invalid("A scanned file has invalid metadata or parentage.")
+            }
+            if let parent {
+                let bytes = path.utf8
+                let simple = bytes.first == 47 && (bytes.count == 1 || bytes.last != 47)
+                    && !path.hasSuffix("/.") && !path.hasSuffix("/..")
+                    && !zip(bytes, bytes.dropFirst()).contains { $0 == 47 && $1 == 47 }
+                let validParent: Bool
+                if simple, let slash = bytes.lastIndex(of: 47) {
+                    validParent = slash == path.startIndex ? parent == "/" : path[..<slash] == parent
+                } else {
+                    validParent = URL(fileURLWithPath: path, isDirectory: node.isDirectory).deletingLastPathComponent().path == parent
+                }
+                guard validParent else { throw DiskIndexError.invalid("A scanned file has invalid metadata or parentage.") }
             }
             try statement.bind([.text(path), parentID.map(IndexValue.integer) ?? .null, .text(node.name), .text(Self.fold(node.name)),
                                 .integer(node.isDirectory ? 1 : 0), .integer(node.isSymbolicLink ? 1 : 0),
@@ -333,8 +783,12 @@ public struct DiskIndexStore: Sendable {
     private func readNodes(_ sql: String, _ values: [IndexValue], db: IndexDatabase) throws -> [DiskNode] {
         let statement = try db.statement(sql)
         try statement.bind(values)
+        return try readNodes(statement)
+    }
+    private func readNodes(_ statement: IndexStatement, cancellation: ScanCancellation? = nil) throws -> [DiskNode] {
         var nodes: [DiskNode] = []
         while try statement.step() {
+            if nodes.count & 255 == 0 { try check(cancellation) }
             guard let path = statement.text(0), let name = statement.text(1), statement.integer(5) >= 0,
                   statement.integer(6) >= 0, statement.integer(7) >= 0, statement.integer(8) >= 0 else {
                 throw DiskIndexError.invalid("A disk index entry is damaged.")
@@ -348,11 +802,13 @@ public struct DiskIndexStore: Sendable {
         }
         return nodes
     }
-    private func preview(_ node: DiskNode, depth: Int, budget: inout Int, db: IndexDatabase) throws -> DiskNode {
+    private func preview(_ node: DiskNode, depth: Int, budget: inout Int, query: IndexStatement) throws -> DiskNode {
         guard node.isDirectory, depth < 4, budget > 0 else { return node }
-        let children = try readChildren(node.id, limit: min(96, budget), db: db)
+        try query.bind([.text(node.id), .integer(Int64(min(96, budget)))])
+        let children = try readNodes(query)
+        try query.reset()
         budget -= children.count
-        let hydrated = try children.map { try preview($0, depth: depth + 1, budget: &budget, db: db) }
+        let hydrated = try children.map { try preview($0, depth: depth + 1, budget: &budget, query: query) }
         return replacingChildren(node, hydrated)
     }
     private func replacingChildren(_ node: DiskNode, _ children: [DiskNode]) -> DiskNode {
@@ -361,8 +817,9 @@ public struct DiskIndexStore: Sendable {
                  isAccessible: node.isAccessible, rawAllocatedSize: node.rawAllocatedSize, fileIdentity: node.fileIdentity)
     }
     private func publish(_ temporary: URL, to destination: URL, cancellation: ScanCancellation) throws {
-        try check(cancellation)
-        guard rename(temporary.path, destination.path) == 0 else { throw DiskIndexError.database(String(cString: strerror(errno))) }
+        try cancellation.commitIfNotCancelled {
+            guard rename(temporary.path, destination.path) == 0 else { throw DiskIndexError.database(String(cString: strerror(errno))) }
+        }
     }
     private func removeTemporary(_ url: URL) {
         for suffix in ["", "-journal", "-wal", "-shm"] { try? FileManager.default.removeItem(atPath: url.path + suffix) }
@@ -376,6 +833,30 @@ private enum IndexValue {
 private final class IndexDatabase {
     private(set) var handle: OpaquePointer?
     let cancellation: ScanCancellation?
+    private var checksTaskCancellation = false
+
+    func checkTaskCancellation() {
+        guard let cancellation else { return }
+        checksTaskCancellation = true
+        sqlite3_progress_handler(handle, 1_000, { pointer in
+            guard let pointer else { return 0 }
+            #if ORBIT_TESTING
+            DiskIndexStore.testSearchSQLiteProgress?()
+            #endif
+            return Unmanaged<ScanCancellation>.fromOpaque(pointer).takeUnretainedValue().isCancelled || Task<Never, Never>.isCancelled ? 1 : 0
+        }, Unmanaged.passUnretained(cancellation).toOpaque())
+    }
+
+    func registerHardLinkOrder() throws {
+        let status = sqlite3_create_collation(handle, "ORBIT_HARDLINK_ORDER", SQLITE_UTF8, nil) { _, leftCount, leftBytes, rightCount, rightBytes in
+            guard let leftBytes, let rightBytes else { return 0 }
+            let left = Data(bytes: leftBytes, count: Int(leftCount)), right = Data(bytes: rightBytes, count: Int(rightCount))
+            if HardLinkPathOrder.precedes(left, right) { return -1 }
+            if HardLinkPathOrder.precedes(right, left) { return 1 }
+            return 0
+        }
+        guard status == SQLITE_OK else { throw DiskIndexError.database("Could not prepare hard-link ordering.") }
+    }
 
     init(_ url: URL, writable: Bool, cancellation: ScanCancellation? = nil) throws {
         self.cancellation = cancellation
@@ -397,7 +878,7 @@ private final class IndexDatabase {
     }
     deinit { if let handle { sqlite3_close_v2(handle) } }
     func error() -> Error {
-        if cancellation?.isCancelled == true { return CancellationError() }
+        if cancellation?.isCancelled == true || (checksTaskCancellation && Task<Never, Never>.isCancelled) { return CancellationError() }
         return DiskIndexError.database(handle.map { String(cString: sqlite3_errmsg($0)) } ?? "The disk index is closed.")
     }
     func close() throws {
@@ -419,13 +900,6 @@ private final class IndexDatabase {
         try statement.bind(values)
         guard try statement.step() else { throw DiskIndexError.invalid("The disk index is missing metadata.") }
         return statement.integer(0)
-    }
-    func strings(_ sql: String, _ values: [IndexValue]) throws -> [String] {
-        let statement = try statement(sql)
-        try statement.bind(values)
-        var result: [String] = []
-        while try statement.step() { if let value = statement.text(0) { result.append(value) } }
-        return result
     }
 }
 

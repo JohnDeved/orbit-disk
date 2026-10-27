@@ -77,11 +77,17 @@ let policyChecks: [(String, (TrashPolicyTests) throws -> Void)] = [
 ]
 for (name, check) in policyChecks { run(name, make: TrashPolicyTests.init, check: check) }
 let indexChecks: [(String, (DiskIndexStoreTests) throws -> Void)] = [
+    ("Index replacement paths reject overlaps and remain cancellable", { try $0.testReplacementPathValidation() }),
     ("Index persistence and lazy folder queries", { try $0.testRoundTripAndLazyFolderQueries() }),
+    ("Index parent validation and atomic preservation", { try $0.testParentValidationPreservesSnapshot() }),
+    ("Index preview across empty and nested folders", { try $0.testPreviewReusesQueryAcrossEmptyAndNestedFolders() }),
     ("Index literal search and ancestors", { try $0.testLiteralSearchAndAncestors() }),
     ("Index atomic cancellation and corrupt cache recovery", { try $0.testCancellationFailureAndInvalidCachesPreserveSnapshot() }),
     ("Index incremental create, delete, rename and totals", { try $0.testIncrementalCreateDeleteRenameAndTotals() }),
-    ("Index incremental hard links across subtrees", { try $0.testIncrementalCrossSubtreeHardLinks() })
+    ("Index incremental hard links across subtrees", { try $0.testIncrementalCrossSubtreeHardLinks() }),
+    ("Index incremental hard links recalculate nested ancestors", { try $0.testIncrementalHardLinksRecalculateNestedAncestors() }),
+    ("Index mixed hard-link batches match a full scan", { try $0.testIncrementalMixedHardLinkBatchMatchesFullScan() }),
+    ("Index interrupted incremental update preserves snapshot", { try $0.testInterruptedIncrementalUpdatePreservesSnapshot() })
 ]
 for (name, check) in indexChecks { run(name, make: DiskIndexStoreTests.init, check: check) }
 print("\(completed) checks, \(failures) failures")

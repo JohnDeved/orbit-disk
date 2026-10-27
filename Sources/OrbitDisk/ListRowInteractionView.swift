@@ -5,6 +5,7 @@ import OrbitCore
 struct ListRowInteractionView: NSViewRepresentable {
     let node: DiskNode
     var trailingExclusion: CGFloat = 0
+    var contentWidth: CGFloat?
     let onSelect: (DiskNode) -> Void
     let onOpen: (DiskNode) -> Void
     let makeDrag: ([DiskNode], String) -> NSPasteboardItem?
@@ -29,7 +30,7 @@ struct ListRowInteractionView: NSViewRepresentable {
 final class ListRowInteractionNSView: NSView, NSDraggingSource {
     var interaction: ListRowInteractionView? {
         didSet {
-            if oldValue?.trailingExclusion != interaction?.trailingExclusion {
+            if oldValue?.trailingExclusion != interaction?.trailingExclusion || oldValue?.contentWidth != interaction?.contentWidth {
                 window?.invalidateCursorRects(for: self)
             }
         }
@@ -53,9 +54,14 @@ final class ListRowInteractionNSView: NSView, NSDraggingSource {
         if window == nil { cancelInteraction(deferNotification: true) }
     }
 
-    private var interactionBounds: NSRect {
-        NSRect(x: bounds.minX, y: bounds.minY,
-               width: max(0, bounds.width - (interaction?.trailingExclusion ?? 0)), height: bounds.height)
+    private var excludedBounds: NSRect {
+        let end = max(bounds.minX, min(bounds.maxX, bounds.minX + (interaction?.contentWidth ?? bounds.width)))
+        let start = max(bounds.minX, end - (interaction?.trailingExclusion ?? 0))
+        return NSRect(x: start, y: bounds.minY, width: end - start, height: bounds.height)
+    }
+
+    private func containsInteractionPoint(_ point: NSPoint) -> Bool {
+        bounds.contains(point) && !excludedBounds.contains(point)
     }
 
     static func isContextClick(_ event: NSEvent?) -> Bool {
@@ -66,14 +72,17 @@ final class ListRowInteractionNSView: NSView, NSDraggingSource {
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard !Self.isContextClick(NSApp.currentEvent),
-              interactionBounds.contains(convert(point, from: superview)) else { return nil }
+              containsInteractionPoint(convert(point, from: superview)) else { return nil }
         return self
     }
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        let rect = interactionBounds.intersection(visibleRect)
-        if !rect.isEmpty { addCursorRect(rect, cursor: .pointingHand) }
+        let excluded = excludedBounds
+        let left = NSRect(x: bounds.minX, y: bounds.minY, width: excluded.minX - bounds.minX, height: bounds.height).intersection(visibleRect)
+        let right = NSRect(x: excluded.maxX, y: bounds.minY, width: bounds.maxX - excluded.maxX, height: bounds.height).intersection(visibleRect)
+        if !left.isEmpty { addCursorRect(left, cursor: .pointingHand) }
+        if !right.isEmpty { addCursorRect(right, cursor: .pointingHand) }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -84,7 +93,7 @@ final class ListRowInteractionNSView: NSView, NSDraggingSource {
         }
         guard let interaction else { return }
         let point = convert(event.locationInWindow, from: nil)
-        guard interactionBounds.contains(point) else { return }
+        guard containsInteractionPoint(point) else { return }
         pressedNode = interaction.node
         pressedEvent = event
         pressedPoint = point
@@ -111,7 +120,7 @@ final class ListRowInteractionNSView: NSView, NSDraggingSource {
 
         let preview = dragPreview(for: pressedNode)
         let item = NSDraggingItem(pasteboardWriter: pasteboardItem)
-        let origin = CGPoint(x: min(max(0, pressedPoint.x + 12), max(0, interactionBounds.width - preview.size.width)),
+        let origin = CGPoint(x: min(max(0, pressedPoint.x + 12), max(0, bounds.width - preview.size.width)),
                              y: min(max(0, pressedPoint.y - preview.size.height / 2), max(0, bounds.height - preview.size.height)))
         item.setDraggingFrame(NSRect(origin: origin, size: preview.size), contents: preview)
         isDragging = true
@@ -125,7 +134,7 @@ final class ListRowInteractionNSView: NSView, NSDraggingSource {
         defer { resetPress(); finishInteraction() }
         guard !movedBeyondClick, let pressedNode, let pressedEvent, let interaction,
               pressedNode.id == interaction.node.id,
-              interactionBounds.contains(convert(event.locationInWindow, from: nil)) else { return }
+              containsInteractionPoint(convert(event.locationInWindow, from: nil)) else { return }
         lastClick = (pressedNode.id, pressedEvent.timestamp)
         if opensOnMouseUp { interaction.onOpen(pressedNode) }
     }
@@ -191,7 +200,7 @@ final class ListRowInteractionNSView: NSView, NSDraggingSource {
     }
 
     private func dragPreview(for node: DiskNode) -> NSImage {
-        let size = NSSize(width: min(240, interactionBounds.width), height: min(56, bounds.height))
+        let size = NSSize(width: min(240, bounds.width), height: min(56, bounds.height))
         return NSImage(size: size, flipped: false) { rect in
             NSColor(calibratedWhite: 0.14, alpha: 0.98).setFill()
             let background = NSBezierPath(roundedRect: rect.insetBy(dx: 1, dy: 1), xRadius: 7, yRadius: 7)

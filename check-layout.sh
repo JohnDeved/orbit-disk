@@ -1,23 +1,26 @@
 #!/bin/zsh
 set -euo pipefail
 cd "${0:A:h}"
-swift build -c release --target OrbitCore
-build_path=$(swift build -c release --show-bin-path)
 checks_path="$PWD/.build/layout-checks"
-mkdir -p "$checks_path"
+build_path="$checks_path/core"
+mkdir -p "$build_path"
+target="$(uname -m)-apple-macosx14.0"
+swiftc -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
+  -emit-library -emit-module -module-name OrbitCore -I Sources/CSQLite \
+  Sources/OrbitCore/*.swift -o "$build_path/libOrbitCore.dylib"
 python3 Tests/OrbitLayoutChecks/make-probes.py "$checks_path/ContentView.swift"
 app_sources=(Sources/OrbitDisk/*.swift)
 app_sources=(${app_sources:#*/ContentView.swift})
 app_sources=(${app_sources:#*/FileRowView.swift})
 app_sources=(${app_sources:#*/OrbitDiskApp.swift})
 app_sources=(${app_sources:#*/AppUpdater.swift})
-swiftc -parse-as-library -O -swift-version 5 \
-  -target "$(uname -m)-apple-macosx14.0" \
+swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
   -module-cache-path "$PWD/.build/module-cache" \
-  -I "$build_path/Modules" -I Sources/CSQLite \
+  -I "$build_path" -I Sources/CSQLite -L "$build_path" -lOrbitCore \
+  -Xlinker -rpath -Xlinker "$build_path" \
   "${app_sources[@]}" "$checks_path/ContentView.swift" "$checks_path/FileRowView.swift" \
   Tests/OrbitLayoutChecks/LayoutChecks.swift \
-  "$build_path/OrbitCore.build/"*.swift.o -o "$checks_path/OrbitLayoutChecks"
+  -o "$checks_path/OrbitLayoutChecks"
 # Collection policy rejects hidden ancestors such as .build.
 temp_root=${TMPDIR:-/tmp}
 fixture=$(mktemp -d "${temp_root%/}/OrbitLayoutChecks.XXXXXX")

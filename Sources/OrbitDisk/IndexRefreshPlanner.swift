@@ -2,7 +2,26 @@ import Darwin
 import Foundation
 import OrbitCore
 
-func refreshDirectories(_ paths: Set<String>, store: DiskIndexStore, snapshot: IndexSnapshot) throws -> [String] {
+struct RefreshIndexMetadataCache {
+    private var indexed: [Data: (isDirectory: Bool, isAccessible: Bool)] = [:]
+    private var missing = Set<Data>()
+
+    mutating func lookup(_ path: String, read: () throws -> (isDirectory: Bool, isAccessible: Bool)?) rethrows -> (isDirectory: Bool, isAccessible: Bool)? {
+        let key = Data(path.utf8)
+        if let value = indexed[key] { return value }
+        if missing.contains(key) { return nil }
+        guard let value = try read() else { missing.insert(key); return nil }
+        indexed[key] = value
+        return value
+    }
+}
+
+func refreshDirectories(_ paths: Set<String>, store: DiskIndexStore, snapshot: IndexSnapshot,
+                        cancellation: ScanCancellation? = nil) throws -> [String] {
+    func checkCancellation() throws {
+        if Task.isCancelled || cancellation?.isCancelled == true { throw CancellationError() }
+    }
+    try checkCancellation()
     let root = snapshot.rootURL.standardizedFileURL.path
     let canonicalRoot = snapshot.rootURL.resolvingSymlinksInPath().path
     var rootInfo = stat()
@@ -23,12 +42,23 @@ func refreshDirectories(_ paths: Set<String>, store: DiskIndexStore, snapshot: I
         return withUnsafeBytes(of: &name) { String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self)) }
     }
 
+    // Index metadata is immutable for a snapshot; filesystem checks still run for each path.
+    var cache = RefreshIndexMetadataCache()
+    func indexedNode(_ path: String) throws -> (isDirectory: Bool, isAccessible: Bool)? {
+        try checkCancellation()
+        return try cache.lookup(path) {
+            guard let node = try store.node(path: path, snapshot: snapshot, cancellation: cancellation) else { return nil }
+            return (isDirectory: node.isDirectory, isAccessible: node.isAccessible)
+        }
+    }
+
     var candidates = Set<String>()
     for original in paths {
+        try checkCancellation()
         let original = URL(fileURLWithPath: original).standardizedFileURL.path
         guard contains(original, in: root) else { continue }
         var candidate = original
-        while try store.node(path: candidate, snapshot: snapshot)?.isDirectory != true {
+        while try indexedNode(candidate)?.isDirectory != true {
             guard candidate != root else { throw ScanError.filesystem(root, ENOENT) }
             candidate = parent(candidate)
         }
@@ -40,7 +70,7 @@ func refreshDirectories(_ paths: Set<String>, store: DiskIndexStore, snapshot: I
             current = parent(current)
         }
         for path in ancestors.reversed() {
-            if try store.node(path: path, snapshot: snapshot)?.isAccessible == false {
+            if try indexedNode(path)?.isAccessible == false {
                 candidate = parent(path)
                 break
             }
@@ -62,8 +92,16 @@ func refreshDirectories(_ paths: Set<String>, store: DiskIndexStore, snapshot: I
         candidates.insert(candidate)
     }
     var minimal: [String] = []
+    var selected = Set<String>()
     for path in candidates.sorted(by: { $0.count == $1.count ? $0 < $1 : $0.count < $1.count }) {
-        if !minimal.contains(where: { contains(path, in: $0) }) { minimal.append(path) }
+        try checkCancellation()
+        var current = path
+        var covered = false
+        while current != root {
+            current = parent(current)
+            if selected.contains(current) { covered = true; break }
+        }
+        if !covered { minimal.append(path); selected.insert(path) }
     }
     return minimal
 }

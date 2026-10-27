@@ -19,7 +19,8 @@ struct CollectionCoverage: Equatable, Sendable {
         for path in paths {
             var ancestor = Self.parent(of: path)
             while let current = ancestor {
-                ancestors.insert(Data(current.utf8))
+                // A previously visited ancestor already has its complete parent chain.
+                if !ancestors.insert(Data(current.utf8)).inserted { break }
                 ancestor = Self.parent(of: current)
             }
         }
@@ -49,6 +50,25 @@ struct CollectionCoverage: Equatable, Sendable {
             if anyCollected && !allIncluded { return .containsItems }
         }
         return allIncluded ? .included : anyCollected ? .containsItems : .none
+    }
+
+    func state(forGroup paths: [String], distinct: Bool, parent: String, contains: (Data) -> Bool) -> CollectionState {
+        guard !isEmpty, !paths.isEmpty else { return .none }
+        guard distinct, collected.count < paths.count else { return state(for: paths) }
+        if state(for: parent) == .included { return .included }
+
+        let parentBytes = Data(Self.normalized(parent).utf8)
+        for path in collected {
+            var current = String(decoding: path, as: UTF8.self)
+            while let ancestor = Self.parent(of: current) {
+                if Data(ancestor.utf8) == parentBytes {
+                    if contains(Data(current.utf8)) { return .containsItems }
+                    break
+                }
+                current = ancestor
+            }
+        }
+        return .none
     }
 
     private static func normalized(_ path: String) -> String {

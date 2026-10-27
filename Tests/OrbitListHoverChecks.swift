@@ -237,5 +237,142 @@ enum OrbitListHoverChecks {
         precondition(!timed.isSuppressed && timedChanges == [nil, "first"])
         timed.detach()
         print("PASS the real quiet timer stays blocked through gesture and momentum, and restarts after each wheel event")
+
+        dataSource.count = 100
+        func resetList() -> (NSScrollView, RevealTable, NSView) {
+            let scroller = NSScrollView(frame: window.contentView!.bounds)
+            let list = RevealTable(frame: NSRect(x: 0, y: 0, width: 340, height: 5_200))
+            list.dataSource = dataSource
+            list.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("reset-files")))
+            list.headerView = nil
+            list.rowHeight = 52
+            list.intercellSpacing = .zero
+            scroller.documentView = list
+            window.contentView!.addSubview(scroller)
+            list.reloadData()
+            let view = NSView(frame: list.rect(ofRow: 0))
+            list.addSubview(view)
+            return (scroller, list, view)
+        }
+        func offset(_ row: Int, in table: NSTableView, scroll: NSScrollView) -> CGFloat {
+            table.rect(ofRow: row).minY - table.convert(scroll.contentView.bounds, from: scroll.contentView).minY
+        }
+        let resetTracking = ListHoverTracking()
+        var restorationCount = 0
+        resetTracking.onResetRestored = { restorationCount += 1 }
+        let (oldScroll, oldTable, oldRow) = resetList()
+        resetTracking.register(oldRow, id: "item-0", table: oldTable)
+        oldScroll.contentView.scroll(to: NSPoint(x: 0, y: 16 * 52 + 13))
+        oldScroll.reflectScrolledClipView(oldScroll.contentView)
+        precondition(window.makeFirstResponder(oldTable))
+        let before = offset(17, in: oldTable, scroll: oldScroll)
+        precondition(resetTracking.prepareForReset(preferredRow: 17, itemIDAt: { "item-\($0)" },
+                                                  rowIndexForID: { Int($0.dropFirst(5)).map { 99 - $0 } }))
+        precondition(resetTracking.hasPendingRestore)
+        oldScroll.removeFromSuperview()
+        resetTracking.detach()
+        precondition(resetTracking.hasPendingRestore, "List teardown must retain a pending reset")
+        let (replacementScroll, replacementTable, replacementRow) = resetList()
+        resetTracking.register(replacementRow, id: "item-99", table: replacementTable)
+        runLoop(for: 0.04)
+        precondition(!resetTracking.hasPendingRestore)
+        precondition(restorationCount == 1)
+        precondition(abs(offset(82, in: replacementTable, scroll: replacementScroll) - before) < 0.5,
+                     "The visible hovered row must keep its pixel offset after reordering")
+        precondition(window.firstResponder === replacementTable, "A focused list must regain keyboard focus")
+
+        replacementScroll.contentView.scroll(to: NSPoint(x: 0, y: 20 * 52 + 11))
+        replacementScroll.reflectScrolledClipView(replacementScroll.contentView)
+        let beforeTop = offset(20, in: replacementTable, scroll: replacementScroll)
+        precondition(resetTracking.prepareForReset(preferredRow: 99, itemIDAt: { "item-\($0)" },
+                                                  rowIndexForID: { Int($0.dropFirst(5)).map { $0 + 10 } }))
+        let search = NSTextField(frame: NSRect(x: 0, y: 0, width: 100, height: 20))
+        window.contentView!.addSubview(search)
+        precondition(window.makeFirstResponder(search))
+        replacementScroll.removeFromSuperview()
+        resetTracking.detach()
+        let (nextScroll, nextTable, nextRow) = resetList()
+        resetTracking.register(nextRow, id: "item-10", table: nextTable)
+        runLoop(for: 0.04)
+        precondition(!resetTracking.hasPendingRestore)
+        precondition(restorationCount == 2)
+        precondition(abs(offset(30, in: nextTable, scroll: nextScroll) - beforeTop) < 0.5,
+                     "An offscreen preferred row must fall back to the first visible row")
+        precondition(window.firstResponder !== nextTable, "A newer focus choice must not be overwritten")
+
+        let visibleRow = nextTable.rows(in: nextTable.convert(nextScroll.contentView.bounds, from: nextScroll.contentView)).location
+        let beforeMissing = offset(visibleRow, in: nextTable, scroll: nextScroll)
+        precondition(resetTracking.prepareForReset(preferredRow: nil, itemIDAt: { "item-\($0)" },
+                                                  rowIndexForID: { _ in nil }))
+        let sameScrollTable = RevealTable(frame: NSRect(x: 0, y: 0, width: 340, height: 5_200))
+        sameScrollTable.dataSource = dataSource
+        sameScrollTable.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("reused-scroll")))
+        sameScrollTable.headerView = nil
+        sameScrollTable.rowHeight = 52
+        sameScrollTable.intercellSpacing = .zero
+        nextScroll.documentView = sameScrollTable
+        sameScrollTable.reloadData()
+        let sameScrollRow = NSView(frame: sameScrollTable.rect(ofRow: 0))
+        sameScrollTable.addSubview(sameScrollRow)
+        resetTracking.register(sameScrollRow, id: "new-item", table: sameScrollTable)
+        runLoop(for: 0.04)
+        precondition(!resetTracking.hasPendingRestore)
+        precondition(restorationCount == 3)
+        precondition(abs(offset(visibleRow, in: sameScrollTable, scroll: nextScroll) - beforeMissing) < 0.5,
+                     "A missing item must fall back to the previous row index on a reused scroll view")
+        let beforeDelayed = offset(visibleRow, in: sameScrollTable, scroll: nextScroll)
+        precondition(resetTracking.prepareForReset(preferredRow: nil, itemIDAt: { "item-\($0)" },
+                                                  rowIndexForID: { _ in 70 }))
+        dataSource.count = 10
+        let loadingTable = RevealTable(frame: NSRect(x: 0, y: 0, width: 340, height: 5_200))
+        loadingTable.dataSource = dataSource
+        loadingTable.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("loading")))
+        loadingTable.headerView = nil
+        loadingTable.rowHeight = 52
+        loadingTable.intercellSpacing = .zero
+        nextScroll.documentView = loadingTable
+        loadingTable.reloadData()
+        let loadingRow = NSView(frame: loadingTable.rect(ofRow: 0))
+        loadingTable.addSubview(loadingRow)
+        resetTracking.register(loadingRow, id: "loading", table: loadingTable)
+        runLoop(for: 0.02)
+        precondition(resetTracking.hasPendingRestore, "An incomplete table must wait for its anchor row")
+        dataSource.count = 100
+        loadingTable.reloadData()
+        runLoop(for: 0.12)
+        precondition(!resetTracking.hasPendingRestore)
+        precondition(restorationCount == 4)
+        precondition(abs(offset(70, in: loadingTable, scroll: nextScroll) - beforeDelayed) < 0.5,
+                     "A reset must retry once its anchor row becomes available")
+        let beforeRace = offset(70, in: loadingTable, scroll: nextScroll)
+        precondition(resetTracking.prepareForReset(preferredRow: 70, itemIDAt: { "item-\($0)" },
+                                                  rowIndexForID: { _ in 40 }))
+        func replacementInSameScroll(_ identifier: String) -> (RevealTable, NSView) {
+            let list = RevealTable(frame: NSRect(x: 0, y: 0, width: 340, height: 5_200))
+            list.dataSource = dataSource
+            list.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier)))
+            list.headerView = nil
+            list.rowHeight = 52
+            list.intercellSpacing = .zero
+            nextScroll.documentView = list
+            list.reloadData()
+            let view = NSView(frame: list.rect(ofRow: 0))
+            list.addSubview(view)
+            resetTracking.register(view, id: identifier, table: list)
+            return (list, view)
+        }
+        let (intermediateTable, intermediateRow) = replacementInSameScroll("intermediate")
+        let (finalTable, finalRow) = replacementInSameScroll("final")
+        withExtendedLifetime((intermediateTable, intermediateRow, finalRow)) { runLoop(for: 0.08) }
+        precondition(!resetTracking.hasPendingRestore && restorationCount == 5)
+        precondition(abs(offset(40, in: finalTable, scroll: nextScroll) - beforeRace) < 0.5,
+                     "A newer replacement table must inherit the pending restore")
+        precondition(resetTracking.prepareForReset(preferredRow: nil, itemIDAt: { "item-\($0)" },
+                                                  rowIndexForID: { _ in nil }))
+        resetTracking.cancelPendingRestore()
+        precondition(!resetTracking.hasPendingRestore && restorationCount == 5)
+        nextScroll.removeFromSuperview()
+        resetTracking.detach()
+        print("PASS list reset preserves visible row offset and focus, honors later focus, and can be cancelled")
     }
 }

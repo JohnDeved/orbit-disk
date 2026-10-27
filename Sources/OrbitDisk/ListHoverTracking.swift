@@ -1,7 +1,33 @@
 import AppKit
 
 final class ListHoverTracking {
+    private final class PendingRestore {
+        weak var oldTable: NSTableView?
+        weak var window: NSWindow?
+        weak var responder: NSResponder?
+        let anchorID: String
+        let oldIndex: Int
+        let offset: CGFloat
+        let restoreFocus: Bool
+        let rowIndexForID: (String) -> Int?
+        let deadline = ProcessInfo.processInfo.systemUptime + 10
+        var userInteracted = false
+        var restoreScheduled = false
+
+        init(table: NSTableView, window: NSWindow, responder: NSResponder?, anchorID: String,
+             oldIndex: Int, offset: CGFloat, restoreFocus: Bool, rowIndexForID: @escaping (String) -> Int?) {
+            oldTable = table
+            self.window = window
+            self.responder = responder
+            self.anchorID = anchorID
+            self.oldIndex = oldIndex
+            self.offset = offset
+            self.restoreFocus = restoreFocus
+            self.rowIndexForID = rowIndexForID
+        }
+    }
     var onHoverChanged: ((String?) -> Void)?
+    var onResetRestored: (() -> Void)?
     private(set) var isSuppressed = false
     private(set) weak var scrollView: NSScrollView?
     private weak var tableView: NSTableView?
@@ -16,19 +42,99 @@ final class ListHoverTracking {
     private let rows = NSMapTable<NSView, NSString>.weakToStrongObjects()
     private let pointerLocation: () -> NSPoint
     private let settleDelay: TimeInterval
+    private var pendingRestore: PendingRestore?
+    private var focusEventMonitor: Any?
+    var hasPendingRestore: Bool { pendingRestore != nil }
 
     init(settleDelay: TimeInterval = 0.18, pointerLocation: @escaping () -> NSPoint = { NSEvent.mouseLocation }) {
         self.settleDelay = settleDelay
         self.pointerLocation = pointerLocation
     }
 
-    deinit { removeObservers() }
+    deinit { removeObservers(); cancelPendingRestore() }
 
     func register(_ row: NSView, id: String, table: NSTableView) {
         guard let scroll = table.enclosingScrollView else { return }
         if scrollView !== scroll { attach(to: scroll) }
+        else if tableView !== table { rows.removeAllObjects() }
         tableView = table
         rows.setObject(id as NSString, forKey: row)
+        scheduleRestore(for: table)
+    }
+
+    @discardableResult
+    func prepareForReset(preferredRow: Int?, itemIDAt: (Int) -> String?,
+                         rowIndexForID: @escaping (String) -> Int?) -> Bool {
+        cancelPendingRestore()
+        guard let table = tableView, let scroll = scrollView, let window = table.window else { return false }
+        let visible = table.convert(scroll.contentView.bounds, from: scroll.contentView).intersection(table.bounds)
+        let visibleRows = table.rows(in: visible)
+        guard visibleRows.location != NSNotFound, visibleRows.length > 0 else { return false }
+        let index = preferredRow.flatMap { NSLocationInRange($0, visibleRows) ? $0 : nil } ?? visibleRows.location
+        guard let id = itemIDAt(index) else { return false }
+        let responder = window.firstResponder
+        let focusedView = responder as? NSView
+        let focused = focusedView === table || (focusedView?.isDescendant(of: table) ?? false)
+        let pending = PendingRestore(table: table, window: window, responder: responder, anchorID: id,
+                                     oldIndex: index, offset: table.rect(ofRow: index).minY - visible.minY,
+                                     restoreFocus: focused, rowIndexForID: rowIndexForID)
+        pendingRestore = pending
+        focusEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown, .scrollWheel]) { [weak pending] event in
+            if event.window === pending?.window { pending?.userInteracted = true }
+            return event
+        }
+        return true
+    }
+
+    func cancelPendingRestore() {
+        pendingRestore = nil
+        if let focusEventMonitor { NSEvent.removeMonitor(focusEventMonitor) }
+        focusEventMonitor = nil
+    }
+
+    private func scheduleRestore(for table: NSTableView) {
+        guard let pending = pendingRestore, table !== pending.oldTable, !pending.restoreScheduled else { return }
+        guard table.window === pending.window else { cancelPendingRestore(); return }
+        pending.restoreScheduled = true
+        DispatchQueue.main.async { [weak self, weak table, weak pending] in
+            guard let self, let pending else { return }
+            pending.restoreScheduled = false
+            guard self.pendingRestore === pending else { return }
+            guard let table, self.tableView === table else {
+                if let current = self.tableView { self.scheduleRestore(for: current) }
+                return
+            }
+            guard let scroll = self.scrollView, let window = pending.window, table.window === window else { return }
+            guard !pending.userInteracted else { self.cancelPendingRestore(); return }
+            let count = table.numberOfRows
+            let mapped = pending.rowIndexForID(pending.anchorID).flatMap { $0 >= 0 ? $0 : nil }
+            guard count > 0, mapped == nil || mapped! < count else {
+                if ProcessInfo.processInfo.systemUptime >= pending.deadline {
+                    self.cancelPendingRestore()
+                } else {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak table, weak pending] in
+                        guard let self, let table, let pending, self.pendingRestore === pending, self.tableView === table else { return }
+                        self.scheduleRestore(for: table)
+                    }
+                }
+                return
+            }
+            let index = mapped ?? min(pending.oldIndex, count - 1)
+            let visible = table.convert(scroll.contentView.bounds, from: scroll.contentView)
+            let delta = table.rect(ofRow: index).minY - pending.offset - visible.minY
+            let clip = scroll.contentView
+            let proposed = NSRect(origin: NSPoint(x: clip.bounds.minX, y: clip.bounds.minY + delta), size: clip.bounds.size)
+            clip.scroll(to: clip.constrainBoundsRect(proposed).origin)
+            scroll.reflectScrolledClipView(clip)
+            if pending.restoreFocus && window.isKeyWindow {
+                let current = window.firstResponder
+                if current == nil || current === window || current === pending.responder || current === table {
+                    window.makeFirstResponder(table)
+                }
+            }
+            self.cancelPendingRestore()
+            self.onResetRestored?()
+        }
     }
 
     func revealRow(expectedCount: Int, rowIndex: () -> Int?) -> Bool {

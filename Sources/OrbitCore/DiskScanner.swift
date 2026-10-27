@@ -3,20 +3,61 @@ import Foundation
 
 public struct DiskScanner: Sendable {
     let useBulkEnumeration: Bool
+    #if ORBIT_TESTING
+    let testBatch: (@Sendable () throws -> Void)?
+    let testFallback: (@Sendable () throws -> Void)?
+    let testAfterListing: (@Sendable () -> Void)?
+    #endif
 
-    public init() { useBulkEnumeration = true }
-    package init(useBulkEnumeration: Bool) { self.useBulkEnumeration = useBulkEnumeration }
+    public init() {
+        useBulkEnumeration = true
+        #if ORBIT_TESTING
+        testBatch = nil
+        testFallback = nil
+        testAfterListing = nil
+        #endif
+    }
+    package init(useBulkEnumeration: Bool) {
+        self.useBulkEnumeration = useBulkEnumeration
+        #if ORBIT_TESTING
+        testBatch = nil
+        testFallback = nil
+        testAfterListing = nil
+        #endif
+    }
+    #if ORBIT_TESTING
+    package init(testBatch: @escaping @Sendable () throws -> Void,
+                 testFallback: (@Sendable () throws -> Void)? = nil,
+                 testAfterListing: (@Sendable () -> Void)? = nil) {
+        useBulkEnumeration = true
+        self.testBatch = testBatch
+        self.testFallback = testFallback
+        self.testAfterListing = testAfterListing
+    }
+    #endif
 
     /// Runs synchronously on the caller's thread; call from a detached task or worker queue.
     public func scan(_ url: URL, cancellation: ScanCancellation = ScanCancellation(),
                      preview: DiskScanPreview? = nil,
+                     excluding: [URL] = [],
                      progress: @escaping @Sendable (ScanProgress) -> Void = { _ in }) throws -> ScanResult {
         guard url.isFileURL else { throw ScanError.notDirectory(url.absoluteString) }
         let rootURL = url.standardizedFileURL
         let state = ScanState(cancellation: cancellation, progress: progress, useBulk: useBulkEnumeration, preview: preview)
+        state.excludedDirectories = Set(excluding.compactMap { url in
+            var info = stat()
+            guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR else { return nil }
+            return FileIdentity(device: info.st_dev, inode: info.st_ino)
+        })
+        state.excludedPaths = IndexLocations.exclusionPaths(excluding)
         try state.checkCancellation()
         let metadata = try FileMetadata.read(rootURL)
         guard metadata.isDirectory, !metadata.isSymbolicLink else { throw ScanError.notDirectory(rootURL.path) }
+        #if ORBIT_TESTING
+        state.testBatch = testBatch
+        state.testFallback = testFallback
+        state.testAfterListing = testAfterListing
+        #endif
         state.rootDevice = metadata.device
         if let preview { preview.begin(state.previewNode(rootURL, metadata: metadata, scanState: .scanning)) }
         state.report(rootURL.path, force: true)
@@ -65,12 +106,19 @@ private final class ScanState {
     let useBulk: Bool
     let preview: DiskScanPreview?
     let started = ProcessInfo.processInfo.systemUptime
+    #if ORBIT_TESTING
+    var testBatch: (@Sendable () throws -> Void)?
+    var testFallback: (@Sendable () throws -> Void)?
+    var testAfterListing: (@Sendable () -> Void)?
+    #endif
     var rootDevice: Int32 = 0
     var itemCount = 0
     var bytesScanned: Int64 = 0
     var skippedCount = 0
     var issues: [String] = []
     var hardLinks = Set<FileIdentity>()
+    var excludedDirectories = Set<FileIdentity>()
+    var excludedPaths = Set<Data>()
     var lastProgress: TimeInterval = 0
 
     init(cancellation: ScanCancellation, progress: @escaping @Sendable (ScanProgress) -> Void,
@@ -112,7 +160,10 @@ private final class ScanState {
             skip("\(url.path): nested volume skipped")
         } else {
             do {
-                let entries = try readDirectory(url)
+                let entries = try readDirectory(url).filter {
+                    !$0.isDirectory || (!excludedPaths.contains(Data(url.appendingPathComponent($0.name).path.utf8)) &&
+                        !excludedDirectories.contains(FileIdentity(device: $0.device, inode: $0.inode)))
+                }
                 itemCount += entries.count
                 bytesScanned += entries.reduce(0) { $0 + $1.size }
                 children.reserveCapacity(entries.count)
@@ -140,6 +191,9 @@ private final class ScanState {
                 if let preview {
                     try checkCancellation()
                     preview.recordListing(url.path, children: previewChildren)
+                    #if ORBIT_TESTING
+                    testAfterListing?()
+                    #endif
                     report(url.path, force: isRoot)
                     try checkCancellation()
                 }
@@ -158,6 +212,7 @@ private final class ScanState {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                preview?.clearListing(url.path)
                 if isRoot { throw error }
                 isAccessible = false
                 skip(error.localizedDescription)
@@ -207,9 +262,26 @@ private final class ScanState {
         if useBulk {
             do {
                 var pendingIssues: [String] = []
+                var published = 0
                 let entries = try BulkDirectory.read(descriptor, url: url, cancellation: cancellation,
                     progress: { count, bytes in self.report(url.path, extraItems: count, extraBytes: bytes) },
-                    issue: { pendingIssues.append($0) })
+                    issue: { pendingIssues.append($0) },
+                    batch: { entries in
+                        if let preview = self.preview, entries.count >= 1_000, published == 0 {
+                            var nodes: [DiskNode] = []
+                            nodes.reserveCapacity(512)
+                            for (index, entry) in entries.prefix(512).enumerated() {
+                                if index & 127 == 0 { try self.checkCancellation() }
+                                let childURL = url.appendingPathComponent(entry.name, isDirectory: entry.isDirectory)
+                                nodes.append(self.previewNode(childURL, metadata: entry, scanState: .pending))
+                            }
+                            preview.appendListing(url.path, children: nodes)
+                            published = nodes.count
+                        }
+                        #if ORBIT_TESTING
+                        try self.testBatch?()
+                        #endif
+                    })
                 pendingIssues.forEach(skip)
                 return entries
             } catch is CancellationError {
@@ -242,6 +314,9 @@ private final class ScanState {
             throw ScanError.filesystem(url.path, code)
         }
         defer { closedir(directory) }
+        #if ORBIT_TESTING
+        try testFallback?()
+        #endif
         var result: [FileMetadata] = []
         var bytes: Int64 = 0
         while true {

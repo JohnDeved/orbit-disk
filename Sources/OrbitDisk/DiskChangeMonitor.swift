@@ -38,12 +38,17 @@ final class DiskChangeMonitor {
     private let exclusions: [URL]
     private var plan: DiskEventPlan?
     private var excludedPaths: [String] = []
+    private var rawExcludedPaths: [String] = []
     private var stream: DiskEventStream?
     private var context: DiskEventContext?
     private var handler: ((DiskChangeBatch) -> Void)?
     private var latestEventID: UInt64 = 0
     private var checkpointIdentity = ""
     private var generation = UUID()
+    private let normalizationQueue = DispatchQueue(label: "OrbitDisk.EventNormalization", qos: .utility)
+    private let normalizationGeneration = EventGeneration()
+    private var queuedNormalizations = 0
+    private var overflow: EventOverflow?
 
     nonisolated static func capture(root: URL) throws -> DiskChangeCheckpoint {
         try DiskEventPlan.inspect(root: root).checkpoint
@@ -84,6 +89,7 @@ final class DiskChangeMonitor {
             }
             plan = prepared.plan
             excludedPaths = prepared.excludedPaths
+            rawExcludedPaths = prepared.rawExcludedPaths
             latestEventID = prepared.since
             checkpointIdentity = prepared.plan.checkpoint.identity
             stream = prepared.stream
@@ -103,11 +109,15 @@ final class DiskChangeMonitor {
 
     func stop() {
         generation = UUID()
+        normalizationGeneration.replace(with: generation)
+        queuedNormalizations = 0
+        overflow = nil
         context?.cancel()
         if let stream { Task.detached { stream.close() } }
         stream = nil
         plan = nil
         context = nil
+        rawExcludedPaths = []
         handler = nil
     }
 
@@ -117,29 +127,166 @@ final class DiskChangeMonitor {
 
     fileprivate func receive(paths: [String], flags: [FSEventStreamEventFlags], ids: [UInt64]) {
         guard stream != nil, let plan else { return }
-        var directories = Set<String>()
-        var fullRefresh = paths.count != flags.count || flags.count != ids.count
-        var historyFinished = false
-        var identityInvalidated = false
+        let token = generation
+        if overflow != nil {
+            overflow?.merge(excluded: rawExcludedPaths, paths: paths, flags: flags, ids: ids)
+            return
+        }
+        if queuedNormalizations >= 8 {
+            var merged = EventOverflow()
+            merged.merge(excluded: rawExcludedPaths, paths: paths, flags: flags, ids: ids)
+            overflow = merged
+            let generationState = normalizationGeneration
+            normalizationQueue.async { [weak self] in
+                guard generationState.isCurrent(token) else { return }
+                let rootValid = plan.rootIdentityIsValid()
+                DispatchQueue.main.async { [weak self] in
+                    self?.publishOverflow(token: token, rootValid: rootValid)
+                }
+            }
+            return
+        }
+        queuedNormalizations += 1
+        let excluded = excludedPaths
+        let generationState = normalizationGeneration
+        normalizationQueue.async { [weak self] in
+            guard let result = NormalizedEventBatch.prepare(plan: plan, excluded: excluded, paths: paths,
+                                                            flags: flags, ids: ids,
+                                                            isCurrent: { generationState.isCurrent(token) }) else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.generation == token else { return }
+                self.queuedNormalizations -= 1
+                self.publish(result, token: token)
+            }
+        }
+    }
+
+    private func publishOverflow(token: UUID, rootValid: Bool) {
+        guard generation == token, let overflow else { return }
+        self.overflow = nil
+        var result = NormalizedEventBatch()
+        result.fullRefresh = overflow.requiresRefresh || !rootValid
+        result.historyFinished = overflow.historyFinished
+        result.identityInvalidated = overflow.identityInvalidated || !rootValid
+        result.latestEventID = overflow.latestEventID
+        publish(result, token: token)
+    }
+
+    private func publish(_ result: NormalizedEventBatch, token: UUID) {
+        guard generation == token, stream != nil, let plan else { return }
+        latestEventID = max(latestEventID, result.latestEventID)
+        if result.identityInvalidated {
+            checkpointIdentity = ""
+            latestEventID = 0
+        }
+        let directories = result.fullRefresh ? Set([plan.rootPath]) : result.directories
+        guard !directories.isEmpty || result.fullRefresh || result.historyFinished else { return }
+        let checkpoint = DiskChangeCheckpoint(rootPath: plan.rootPath,
+                                              identity: checkpointIdentity, eventID: latestEventID)
+        handler?(DiskChangeBatch(directoryPaths: directories, fullRefreshRequired: result.fullRefresh,
+                                 historyFinished: result.historyFinished, checkpoint: checkpoint))
+    }
+
+}
+
+private struct EventOverflow {
+    var historyFinished = false
+    var identityInvalidated = false
+    var latestEventID: UInt64 = 0
+    var requiresRefresh = false
+
+    mutating func merge(excluded: [String], paths: [String],
+                        flags: [FSEventStreamEventFlags], ids: [UInt64]) {
+        for id in ids where id != UInt64(kFSEventStreamEventIdSinceNow) { latestEventID = max(latestEventID, id) }
+        if paths.count != flags.count || flags.count != ids.count { requiresRefresh = true }
         for index in flags.indices {
+            let flag = flags[index]
+            func has(_ value: Int) -> Bool { flag & FSEventStreamEventFlags(value) != 0 }
+            if has(kFSEventStreamEventFlagEventIdsWrapped) || has(kFSEventStreamEventFlagRootChanged)
+                || has(kFSEventStreamEventFlagMount) || has(kFSEventStreamEventFlagUnmount) {
+                identityInvalidated = true
+                requiresRefresh = true
+            }
+            if has(kFSEventStreamEventFlagUserDropped) || has(kFSEventStreamEventFlagKernelDropped) {
+                requiresRefresh = true
+            }
+            if has(kFSEventStreamEventFlagHistoryDone) { historyFinished = true; continue }
+            guard index < paths.count, Self.isExcluded(paths[index], by: excluded) else {
+                requiresRefresh = true
+                continue
+            }
+        }
+    }
+    #if ORBIT_TESTING
+    static func testExcluded(_ path: String, by exclusions: [String]) -> Bool { isExcluded(path, by: exclusions) }
+    #endif
+
+    private static func isExcluded(_ path: String, by exclusions: [String]) -> Bool {
+        path.withCString { raw in
+            let length = strlen(raw)
+            guard length == path.utf8.count, strstr(raw, "/../") == nil,
+                  !(length >= 3 && strncmp(raw, "../", 3) == 0),
+                  !(length == 2 && strncmp(raw, "..", 2) == 0),
+                  !(length >= 3 && strcmp(raw.advanced(by: length - 3), "/..") == 0) else { return false }
+            for exclusion in exclusions {
+                let match = exclusion.withCString { prefix -> Bool in
+                    let count = strlen(prefix)
+                    guard count <= length, strncmp(raw, prefix, count) == 0 else { return false }
+                    return count == 0 || count == length || (count == 1 && prefix[0] == 47) || raw[count] == 47
+                }
+                if match { return true }
+            }
+            return false
+        }
+    }
+}
+
+private final class EventGeneration: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = UUID()
+    func replace(with value: UUID) { lock.lock(); self.value = value; lock.unlock() }
+    func isCurrent(_ value: UUID) -> Bool { lock.lock(); defer { lock.unlock() }; return self.value == value }
+}
+
+private struct NormalizedEventBatch: Sendable {
+    var directories: Set<String> = []
+    var fullRefresh = false
+    var identityInvalidated = false
+    var historyFinished = false
+    var latestEventID: UInt64 = 0
+
+    static func prepare(plan: DiskEventPlan, excluded: [String], paths: [String],
+                        flags: [FSEventStreamEventFlags], ids: [UInt64],
+                        isCurrent: () -> Bool) -> Self? {
+        guard isCurrent() else { return nil }
+        var result = Self()
+        result.identityInvalidated = !plan.rootIdentityIsValid()
+        result.fullRefresh = paths.count != flags.count || flags.count != ids.count || result.identityInvalidated
+        var cache = EventPathCache()
+        for index in flags.indices {
+            if index & 127 == 0, !isCurrent() { return nil }
             let flag = flags[index]
             let has: (Int) -> Bool = { flag & FSEventStreamEventFlags($0) != 0 }
             if index < ids.count, ids[index] != UInt64(kFSEventStreamEventIdSinceNow) {
-                latestEventID = max(latestEventID, ids[index])
+                result.latestEventID = max(result.latestEventID, ids[index])
             }
             if has(kFSEventStreamEventFlagEventIdsWrapped) || has(kFSEventStreamEventFlagRootChanged) {
-                fullRefresh = true
-                identityInvalidated = true
+                result.fullRefresh = true
+                result.identityInvalidated = true
             }
             if has(kFSEventStreamEventFlagUserDropped) || has(kFSEventStreamEventFlagKernelDropped) {
-                fullRefresh = true
+                result.fullRefresh = true
             }
-            if has(kFSEventStreamEventFlagHistoryDone) { historyFinished = true; continue }
-            guard index < paths.count, let path = plan.normalizedEventPath(paths[index]),
-                  !excludedPaths.contains(where: { DiskEventPlan.contains(path, in: $0) }) else { continue }
+            if has(kFSEventStreamEventFlagHistoryDone) { result.historyFinished = true; continue }
+            guard index < paths.count else { result.fullRefresh = true; continue }
+            guard let path = plan.normalizedEventPath(paths[index], cache: &cache) else {
+                if plan.eventMayAffectRoot(paths[index]) { result.fullRefresh = true }
+                continue
+            }
+            if excluded.contains(where: { DiskEventPlan.contains(path, in: $0) }) { continue }
             if has(kFSEventStreamEventFlagMount) || has(kFSEventStreamEventFlagUnmount) {
-                fullRefresh = true
-                identityInvalidated = true
+                result.fullRefresh = true
+                result.identityInvalidated = true
             }
             if plan.untrackedMounts.contains(where: { DiskEventPlan.contains(path, in: $0) }) { continue }
             let directory: String
@@ -152,20 +299,15 @@ final class DiskChangeMonitor {
             } else {
                 directory = URL(fileURLWithPath: path).deletingLastPathComponent().path
             }
-            directories.insert(DiskEventPlan.contains(directory, in: plan.rootPath) ? directory : plan.rootPath)
+            result.directories.insert(DiskEventPlan.contains(directory, in: plan.rootPath) ? directory : plan.rootPath)
         }
-        if identityInvalidated {
-            // The required full scan captures a new identity away from the main thread.
-            checkpointIdentity = ""
-            latestEventID = 0
+        guard isCurrent() else { return nil }
+        if !cache.revalidate() { result.fullRefresh = true }
+        if !plan.rootIdentityIsValid() {
+            result.fullRefresh = true
+            result.identityInvalidated = true
         }
-        if fullRefresh { directories = [plan.rootPath] }
-        let checkpoint = DiskChangeCheckpoint(rootPath: plan.rootPath,
-                                              identity: checkpointIdentity, eventID: latestEventID)
-        // Reporting cache-only batches would let saving their watermark trigger another save.
-        guard !directories.isEmpty || fullRefresh || historyFinished else { return }
-        handler?(DiskChangeBatch(directoryPaths: directories, fullRefreshRequired: fullRefresh,
-                                 historyFinished: historyFinished, checkpoint: checkpoint))
+        return result
     }
 }
 
@@ -219,6 +361,7 @@ private final class DiskEventStream: @unchecked Sendable {
 private struct DiskEventSetup: Sendable {
     let plan: DiskEventPlan
     let excludedPaths: [String]
+    let rawExcludedPaths: [String]
     let since: UInt64
     let canReplay: Bool
     let stream: DiskEventStream
@@ -237,6 +380,10 @@ private struct DiskEventSetup: Sendable {
         let excludedPaths = Array(Set(excluding.flatMap {
             [$0.standardizedFileURL.path, $0.standardizedFileURL.resolvingSymlinksInPath().path]
         }))
+        let nativeExcludedPaths = Array(Set(excludedPaths.flatMap { path -> [String] in
+            [path, DiskEventPlan.nativeExclusionPath(path)].compactMap { $0 }
+        }))
+        let rawExcludedPaths = Array(Set(nativeExcludedPaths.flatMap { plan.rawExclusionPaths($0) }))
         try Task.checkCancellation()
         var nativeContext = FSEventStreamContext(
             version: 0, info: Unmanaged.passUnretained(context).toOpaque(),
@@ -267,7 +414,7 @@ private struct DiskEventSetup: Sendable {
         FSEventStreamSetDispatchQueue(created, .main)
         guard FSEventStreamStart(created) else { throw DiskChangeMonitorError.unavailable(plan.rootPath) }
         try Task.checkCancellation()
-        return DiskEventSetup(plan: plan, excludedPaths: excludedPaths, since: since,
+        return DiskEventSetup(plan: plan, excludedPaths: excludedPaths, rawExcludedPaths: rawExcludedPaths, since: since,
                               canReplay: canReplay, stream: stream)
     }
 }
@@ -280,6 +427,65 @@ private let diskEventCallback: FSEventStreamCallback = { _, info, count, rawPath
     let copiedIDs = Array(UnsafeBufferPointer(start: ids, count: count))
     MainActor.assumeIsolated {
         context.receive(paths: paths, flags: copiedFlags, ids: copiedIDs)
+    }
+}
+
+private struct EventPathCache {
+    struct Entry {
+        let parent: String
+        let nativeParent: String
+        let device: dev_t
+        let inode: ino_t
+    }
+    struct Identity: Equatable {
+        let device: dev_t
+        let inode: ino_t
+        let mode: mode_t
+    }
+    var parents: [Data: Entry] = [:]
+    var ancestors: [Data: (path: String, identity: Identity)] = [:]
+    var invalidated = false
+
+    mutating func trackAncestors(_ path: String) -> Bool {
+        let components = path.split(separator: "/")
+        guard components.count <= 128, parents.count < 256,
+              ancestors.count + components.count + 1 <= 1024 else { return false }
+        var current = ""
+        for component in [Substring("")] + components {
+            current = component.isEmpty ? "/" : (current == "/" ? "/" + component : current + "/" + component)
+            var info = stat()
+            guard lstat(current, &info) == 0 else { return false }
+            let identity = Identity(device: info.st_dev, inode: info.st_ino, mode: info.st_mode)
+            let key = Data(current.utf8)
+            if let previous = ancestors[key], previous.identity != identity {
+                invalidated = true
+                return false
+            }
+            ancestors[key] = (path: current, identity: identity)
+        }
+        return true
+    }
+
+    func revalidate(path: String) -> Bool {
+        var current = ""
+        for component in [Substring("")] + path.split(separator: "/") {
+            current = component.isEmpty ? "/" : (current == "/" ? "/" + component : current + "/" + component)
+            guard let previous = ancestors[Data(current.utf8)] else { return false }
+            var info = stat()
+            guard lstat(current, &info) == 0,
+                  Identity(device: info.st_dev, inode: info.st_ino, mode: info.st_mode) == previous.identity else { return false }
+        }
+        return true
+    }
+
+    func revalidate() -> Bool {
+        guard !invalidated else { return false }
+        for (_, previous) in ancestors {
+            var info = stat()
+            guard lstat(previous.path, &info) == 0,
+                  Identity(device: info.st_dev, inode: info.st_ino, mode: info.st_mode) == previous.identity else { return false }
+        }
+        return true
     }
 }
 
@@ -307,6 +513,7 @@ private struct DiskEventPlan: Sendable {
     let relativePath: String?
     let untrackedMounts: [String]
     let device: dev_t
+    let rootFileID: UInt64
     let supportsReplay: Bool
     let checkpoint: DiskChangeCheckpoint
 
@@ -367,21 +574,70 @@ private struct DiskEventPlan: Sendable {
             : FSEventsGetLastEventIdForDeviceBeforeTime(metadata.st_dev, Date().timeIntervalSince1970)
         return DiskEventPlan(rootPath: rootPath, canonicalRoot: canonicalRoot, physicalRoot: physical,
                              mountPath: mount, relativePath: relative, untrackedMounts: untrackedMounts,
-                             device: metadata.st_dev,
+                             device: metadata.st_dev, rootFileID: metadata.st_ino,
                              supportsReplay: supportsReplay,
                              checkpoint: DiskChangeCheckpoint(rootPath: rootPath, identity: identity, eventID: eventID))
     }
 
     func normalizedEventPath(_ raw: String) -> String? {
+        var cache = EventPathCache()
+        return normalizedEventPath(raw, cache: &cache)
+    }
+
+    func normalizedEventPath(_ raw: String, cache: inout EventPathCache) -> String? {
+        guard !raw.contains("\0"), !raw.split(separator: "/").contains(".."),
+              let separator = raw.lastIndex(of: "/"), separator != raw.index(before: raw.endIndex) else {
+            return normalizedEventPathUncached(raw)
+        }
+        let parent = separator == raw.startIndex ? "/" : String(raw[..<separator])
+        let name = String(raw[raw.index(after: separator)...])
+        let key = Data(parent.utf8)
+        let nativeParent: String
+        if relativePath != nil {
+            let suffix = parent.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            nativeParent = mountPath == "/" ? "/" + suffix : mountPath + "/" + suffix
+        } else { nativeParent = parent }
+        var info = stat()
+        let usableParent = lstat(nativeParent, &info) == 0 && info.st_mode & S_IFMT == S_IFDIR
+        if usableParent, let entry = cache.parents[key], entry.nativeParent == nativeParent,
+           entry.device == info.st_dev, entry.inode == info.st_ino {
+            return entry.parent == "/" ? "/" + name : entry.parent + "/" + name
+        }
+        cache.parents.removeValue(forKey: key)
+        let tracked = usableParent && cache.trackAncestors(nativeParent)
+        let normalized = normalizedEventPathUncached(raw)
+        if tracked && !cache.revalidate(path: nativeParent) { cache.invalidated = true }
+        guard let normalized else { return nil }
+        let suffix = "/" + name
+        guard tracked, !cache.invalidated,
+              normalized.utf8.suffix(suffix.utf8.count).elementsEqual(suffix.utf8) else { return normalized }
+        let normalizedParent = String(normalized.dropLast(suffix.count))
+        cache.parents[key] = EventPathCache.Entry(parent: normalizedParent.isEmpty ? "/" : normalizedParent,
+            nativeParent: nativeParent, device: info.st_dev, inode: info.st_ino)
+        return normalized
+    }
+
+    private func normalizedEventPathUncached(_ raw: String) -> String? {
         guard !raw.contains("\0"), !raw.split(separator: "/").contains("..") else { return nil }
         var path: String
         if relativePath != nil {
             path = URL(fileURLWithPath: mountPath).appendingPathComponent(raw).standardizedFileURL.path
+            let relative = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let nativePath = mountPath == "/" ? "/" + relative : mountPath + "/" + relative
             if Self.contains(path, in: physicalRoot) {
+                if path != physicalRoot {
+                    guard let resolvedRoot = Self.realPath(physicalRoot),
+                          Self.resolveEventPath(nativePath, within: resolvedRoot) != nil else { return nil }
+                }
                 path = rootPath + String(path.dropFirst(physicalRoot.count))
             } else if Self.contains(physicalRoot, in: path) {
                 return rootPath
-            } else { return nil }
+            } else {
+                guard let resolvedRoot = Self.realPath(physicalRoot),
+                      let resolvedEvent = Self.resolveEventPath(nativePath, within: resolvedRoot),
+                      Self.contains(resolvedEvent, in: resolvedRoot) else { return nil }
+                path = rootPath + String(resolvedEvent.dropFirst(resolvedRoot.count))
+            }
         } else {
             guard raw.hasPrefix("/") else { return nil }
             path = URL(fileURLWithPath: raw).standardizedFileURL.path
@@ -390,12 +646,108 @@ private struct DiskEventPlan: Sendable {
                 if Self.matchesThroughExistingAncestor(path, alias) { path = alias }
             }
             if Self.contains(path, in: canonicalRoot) {
+                if path != canonicalRoot {
+                    guard let resolvedRoot = Self.realPath(canonicalRoot),
+                          Self.resolveEventPath(raw, within: resolvedRoot) != nil else { return nil }
+                }
                 path = rootPath == "/" ? path : rootPath + String(path.dropFirst(canonicalRoot.count))
             } else if Self.contains(canonicalRoot, in: path) {
                 return rootPath
+            } else if let physicalRoot = Self.realPath(canonicalRoot),
+                      let physicalEvent = Self.resolveEventPath(raw, within: physicalRoot),
+                      Self.contains(physicalEvent, in: physicalRoot) {
+                let suffix = String(physicalEvent.dropFirst(physicalRoot.count))
+                path = rootPath == "/" ? physicalEvent : rootPath + suffix
             } else { return nil }
         }
         return Self.contains(path, in: rootPath) ? path : nil
+    }
+
+    private static func realPath(_ path: String) -> String? {
+        guard let resolved = path.withCString({ realpath($0, nil) }) else { return nil }
+        defer { free(resolved) }
+        return String(validatingUTF8: resolved)
+    }
+
+    // Preserve the final component: the event can refer to a removed item or a symlink itself.
+    // Resolve an existing parent, then append any removed intermediate components lexically.
+    #if ORBIT_TESTING
+    static func testResolveEventPath(_ raw: String, within root: String) -> String? { resolveEventPath(raw, within: root) }
+    #endif
+
+    private static func resolveEventPath(_ raw: String, within root: String) -> String? {
+        guard raw.hasPrefix("/") else { return nil }
+        let components = raw.split(separator: "/").map(String.init)
+        guard !components.isEmpty else { return "/" }
+        var prefix = Array(components.dropLast())
+        var suffix = [components.last!]
+        while true {
+            let candidate = "/" + prefix.joined(separator: "/")
+            if let resolved = realPath(candidate) {
+                guard contains(resolved, in: root) else { return nil }
+                return resolved == "/" ? "/" + suffix.joined(separator: "/")
+                    : resolved + "/" + suffix.joined(separator: "/")
+            }
+            guard (errno == ENOENT || errno == ENOTDIR), let last = prefix.popLast() else { return nil }
+            suffix.insert(last, at: 0)
+        }
+    }
+
+    static func nativeExclusionPath(_ path: String) -> String? {
+        if path == "/" { return "/" }
+        return realPath(path) ?? resolveEventPath(path, within: "/")
+    }
+
+    func rawExclusionPaths(_ native: String) -> [String] {
+        if relativePath == nil {
+            var paths = [native]
+            if canonicalRoot == "/", native.hasPrefix("/"), native != "/" {
+                let dataPath = "/System/Volumes/Data" + native
+                if Self.matchesThroughExistingAncestor(dataPath, native) { paths.append(dataPath) }
+            }
+            return paths
+        }
+        let suffix: String
+        if Self.contains(native, in: mountPath) {
+            suffix = mountPath == "/" ? String(native.dropFirst()) : String(native.dropFirst(mountPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        } else {
+            guard native.hasPrefix("/") else { return [] }
+            let candidate = mountPath + native
+            guard Self.matchesThroughExistingAncestor(candidate, native) else { return [] }
+            suffix = String(native.dropFirst())
+        }
+        return suffix.isEmpty ? ["/", ""] : [suffix, "/" + suffix]
+    }
+
+    func nativeEventPath(_ raw: String) -> String? {
+        guard !raw.contains("\0"), !raw.split(separator: "/").contains("..") else { return nil }
+        if relativePath != nil {
+            let suffix = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            return mountPath == "/" ? "/" + suffix : mountPath + "/" + suffix
+        }
+        return raw.hasPrefix("/") ? raw : nil
+    }
+
+    func eventMayAffectRoot(_ raw: String) -> Bool {
+        guard !raw.contains("\0"), !raw.split(separator: "/").contains("..") else { return true }
+        let path: String
+        if relativePath != nil {
+            let suffix = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            path = mountPath == "/" ? "/" + suffix : mountPath + "/" + suffix
+        } else {
+            guard raw.hasPrefix("/") else { return true }
+            path = raw
+        }
+        guard let resolvedRoot = Self.realPath(canonicalRoot) else { return true }
+        return [canonicalRoot, physicalRoot, resolvedRoot].contains {
+            Self.contains(path, in: $0) || Self.contains($0, in: path)
+        }
+    }
+
+    func rootIdentityIsValid() -> Bool {
+        var metadata = stat()
+        return lstat(canonicalRoot, &metadata) == 0 && metadata.st_dev == device
+            && metadata.st_ino == rootFileID && metadata.st_mode & S_IFMT == S_IFDIR
     }
 
     static func contains(_ path: String, in root: String) -> Bool {
@@ -441,3 +793,95 @@ private struct DiskEventPlan: Sendable {
         return false
     }
 }
+
+#if ORBIT_TESTING
+extension DiskChangeMonitor {
+    func testReceive(event: String, id: UInt64 = 0, flag: FSEventStreamEventFlags = 0) {
+        receive(paths: [event], flags: [flag], ids: [id])
+    }
+
+    func testReceiveBatch(events: [String], id: UInt64) {
+        receive(paths: events, flags: Array(repeating: 0, count: events.count), ids: Array(repeating: id, count: events.count))
+    }
+
+    func testBlockNormalization(_ semaphore: DispatchSemaphore) {
+        normalizationQueue.async { semaphore.wait() }
+    }
+    var testQueuedNormalizations: Int { queuedNormalizations }
+    var testHasOverflow: Bool { overflow != nil }
+    var testOverflowRequiresRefresh: Bool { overflow?.requiresRefresh ?? false }
+
+    nonisolated static func testRawExclusions(root: URL, excluded: URL) throws -> [String] {
+        let plan = try DiskEventPlan.inspect(root: root)
+        let variants = [excluded.path, DiskEventPlan.nativeExclusionPath(excluded.path)].compactMap { $0 }
+        return variants.flatMap { plan.rawExclusionPaths($0) }
+    }
+
+    nonisolated static func testExclusionPlan(root: URL, excluded: URL) throws -> String {
+        let plan = try DiskEventPlan.inspect(root: root)
+        let variants = [excluded.path, DiskEventPlan.nativeExclusionPath(excluded.path)].compactMap { $0 }
+        return "mount=\(plan.mountPath) relative=\(String(describing: plan.relativePath)) physical=\(plan.physicalRoot) variants=\(variants.flatMap { plan.rawExclusionPaths($0) })"
+    }
+
+    nonisolated static func testOverflowExcluded(_ path: String, exclusions: [String]) -> Bool {
+        EventOverflow.testExcluded(path, by: exclusions)
+    }
+
+    nonisolated static func testCombinedOverflowFlags() -> Bool {
+        var overflow = EventOverflow()
+        let flags = FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone | kFSEventStreamEventFlagRootChanged)
+        overflow.merge(excluded: [], paths: ["/"], flags: [flags], ids: [1])
+        return overflow.historyFinished && overflow.identityInvalidated && overflow.requiresRefresh
+    }
+
+    nonisolated static func testBatchRefresh(root: URL, event: String, device: Bool = false) throws -> Bool {
+        let p = try DiskEventPlan.inspect(root: root)
+        let plan = device ? DiskEventPlan(rootPath: p.rootPath, canonicalRoot: p.canonicalRoot,
+            physicalRoot: p.canonicalRoot, mountPath: "/", relativePath: "fixture",
+            untrackedMounts: [], device: p.device, rootFileID: p.rootFileID,
+            supportsReplay: p.supportsReplay, checkpoint: p.checkpoint) : p
+        return NormalizedEventBatch.prepare(plan: plan, excluded: [], paths: [event], flags: [0], ids: [1], isCurrent: { true })!.fullRefresh
+    }
+
+    nonisolated static func testNormalizeBatch(root: URL, events: [String]) throws -> [String?] {
+        let plan = try DiskEventPlan.inspect(root: root)
+        var cache = EventPathCache()
+        return events.map { plan.normalizedEventPath($0, cache: &cache) }
+    }
+
+    nonisolated static func testCacheRace(root: URL, first: String, second: String,
+                                          between: () throws -> Void) throws -> Bool {
+        let plan = try DiskEventPlan.inspect(root: root)
+        var cache = EventPathCache()
+        _ = plan.normalizedEventPath(first, cache: &cache)
+        try between()
+        _ = plan.normalizedEventPath(second, cache: &cache)
+        return cache.revalidate()
+    }
+
+    nonisolated static func testNormalize(root: URL, event: String) throws -> String? {
+        try DiskEventPlan.inspect(root: root).normalizedEventPath(event)
+    }
+
+    nonisolated static func testDeviceNormalize(root: URL, event: String, mount: String) throws -> String? {
+        let p = try DiskEventPlan.inspect(root: root)
+        let devicePlan = DiskEventPlan(rootPath: p.rootPath, canonicalRoot: p.canonicalRoot,
+            physicalRoot: p.canonicalRoot, mountPath: mount, relativePath: "fixture",
+            untrackedMounts: [], device: p.device, rootFileID: p.rootFileID, supportsReplay: p.supportsReplay, checkpoint: p.checkpoint)
+        return devicePlan.normalizedEventPath(event)
+    }
+
+    nonisolated static func testCanonicalNormalize(root: URL, event: String, realRoot: String) throws -> String? {
+        let p = try DiskEventPlan.inspect(root: root)
+        let plan = DiskEventPlan(rootPath: realRoot, canonicalRoot: realRoot,
+            physicalRoot: realRoot, mountPath: p.mountPath, relativePath: nil,
+            untrackedMounts: [], device: p.device, rootFileID: p.rootFileID,
+            supportsReplay: p.supportsReplay, checkpoint: p.checkpoint)
+        return plan.normalizedEventPath(event)
+    }
+
+    nonisolated static func testResolveEventPath(_ path: String, within root: String) -> String? {
+        DiskEventPlan.testResolveEventPath(path, within: root)
+    }
+}
+#endif

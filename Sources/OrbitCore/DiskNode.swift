@@ -78,6 +78,13 @@ public final class ScanCancellation: @unchecked Sendable {
         defer { lock.unlock() }
         return cancelled
     }
+
+    func commitIfNotCancelled<T>(_ operation: () throws -> T) throws -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled else { throw CancellationError() }
+        return try operation()
+    }
 }
 
 public enum ScanError: LocalizedError {

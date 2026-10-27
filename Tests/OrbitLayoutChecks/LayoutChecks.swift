@@ -27,6 +27,8 @@ struct ToolbarFrameProbe: NSViewRepresentable {
     func updateNSView(_ view: NSView, context: Context) {}
 }
 final class LayoutWindow: NSWindow {
+    var keyForChecks = false
+    override var isKeyWindow: Bool { keyForChecks || super.isKeyWindow }
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 @MainActor final class FrameRecorder {
@@ -49,10 +51,29 @@ final class LayoutWindow: NSWindow {
 final class LayoutGate: @unchecked Sendable {
     let lock = NSLock()
     let semaphore = DispatchSemaphore(value: 0)
-    var count = 0
-    func observe(_ progress: ScanProgress) {
-        lock.lock(); count += 1; let block = count == 2; lock.unlock()
+    private var waiting = false
+    private var used = false
+    var isWaiting: Bool { lock.lock(); defer { lock.unlock() }; return waiting }
+    func pauseOnce() {
+        lock.lock(); let block = !used; used = true; waiting = block; lock.unlock()
         if block { semaphore.wait() }
+    }
+}
+final class SortGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var armed = false
+    private var started = false
+    let release = DispatchSemaphore(value: 0)
+
+    func arm() { lock.lock(); armed = true; started = false; lock.unlock() }
+    var hasStarted: Bool { lock.lock(); defer { lock.unlock() }; return started }
+    func observe() {
+        lock.lock()
+        let shouldWait = armed
+        armed = false
+        if shouldWait { started = true }
+        lock.unlock()
+        if shouldWait { release.wait() }
     }
 }
 @main struct LayoutChecks {
@@ -243,6 +264,28 @@ final class LayoutGate: @unchecked Sendable {
             try await wait("root") { model.current?.id == root.id && !model.isOpeningFolder }
             install(AnyView(ContentView(model: model)), size: size)
             let baseline = try await capture(prefix + "/root")
+            let originalVolumes = model.volumes
+            let fallback = DiskVolume(url: URL(fileURLWithPath: "/"), name: "Mac", capacity: 0, available: 0)
+            model.isDiscoveringVolumes = true; model.volumes = [fallback]
+            let deviceLoading = try await capture(prefix + "/device-loading")
+            if size.width == 1280, let content = window.contentView,
+               let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                content.cacheDisplay(in: content.bounds, to: bitmap)
+                try bitmap.representation(using: .png, properties: [:])?.write(to: reportDirectory.appendingPathComponent("device-loading.png"))
+            }
+            model.isDiscoveringVolumes = false
+            compare(prefix + "/device-unavailable", deviceLoading, try await capture(prefix + "/device-unavailable"), names: ["device:/"])
+            model.volumes = [DiskVolume(url: fallback.url, name: "Macintosh HD", capacity: 100, available: 40)]
+            compare(prefix + "/device-resolved", deviceLoading, try await capture(prefix + "/device-resolved"), names: ["device:/"])
+            if size.width == 1280, let content = window.contentView,
+               let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                content.cacheDisplay(in: content.bounds, to: bitmap)
+                try bitmap.representation(using: .png, properties: [:])?.write(to: reportDirectory.appendingPathComponent("device-resolved.png"))
+            }
+            model.volumes = originalVolumes
+            model.isRemoving = true
+            compare(prefix + "/updating-sizes", baseline, try await capture(prefix + "/updating-sizes"))
+            model.isRemoving = false
             if size.width == 1280 { wideToolbarFrames = baseline }
             model.selectedID = short.id
             compare(prefix+"/file-selection", baseline, try await capture(prefix+"/file-selection"))
@@ -280,9 +323,15 @@ final class LayoutGate: @unchecked Sendable {
             compare(prefix+"/drag", baseline, try await capture(prefix+"/drag"))
             model.endCollectionDrag()
             let gate = LayoutGate()
-            let partial = DiskModel(cacheDirectory: base.appendingPathComponent("partial-\(prefix)"), preferences: prefs, scanProgressObserver: { gate.observe($0) })
+            let partial = DiskModel(cacheDirectory: base.appendingPathComponent("partial-\(prefix)"), preferences: prefs)
+            let expectedCount = root.children.count
+            partial.testAfterStageStep = { stage in
+                guard let view = try? stage.view(path: nil, removals: [], cancellation: ScanCancellation()),
+                      view.folder.children.count == expectedCount, !view.isListing else { return }
+                gate.pauseOnce()
+            }
             partial.scan(rootURL)
-            try await wait("partial map") { partial.current?.children.count == root.children.count && partial.isPartialMap }
+            try await wait("partial map") { gate.isWaiting && partial.current?.children.count == expectedCount && partial.isPartialMap }
             install(AnyView(ContentView(model: partial)), size: size)
             compare(prefix+"/partial", baseline, try await capture(prefix+"/partial"))
             partial.selectedID = partial.current!.children.first { $0.name == "short.bin" }!.id
@@ -296,7 +345,24 @@ final class LayoutGate: @unchecked Sendable {
         window.setContentSize(installedSize)
         compare("1280x810/resize-back", wideToolbarFrames, try await capture("1280x810/resize-back"),
                 names: ["window", "header", "toolbar-location", "toolbar-actions", "location", "search", "refresh", "open-folder", "traffic-close", "traffic-minimize", "traffic-zoom"])
-        model.showCollection = true
+        precondition(model.beginCollectionReview() != nil)
+        let tracking = ListHoverTracking()
+        let narrowRow = FileRowView(model: model, item: folder, parentSize: root.size, related: false, listHoverTracking: tracking)
+        let wideRow = FileRowView(model: model, item: short, parentSize: root.size, related: false, listHoverTracking: tracking)
+        install(AnyView(VStack(alignment: .leading, spacing: 0) {
+            narrowRow.frame(width: 266)
+            wideRow.frame(width: 283)
+        }.frame(maxWidth: .infinity, alignment: .leading)), size: CGSize(width: 720, height: 180))
+        try await settle()
+        for kind in ["row-size:", "row-action:"] {
+            guard let narrow = recorder.frames[kind + folder.id], let wide = recorder.frames[kind + short.id] else {
+                failures.append("Missing fixed-width row probe: \(kind)")
+                continue
+            }
+            if abs(narrow.minX - wide.minX) > 0.5 {
+                failures.append("Row column moved when offered 17 extra points: \(kind)")
+            }
+        }
         let modalSize = CGSize(width: 720, height: 470)
         install(AnyView(CollectionView(model: model)), size: modalSize)
         let modal = try await capture("collection/normal")
@@ -305,7 +371,80 @@ final class LayoutGate: @unchecked Sendable {
         compare("collection/error", modal, try await capture("collection/error"), names: modalNames)
         model.errorMessage = nil; model.isRemoving = true
         compare("collection/busy", modal, try await capture("collection/busy"), names: modalNames)
-        model.isRemoving = false; model.showCollection = false
+        model.isRemoving = false
+        let pendingNodes = (0..<1_200).map { index in
+            DiskNode(url: rootURL.appendingPathComponent("pending-\(index)"), name: "pending-\(index)", isDirectory: false,
+                     size: 1, allocatedSize: 1, fileCount: 1, fileIdentity: "fake:\(index)")
+        }
+        model.collection = [short] + pendingNodes
+        model.showCollection = false
+        install(AnyView(ContentView(model: model)), size: CGSize(width: 1280, height: 810))
+        let reviewBeforePending = try await capture("collection/review-before-pending")
+        let reviewBeforeImage: NSBitmapImageRep = {
+            let bounds = host.view.bounds
+            guard let image = host.view.bitmapImageRepForCachingDisplay(in: bounds), let data = image.bitmapData else {
+                fatalError("Could not render review controls")
+            }
+            host.view.cacheDisplay(in: bounds, to: image)
+            _ = data
+            return image
+        }()
+        model.showCollection = true
+        install(AnyView(CollectionView(model: model)), size: modalSize)
+        let pendingGate = LayoutGate()
+        model.testBeforeCollectionEdit = { pendingGate.pauseOnce() }
+        func renderedBitmap() -> NSBitmapImageRep {
+            let bounds = host.view.bounds
+            guard let image = host.view.bitmapImageRepForCachingDisplay(in: bounds), image.bitmapData != nil else {
+                fatalError("Could not render the collection sheet")
+            }
+            host.view.cacheDisplay(in: bounds, to: image)
+            return image
+        }
+        func changedPixels(_ first: NSBitmapImageRep, _ second: NSBitmapImageRep, frame: CGRect) -> Int {
+            let scaleX = Double(first.pixelsWide) / host.view.bounds.width
+            let scaleY = Double(first.pixelsHigh) / host.view.bounds.height
+            let x0 = max(0, Int(frame.minX * scaleX)), x1 = min(first.pixelsWide, Int(ceil(frame.maxX * scaleX)))
+            let y0 = max(0, Int(frame.minY * scaleY)), y1 = min(first.pixelsHigh, Int(ceil(frame.maxY * scaleY)))
+            func count(mirror: Bool) -> Int {
+                var changed = 0
+                for y in y0..<y1 {
+                    let row = mirror ? first.pixelsHigh - y - 1 : y
+                    for x in x0..<x1 {
+                        if first.colorAt(x: x, y: row) != second.colorAt(x: x, y: row) { changed += 1 }
+                    }
+                }
+                return changed
+            }
+            return max(count(mirror: false), count(mirror: true))
+        }
+        let beforePending = try await capture("collection/before-pending")
+        let beforeImage = renderedBitmap()
+        model.removeFromCollection(short.id)
+        try await wait("pending collection edit") { pendingGate.isWaiting && model.isUpdatingCollection }
+        let pendingNames = modalNames + ["collection-remove:" + short.id]
+        compare("collection/pending", beforePending, try await capture("collection/pending"), names: pendingNames)
+        let pendingImage = renderedBitmap()
+        guard let buttonFrame = beforePending["collection-remove:" + short.id] else { fatalError("Missing pending button frame") }
+        precondition(changedPixels(beforeImage, pendingImage, frame: buttonFrame) > 0,
+                     "Pending removal must visibly change its button")
+        precondition(model.isRemovingFromCollection(short.id) && model.isUpdatingCollection)
+        model.showCollection = false
+        install(AnyView(ContentView(model: model)), size: CGSize(width: 1280, height: 810))
+        let reviewPending = try await capture("collection/review-pending")
+        compare("collection/review-pending", reviewBeforePending, reviewPending, names: ["review-action"])
+        let reviewPendingImage = renderedBitmap()
+        guard let reviewFrame = reviewBeforePending["review-action"] else { fatalError("Missing review button frame") }
+        precondition(changedPixels(reviewBeforeImage, reviewPendingImage, frame: reviewFrame) > 0,
+                     "Pending edits must visibly disable Review Collection")
+        model.showCollection = true
+        install(AnyView(CollectionView(model: model)), size: modalSize)
+        try await settle()
+        pendingGate.semaphore.signal()
+        try await wait("pending collection edit finished") { !model.isUpdatingCollection }
+        precondition(!model.collection.contains { $0.id == short.id })
+        model.testBeforeCollectionEdit = {}
+        model.showCollection = false
 
         let largeURL = base.appendingPathComponent("large-list", isDirectory: true)
         let largeCount = 10_000
@@ -318,7 +457,10 @@ final class LayoutGate: @unchecked Sendable {
                                  size: largeNodes.reduce(0) { $0 + $1.size },
                                  allocatedSize: largeNodes.reduce(0) { $0 + $1.allocatedSize },
                                  fileCount: largeCount, children: largeNodes)
-        let largeModel = DiskModel(cacheDirectory: base.appendingPathComponent("large-cache"), preferences: prefs)
+        let sortGate = SortGate()
+        defer { sortGate.release.signal() }
+        let largeModel = DiskModel(cacheDirectory: base.appendingPathComponent("large-cache"), preferences: prefs,
+                                   sortStartObserver: { sortGate.observe() })
         largeModel.root = largeRoot
         largeModel.navigation = [largeRoot]
         RowEvaluationProbe.pathPrefix = largeURL.path + "/"
@@ -332,8 +474,18 @@ final class LayoutGate: @unchecked Sendable {
             }
             return nil
         }
-        guard let table = contentsTable(in: host.view), let clip = table.enclosingScrollView?.contentView else {
+        guard let initialTable = contentsTable(in: host.view), let initialClip = initialTable.enclosingScrollView?.contentView else {
             fatalError("The lazy-row fixture must expose all \(largeCount) rows in the native Contents table")
+        }
+        var table = initialTable
+        var clip = initialClip
+        func rebindAfterReset(_ label: String) async throws {
+            try await wait(label) { contentsTable(in: host.view).map { $0 !== table } ?? false }
+            guard let replacement = contentsTable(in: host.view), let replacementClip = replacement.enclosingScrollView?.contentView else {
+                fatalError("The replacement list must expose its native table")
+            }
+            table = replacement
+            clip = replacementClip
         }
         func renderedItemID(in view: NSView) -> String? {
             if let appearance = view as? SelectionAppearanceView { return appearance.itemID }
@@ -407,10 +559,70 @@ final class LayoutGate: @unchecked Sendable {
         largeModel.selectedID = largeNodes[0].id
         try await settle()
         RowEvaluationProbe.reset()
+        sortGate.arm()
         largeModel.sortByName = true
+        try await wait("large sort starts") { sortGate.hasStarted && largeModel.isSortingRows }
+        let hoverID = largeNodes[largeCount - 1].id
         largeModel.setMapHover(nodes: [largeNodes[largeCount - 1]], groupID: nil)
-        try await checkLazyPhase("same-count-sort-hover", row: largeCount - 1, hovered: true)
+        try await checkLazyPhase("hover-before-sort", row: 0, expectedID: hoverID, hovered: true)
+        precondition(largeModel.isSortingRows && largeModel.firstDisplayedRowIndex(matching: [hoverID]) == 0)
+        RowEvaluationProbe.reset()
+        sortGate.release.signal()
+        try await wait("large sort finishes") { !largeModel.isSortingRows }
+        try await rebindAfterReset("name sort list reset")
+        try await checkLazyPhase("same-count-sort-hover", row: largeCount - 1, expectedID: hoverID, hovered: true)
+        precondition(largeModel.firstDisplayedRowIndex(matching: [hoverID]) == largeCount - 1)
         if largeModel.selectedID != largeNodes[0].id { failures.append("Hover after sorting changed selection") }
+
+        RowEvaluationProbe.reset()
+        largeModel.sortByName = false
+        try await rebindAfterReset("size sort list reset")
+        try await checkLazyPhase("size-order-hover", row: 0, expectedID: hoverID, hovered: true)
+        precondition(largeModel.firstDisplayedRowIndex(matching: [hoverID]) == 0)
+        RowEvaluationProbe.reset()
+        largeModel.navigation = [largeRoot]
+        try await checkLazyPhase("same-count-reorder-hover", row: largeCount - 1, expectedID: hoverID, hovered: true)
+        precondition(largeModel.firstDisplayedRowIndex(matching: [hoverID]) == largeCount - 1)
+
+        largeModel.setMapHover(nodes: nil, groupID: nil)
+        largeModel.navigation = [DiskNode(url: largeURL, name: largeRoot.name, isDirectory: true,
+                                         size: largeRoot.size, allocatedSize: largeRoot.allocatedSize,
+                                         fileCount: largeCount, children: largeNodes.reversed())]
+        try await settle()
+        table.scrollRowToVisible(4_000)
+        let originalRect = table.rect(ofRow: 4_000)
+        clip.scroll(to: NSPoint(x: clip.bounds.minX, y: originalRect.minY + 7))
+        table.enclosingScrollView?.reflectScrolledClipView(clip)
+        try await settle()
+        let originalVisible = table.convert(clip.bounds, from: clip).intersection(table.bounds)
+        let anchorIndex = table.rows(in: originalVisible).location
+        precondition(anchorIndex != NSNotFound && anchorIndex > 0)
+        let anchorID = largeNodes[largeCount - 1 - anchorIndex].id
+        let anchorOffset = table.rect(ofRow: anchorIndex).minY - originalVisible.minY
+        window.keyForChecks = true
+        let acceptedFocus = window.makeFirstResponder(table)
+        precondition(window.isKeyWindow && acceptedFocus, "The large list must accept keyboard focus")
+        largeModel.sortByName = true
+        try await wait("scroll-context name sort") { !largeModel.isSortingRows }
+        try await rebindAfterReset("scroll-context list reset")
+        try await settle()
+        let restoredIndex = largeCount - 1 - anchorIndex
+        let restoredVisible = table.convert(clip.bounds, from: clip).intersection(table.bounds)
+        let restoredRows = table.rows(in: restoredVisible)
+        if !NSLocationInRange(restoredIndex, restoredRows)
+            || table.rowView(atRow: restoredIndex, makeIfNecessary: false).flatMap({ renderedItemID(in: $0) }) != anchorID
+            || abs((table.rect(ofRow: restoredIndex).minY - restoredVisible.minY) - anchorOffset) > 1 {
+            failures.append("Large sort failed to restore the visible row and pixel offset")
+        }
+        let responder = window.firstResponder as? NSView
+        if responder !== table && !(responder?.isDescendant(of: table) ?? false) {
+            failures.append("Large sort failed to restore list keyboard focus")
+        }
+        if largeModel.selectedID != largeNodes[0].id { failures.append("Large sort changed the selected item") }
+        largeModel.sortByName = false
+        try await rebindAfterReset("scroll-context size reset")
+        try await settle()
+        window.keyForChecks = false
 
         largeModel.query = "item"
         largeModel.searchResults = largeNodes

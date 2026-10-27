@@ -4,7 +4,7 @@ cd "${0:A:h}"
 swift build -c release --target OrbitCore
 build_path=$(swift build -c release --show-bin-path)
 framework_path="$PWD/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64"
-swiftc -parse-as-library -O -swift-version 5 \
+swiftc -parse-as-library -O -swift-version 5 -package-name orbitdisk \
   -target "$(uname -m)-apple-macosx14.0" \
   -I "$build_path/Modules" -I Sources/CSQLite -F "$framework_path" \
   -Xlinker -rpath -Xlinker "$framework_path" \

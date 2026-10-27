@@ -40,7 +40,6 @@ struct OrbitDiskApp: App {
             }
             CommandGroup(replacing: .newItem) {
                 Button("Open Folder…", action: model.chooseFolder).keyboardShortcut("o")
-                    .disabled(model.isRemoving)
                 Button("Refresh Full Map", action: model.rescan).keyboardShortcut("r")
                     .disabled(model.root == nil || model.isScanning || model.isRefreshing || model.isRemoving)
             }

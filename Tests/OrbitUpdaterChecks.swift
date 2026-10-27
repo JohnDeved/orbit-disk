@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import Sparkle
 
@@ -22,7 +23,12 @@ import Sparkle
         }
         precondition(delegate.applicationShouldTerminate(application) == .terminateNow)
 
-        model.isRemoving = true
+        var reentrantTerminationProtected = false
+        let observer = model.$isRemovingAcrossSessions.dropFirst().sink { active in
+            if active { reentrantTerminationProtected = delegate.applicationShouldTerminate(application) == .terminateCancel }
+        }
+        var activity = model.beginRemovalActivity()
+        precondition(reentrantTerminationProtected, "Termination must be blocked during the first removal notification")
         precondition(!updater.canCheckForUpdates, "File removal must immediately disable the update menu")
         for check in checks {
             do {
@@ -45,27 +51,44 @@ import Sparkle
         precondition(updater.updater(sparkle, shouldPostponeRelaunchForUpdate: item,
                                     untilInvokingBlock: { installations += 1 }))
         precondition(updater.isWaitingForRemoval && installations == 0)
-        model.isRemoving = false
-        model.isRemoving = true
+        model.endRemovalActivity(activity)
+        activity = model.beginRemovalActivity()
         try await Task.sleep(for: .milliseconds(30))
         precondition(installations == 0, "A new removal must cancel the queued opportunity to restart")
-        model.isRemoving = false
+        model.endRemovalActivity(activity)
         try await Task.sleep(for: .milliseconds(30))
         precondition(installations == 1 && !updater.isWaitingForRemoval)
-        model.isRemoving = true
-        model.isRemoving = false
+        activity = model.beginRemovalActivity()
+        model.endRemovalActivity(activity)
         try await Task.sleep(for: .milliseconds(30))
         precondition(installations == 1, "A postponed install callback must only run once")
         precondition(delegate.applicationShouldTerminate(application) == .terminateNow)
         precondition(!updater.updater(sparkle, shouldPostponeRelaunchForUpdate: item,
                                      untilInvokingBlock: { preconditionFailure("Unneeded postponement") }))
-        model.isRemoving = true
+        activity = model.beginRemovalActivity()
         precondition(updater.updater(sparkle, shouldPostponeRelaunchForUpdate: item,
                                     untilInvokingBlock: { preconditionFailure("Aborted update restarted") }))
         updater.updater(sparkle, didAbortWithError: NSError(domain: "OrbitUpdaterChecks", code: 1))
-        model.isRemoving = false
+        model.endRemovalActivity(activity)
         try await Task.sleep(for: .milliseconds(30))
         precondition(!updater.isWaitingForRemoval)
+        let first = model.beginRemovalActivity()
+        var nested: UUID?
+        let reentrantStart = model.$isRemovingAcrossSessions.dropFirst().sink { active in
+            if !active && nested == nil { nested = model.beginRemovalActivity() }
+        }
+        var nestedInstallations = 0
+        precondition(updater.updater(sparkle, shouldPostponeRelaunchForUpdate: item,
+                                    untilInvokingBlock: { nestedInstallations += 1 }))
+        model.endRemovalActivity(first)
+        precondition(model.hasActiveRemovals && model.isRemovingAcrossSessions && nested != nil)
+        try await Task.sleep(for: .milliseconds(30))
+        precondition(nestedInstallations == 0)
+        reentrantStart.cancel()
+        model.endRemovalActivity(nested!)
+        try await Task.sleep(for: .milliseconds(30))
+        precondition(!model.hasActiveRemovals && !model.isRemovingAcrossSessions && nestedInstallations == 1)
+        withExtendedLifetime(observer) {}
         print("PASS: manual/background/probe checks, late discovery, quit protection, deferred restart, repeated removal, exactly-once continuation, and aborted update cleanup")
     }
 }

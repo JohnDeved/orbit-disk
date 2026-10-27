@@ -2,6 +2,8 @@ import SwiftUI
 import OrbitCore
 
 struct FileRowView: View {
+    // The 340-point panel reserves room for the scrollbar before AppKit lays it out.
+    private static let contentWidth: CGFloat = 266
     @ObservedObject var model: DiskModel
     let item: DiskNode
     let parentSize: Int64
@@ -26,16 +28,18 @@ struct FileRowView: View {
                             .font(.system(size: 10, weight: .medium)).foregroundStyle(.white).lineLimit(1).fixedSize()
                     }
                     if collectionState == .none || model.isFiltering {
-                        Text(model.isFiltering ? item.url.deletingLastPathComponent().path : !item.isAccessible ? "Not scanned" : item.scanState == .pending ? "Waiting to map" : item.scanState == .scanning ? "\(item.fileCount.formatted()) files found · \(model.isScanning ? "Mapping" : "Incomplete")" : item.isSymbolicLink ? "Symbolic link" : item.isDirectory ? "\(item.fileCount.formatted()) \(item.fileCount == 1 ? "file" : "files")" : item.url.pathExtension.uppercased().isEmpty ? "File" : item.url.pathExtension.uppercased())
+                        Text(model.isFiltering ? item.url.deletingLastPathComponent().path : model.isUpdatingRemovalSizes && item.isDirectory ? "Updating sizes" : !item.isAccessible ? "Not scanned" : item.scanState == .pending ? "Waiting to map" : item.scanState == .scanning ? "\(item.fileCount.formatted()) files found · \(model.isScanning ? "Mapping" : "Incomplete")" : item.isSymbolicLink ? "Symbolic link" : item.isDirectory ? "\(item.fileCount.formatted()) \(item.fileCount == 1 ? "file" : "files")" : item.url.pathExtension.uppercased().isEmpty ? "File" : item.url.pathExtension.uppercased())
                             .font(.system(size: 10)).foregroundStyle(OrbitStyle.muted).lineLimit(1).truncationMode(.middle)
                     }
                 }.frame(height: 13, alignment: .leading)
             }.frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             VStack(alignment: .trailing, spacing: 4) {
-                Text(!item.isAccessible ? "Unavailable" : item.scanState == .pending ? "Waiting" : formatBytes(item.size))
+                Text(model.isUpdatingRemovalSizes ? "Updating…" : !item.isAccessible ? "Unavailable" : item.scanState == .pending ? "Waiting" : formatBytes(item.size))
                     .font(.system(size: 12, weight: .medium)).monospacedDigit().lineLimit(1)
                 ZStack(alignment: .trailing) {
-                    if item.scanState == .scanning {
+                    if model.isUpdatingRemovalSizes {
+                        Text("")
+                    } else if item.scanState == .scanning {
                         Text("so far")
                     } else if !model.isFiltering && item.isScanComplete {
                         Text(percent, format: .percent.precision(.fractionLength(1)))
@@ -61,11 +65,8 @@ struct FileRowView: View {
             }
         }
         .frame(height: 40)
-        .padding(.vertical, 7).padding(.horizontal, 5).contentShape(Rectangle())
-        .background(ListSelectionAppearance(hoverTracking: listHoverTracking, itemID: item.id) { [weak model] id in
-            guard let model, model.hoveredListID != id else { return }
-            model.hoveredListID = id
-        }.accessibilityHidden(true))
+        .padding(.vertical, 7).padding(.horizontal, 5)
+        .frame(maxWidth: Self.contentWidth, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 7)
             .fill(selected ? Color(red: 0.29, green: 0.18, blue: 0.16) : hovered ? Color(red: 0.145, green: 0.157, blue: 0.184) : .clear))
         .overlay {
@@ -74,8 +75,14 @@ struct FileRowView: View {
                               lineWidth: selected ? 2.5 : 1)
                 .allowsHitTesting(false)
         }
+        .frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+        .background(ListSelectionAppearance(hoverTracking: listHoverTracking, itemID: item.id) { [weak model] id in
+            guard let model, model.hoveredListID != id else { return }
+            model.hoveredListID = id
+        }.accessibilityHidden(true))
         .overlay {
             ListRowInteractionView(node: item, trailingExclusion: item.isDirectory ? 43 : 0,
+                                   contentWidth: Self.contentWidth,
                                    onSelect: { model.selectedID = $0.id },
                                    onOpen: { node in
                                        if node.isDirectory { model.open(node) }

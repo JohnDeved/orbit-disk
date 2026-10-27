@@ -7,7 +7,8 @@ package enum BulkDirectory {
     static let file = UInt32(ATTR_FILE_LINKCOUNT | ATTR_FILE_ALLOCSIZE | ATTR_FILE_DATALENGTH)
 
     package static func read(_ descriptor: Int32, url: URL, cancellation: ScanCancellation,
-                     progress: (Int, Int64) -> Void, issue: (String) -> Void) throws -> [FileMetadata] {
+                     progress: (Int, Int64) -> Void, issue: (String) -> Void,
+                     batch: ([FileMetadata]) throws -> Void = { _ in }) throws -> [FileMetadata] {
         var attributes = attrlist(bitmapcount: UInt16(ATTR_BIT_MAP_COUNT), reserved: 0,
                                   commonattr: common, volattr: 0, dirattr: UInt32(ATTR_DIR_MOUNTSTATUS),
                                   fileattr: file, forkattr: 0)
@@ -81,6 +82,7 @@ package enum BulkDirectory {
                     allocatedSize: isDirectory ? 0 : max(0, record.loadUnaligned(fromByteOffset: 56, as: Int64.self))))
                 bytes += entries[entries.count - 1].size
             }
+            try batch(entries)
             progress(entries.count, bytes)
         }
     }

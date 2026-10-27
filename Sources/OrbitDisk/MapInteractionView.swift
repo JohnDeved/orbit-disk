@@ -259,12 +259,45 @@ final class MapInteractionNSView: NSView, NSDraggingSource {
 
 final class MapHitRegions {
     private let paths: [Path]
+    private let bounds: CGRect
+    private let buckets: [[Int]]
+    private static let gridSize = 32
 
     init(segments: [SunburstSegment], metrics: SunburstMetrics) {
-        paths = segments.map { $0.path(metrics: metrics) }
+        let paths = segments.map { $0.path(metrics: metrics) }
+        // SwiftUI path bounds can be rounded slightly inward relative to hit testing.
+        let padding = max(0.01, max(abs(metrics.center.x), abs(metrics.center.y)) * 0.00001)
+        let pathBounds = paths.map { $0.boundingRect.insetBy(dx: -padding, dy: -padding) }
+        let bounds = pathBounds.reduce(CGRect.null) { $0.union($1) }
+        var buckets = Array(repeating: [Int](), count: Self.gridSize * Self.gridSize)
+        if !bounds.isNull && bounds.width > 0 && bounds.height > 0 {
+            for (index, rect) in pathBounds.enumerated() {
+                guard !rect.isNull else { continue }
+                let minX = Self.cell(rect.minX, origin: bounds.minX, length: bounds.width)
+                let maxX = Self.cell(rect.maxX, origin: bounds.minX, length: bounds.width)
+                let minY = Self.cell(rect.minY, origin: bounds.minY, length: bounds.height)
+                let maxY = Self.cell(rect.maxY, origin: bounds.minY, length: bounds.height)
+                for y in minY...maxY {
+                    for x in minX...maxX { buckets[y * Self.gridSize + x].append(index) }
+                }
+            }
+        }
+        self.paths = paths
+        self.bounds = bounds
+        self.buckets = buckets
     }
 
     func index(at point: CGPoint) -> Int? {
-        paths.firstIndex { $0.contains(point) }
+        guard point.x.isFinite, point.y.isFinite, !bounds.isNull,
+              bounds.width > 0, bounds.height > 0,
+              point.x >= bounds.minX, point.x <= bounds.maxX,
+              point.y >= bounds.minY, point.y <= bounds.maxY else { return nil }
+        let x = Self.cell(point.x, origin: bounds.minX, length: bounds.width)
+        let y = Self.cell(point.y, origin: bounds.minY, length: bounds.height)
+        return buckets[y * Self.gridSize + x].first { paths[$0].contains(point) }
+    }
+
+    private static func cell(_ value: CGFloat, origin: CGFloat, length: CGFloat) -> Int {
+        min(gridSize - 1, max(0, Int((value - origin) / length * CGFloat(gridSize))))
     }
 }

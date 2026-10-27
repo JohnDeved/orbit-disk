@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import OrbitCore
 
@@ -30,6 +31,17 @@ private final class PreviewGate: @unchecked Sendable {
         lock.unlock()
     }
 
+    func pauseOnce() {
+        lock.lock()
+        let shouldWait = !released && callbacks == 0
+        if shouldWait { callbacks = 1; waiting = true }
+        lock.unlock()
+        if shouldWait {
+            semaphore.wait()
+            lock.lock(); waiting = false; lock.unlock()
+        }
+    }
+
     func release() {
         lock.lock()
         released = true
@@ -38,7 +50,52 @@ private final class PreviewGate: @unchecked Sendable {
     }
 }
 
+final class CollectionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let semaphore = DispatchSemaphore(value: 0)
+    private var armed = false
+    private var waiting = false
+    func arm() { lock.lock(); armed = true; waiting = false; lock.unlock() }
+    var isWaiting: Bool { lock.lock(); defer { lock.unlock() }; return waiting }
+    func blockOnce() {
+        lock.lock(); let take = armed; if take { armed = false; waiting = true }; lock.unlock()
+        guard take else { return }
+        semaphore.wait()
+        lock.lock(); waiting = false; lock.unlock()
+    }
+    func release() { semaphore.signal() }
+}
+
 @main struct ModelCheck {
+    static func checkCollectedAncestorParity() {
+        func reference(_ path: String, _ collected: Set<String>, _ includingSelf: Bool) -> Bool {
+            var candidate = includingSelf ? path : URL(fileURLWithPath: path).deletingLastPathComponent().path
+            while true {
+                if collected.contains(candidate) { return true }
+                if candidate == "/" { return false }
+                let next = URL(fileURLWithPath: candidate).deletingLastPathComponent().path
+                if next == candidate { return false }
+                candidate = next
+            }
+        }
+        let paths = ["/", "/a/b/c", "/a//b", "/a/b/", "/a/./b", "/a/../b", "/a/.", "/a/..",
+                     "/a/é/file", "/a/e\u{0301}/file", "/a/\u{0301}name", "/a/\0b/c", "relative/file", "../file"]
+        for path in paths {
+            let parent = URL(fileURLWithPath: path).deletingLastPathComponent().path
+            for collected in [Set<String>(), ["/"], [parent], [path], ["/unrelated"], ["/a/é"]] {
+                for includingSelf in [false, true] {
+                    precondition(hasCollectedAncestor(path, in: collected, includingSelf: includingSelf)
+                                 == reference(path, collected, includingSelf), "Collection path ancestry must match Foundation")
+                }
+            }
+        }
+        for path in ["/a/../b", "/a/.."] {
+            precondition(!hasCollectedAncestor(path, in: []))
+            precondition(hasCollectedAncestor(path, in: ["/a/.."]))
+        }
+        print("PASS: collection ancestor lookup matches Foundation for normalized, unusual, Unicode and relative paths")
+    }
+
     static func checkCollectionCoverage() {
         let empty = CollectionCoverage()
         precondition(empty.state(for: "/") == .none && empty.state(for: [String]()) == .none)
@@ -60,6 +117,13 @@ private final class PreviewGate: @unchecked Sendable {
         precondition(exactPaths.state(for: composed + "/child") == .included)
         precondition(exactPaths.state(for: decomposed + "/child") == .none,
                      "Distinct Unicode path encodings must not be merged by string comparison")
+        let repeated = CollectionCoverage(paths: ["/a/b/one", "/a/b/two", "/a/c/three", "/K/one", "/\u{212A}/two"])
+        for path in ["/", "/a", "/a/b", "/a/c", "/K", "/\u{212A}"] {
+            precondition(repeated.state(for: path) == .containsItems, "Shared ancestors must remain discoverable")
+        }
+        precondition(repeated.state(for: "/a/b/one") == .included && repeated.state(for: "/a/b/missing") == .none)
+        precondition(repeated.state(for: "/K/two") == .none && repeated.state(for: "/\u{212A}/one") == .none,
+                     "Equivalent Unicode spellings must keep separate ancestor chains")
         print("PASS: collection coverage boundaries, Unicode paths, inherited folders, ancestors, mixed groups, and root handling")
     }
 
@@ -166,6 +230,90 @@ private final class PreviewGate: @unchecked Sendable {
         print("PASS: list identity reuse, navigation, search, sort changes, and same-ID metadata refreshes")
     }
 
+    static func checkRefreshPlanner(base: URL) throws {
+        let composed = "/\u{00E9}"
+        let decomposed = "/e\u{0301}"
+        precondition(composed == decomposed && Data(composed.utf8) != Data(decomposed.utf8))
+        var cache = RefreshIndexMetadataCache()
+        var reads = 0
+        let firstMetadata = cache.lookup(composed) { reads += 1; return (true, false) }
+        let secondMetadata = cache.lookup(decomposed) { reads += 1; return (false, true) }
+        precondition(firstMetadata?.isDirectory == true && firstMetadata?.isAccessible == false)
+        precondition(secondMetadata?.isDirectory == false && secondMetadata?.isAccessible == true)
+        _ = cache.lookup("missing" + composed) { reads += 1; return nil }
+        let present = cache.lookup("missing" + decomposed) { reads += 1; return (true, true) }
+        _ = cache.lookup(composed) { reads += 1; return nil }
+        _ = cache.lookup("missing" + composed) { reads += 1; return (false, false) }
+        precondition(present?.isDirectory == true && reads == 4, "Indexed paths and cached misses must use byte-exact keys")
+        let fm = FileManager.default
+        let root = base.appendingPathComponent("planner-root")
+        let first = root.appendingPathComponent("a")
+        let child = first.appendingPathComponent("child")
+        let sibling = root.appendingPathComponent("ab")
+        let outside = base.appendingPathComponent("planner-outside")
+        for directory in [child, sibling, outside] {
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        let store = DiskIndexStore(directory: base.appendingPathComponent("planner-index"))
+        let snapshot = try store.save(DiskScanner().scan(root), eventID: 1, eventIdentity: "fixture")
+        let overlapping = try refreshDirectories([first.path, child.path, sibling.path, outside.path], store: store, snapshot: snapshot)
+        precondition(Set(overlapping) == [first.path, sibling.path], "Only true descendants should be coalesced")
+        let missing = try refreshDirectories([child.appendingPathComponent("new/file").path], store: store, snapshot: snapshot)
+        precondition(missing == [child.path], "Missing paths must refresh their nearest indexed folder")
+
+        let savedChild = base.appendingPathComponent("planner-saved-child")
+        try fm.moveItem(at: child, to: savedChild)
+        try fm.createSymbolicLink(at: child, withDestinationURL: outside)
+        let replaced = try refreshDirectories([child.path], store: store, snapshot: snapshot)
+        precondition(replaced == [first.path], "A replaced ancestor must be refreshed without following its link")
+        try fm.removeItem(at: child)
+        try fm.moveItem(at: savedChild, to: child)
+
+        let cancelled = ScanCancellation()
+        cancelled.cancel()
+        do {
+            _ = try refreshDirectories([first.path], store: store, snapshot: snapshot, cancellation: cancelled)
+            preconditionFailure("Cancelled refresh planning must stop")
+        } catch is CancellationError {}
+        _ = try store.save(DiskScanner().scan(root), eventID: 2, eventIdentity: "fixture")
+        do {
+            _ = try refreshDirectories([first.path], store: store, snapshot: snapshot)
+            preconditionFailure("Refresh planning must reject a stale snapshot")
+        } catch DiskIndexError.staleSnapshot {}
+        print("PASS: refresh planning coalesces paths, protects replaced ancestors, and honors cancellation and snapshot revisions")
+    }
+
+    @MainActor static func checkLargeListHoverLookup(base: URL, preferences: UserDefaults) {
+        let rootURL = base.appendingPathComponent("large-list")
+        let children = (0..<1_200).map { index in
+            let name = String(format: "%04d", 1_199 - index)
+            return DiskNode(url: rootURL.appendingPathComponent(name), name: name, isDirectory: false,
+                            size: 1, allocatedSize: 1, fileCount: 1)
+        }
+        func folder(_ children: [DiskNode]) -> DiskNode {
+            DiskNode(url: rootURL, name: "large-list", isDirectory: true, size: 1_200,
+                     allocatedSize: 1_200, fileCount: 1_200, children: children)
+        }
+        let model = DiskModel(cacheDirectory: base.appendingPathComponent("large-list-cache"), preferences: preferences)
+        model.navigation = [folder(children)]
+        let ids: Set<String> = [children[1_190].id, children[800].id]
+        precondition(model.firstDisplayedRowIndex(matching: ids) == 800)
+        precondition(model.firstDisplayedRowIndex(matching: ["/missing"]) == nil)
+        model.sortByName = true
+        precondition(model.firstDisplayedRowIndex(matching: ids) == 9, "Sorting must invalidate row indices")
+        model.sortByName = false
+        let reversed = Array(children.reversed())
+        model.navigation = [folder(reversed)]
+        precondition(model.firstDisplayedRowIndex(matching: ids) == 9, "Refreshing a folder must invalidate row indices")
+        model.query = "fixture"
+        model.searchResults = children
+        precondition(model.firstDisplayedRowIndex(matching: ids) == 800)
+        model.searchResults = reversed
+        precondition(model.firstDisplayedRowIndex(matching: ids) == 9, "Search result changes must invalidate row indices")
+        precondition(model.firstDisplayedRowIndex(matching: Set(children.map(\.id))) == 0)
+        print("PASS: large-list hover row lookup follows sorting, refresh, and search changes")
+    }
+
     @MainActor static func checkPreparedGroupHover(base: URL, preferences: UserDefaults) {
         for rootPath in [base.appendingPathComponent("prepared-hover").path, "/"] {
             let prefix = rootPath == "/" ? "/" : rootPath + "/"
@@ -237,6 +385,13 @@ private final class PreviewGate: @unchecked Sendable {
     }
 
     @MainActor static func checkProgressiveMapping(base: URL, preferences: UserDefaults) async throws {
+        func gateAtListing(_ model: DiskModel, _ gate: PreviewGate, _ root: URL) {
+            model.testAfterStageStep = { stage in
+                guard let view = try? stage.view(path: nil, removals: [], cancellation: ScanCancellation()),
+                      view.folder.id == root.path, view.folder.children.count == 2, !view.isListing else { return }
+                gate.pauseOnce()
+            }
+        }
         let fm = FileManager.default
         let root = base.appendingPathComponent("progressive-fixture")
         let folder = root.appendingPathComponent("Pending")
@@ -247,11 +402,13 @@ private final class PreviewGate: @unchecked Sendable {
         let cache = base.appendingPathComponent("progressive-cache")
         let gate = PreviewGate()
         defer { gate.release() }
-        let model = DiskModel(cacheDirectory: cache, preferences: preferences, scanProgressObserver: { gate.observe($0) })
+        let model = DiskModel(cacheDirectory: cache, preferences: preferences)
+        gateAtListing(model, gate, root)
         let started = Date()
         model.scan(root)
         try await wait("first partial listing", timeout: 4) {
-            gate.isWaiting && model.current?.children.count == 2 && model.isPartialMap
+            gate.isWaiting && model.isPartialMap && model.current?.children.count == 2 &&
+                model.current?.children.first(where: { $0.id == leaf.path })?.isScanComplete == true
         }
         let firstPreviewTime = Date().timeIntervalSince(started)
         precondition(model.isScanning && model.indexedAt == nil && model.scanResult == nil)
@@ -260,15 +417,11 @@ private final class PreviewGate: @unchecked Sendable {
         let pending = model.current!.children.first { $0.id == folder.path }!
         let ready = model.current!.children.first { $0.id == leaf.path }!
         precondition(!pending.isScanComplete && pending.children.isEmpty && ready.isScanComplete)
-        precondition(!model.canCollect(pending) && !model.collect([pending]) && model.collection.isEmpty,
-                     "Incomplete folders must not enter collection")
+        precondition(model.canCollect(pending), "Visible incomplete folders must be collectable")
         precondition(model.canCollect(ready) && model.collect([ready]))
-        model.moveCollectionToTrash()
-        model.deleteCollectionPermanently()
-        precondition(!model.isRemoving && fm.fileExists(atPath: leaf.path) && model.collection.count == 1,
-                     "Both removal routes must stay blocked until the complete map is persisted")
         model.query = "ready"
-        precondition(!model.isSearching && model.searchResults.isEmpty, "Partial maps must not search an earlier saved index")
+        try await wait("partial preview search") { !model.isSearching && model.searchResults.contains { $0.id == ready.id } }
+        precondition(model.isPartialMap, "Partial search must use the current preview")
         model.query = ""
         model.open(pending)
         try await wait("browse pending folder") { model.current?.id == folder.path && !model.isOpeningFolder }
@@ -295,8 +448,8 @@ private final class PreviewGate: @unchecked Sendable {
 
         let cancelGate = PreviewGate()
         defer { cancelGate.release() }
-        let paused = DiskModel(cacheDirectory: base.appendingPathComponent("paused-preview-cache"), preferences: preferences,
-                               scanProgressObserver: { cancelGate.observe($0) })
+        let paused = DiskModel(cacheDirectory: base.appendingPathComponent("paused-preview-cache"), preferences: preferences)
+        gateAtListing(paused, cancelGate, root)
         paused.scan(root)
         try await wait("cancel fixture partial") { cancelGate.isWaiting && paused.current?.children.count == 2 }
         paused.open(paused.current!.children.first { $0.id == folder.path }!)
@@ -308,7 +461,14 @@ private final class PreviewGate: @unchecked Sendable {
         try await wait("paused partial navigation") { paused.current?.id == root.path && !paused.isOpeningFolder }
         paused.open(paused.current!.children.first { $0.id == folder.path }!)
         try await wait("paused pending folder navigation") { paused.current?.id == folder.path && !paused.isOpeningFolder }
+        cancelGate.arm(callback: 1)
+        paused.testAfterStageAttach = { cancelGate.pauseOnce() }
         paused.rescan()
+        try await wait("restart before folder discovery") { cancelGate.isWaiting }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        precondition(paused.current?.id == folder.path,
+                     "Restart must not discard an existing route before rediscovering its parent listing")
+        cancelGate.release()
         try await wait("restart partial scan") { !paused.isScanning && !paused.isOpeningFolder && !paused.isPartialMap }
         precondition(paused.current?.id == folder.path && paused.current?.children.first?.name == "inside.bin",
                      "Restart and final persistence must retain the folder visited in a partial map")
@@ -316,8 +476,8 @@ private final class PreviewGate: @unchecked Sendable {
 
         let selectionGate = PreviewGate()
         defer { selectionGate.release() }
-        let selectionModel = DiskModel(cacheDirectory: base.appendingPathComponent("selection-preview-cache"), preferences: preferences,
-                                       scanProgressObserver: { selectionGate.observe($0) })
+        let selectionModel = DiskModel(cacheDirectory: base.appendingPathComponent("selection-preview-cache"), preferences: preferences)
+        gateAtListing(selectionModel, selectionGate, root)
         selectionModel.scan(root)
         try await wait("selection fixture partial") { selectionGate.isWaiting && selectionModel.current?.children.count == 2 }
         selectionModel.selectedID = leaf.path
@@ -325,12 +485,13 @@ private final class PreviewGate: @unchecked Sendable {
         selectionGate.release()
         try await wait("cancelled selection worker") { !selectionGate.isWaiting }
         selectionGate.arm(callback: 1)
+        selectionModel.testAfterStageAttach = { selectionGate.pauseOnce() }
         selectionModel.rescan()
-        try await wait("restart empty preview shell") {
-            selectionGate.isWaiting && selectionModel.current?.children.isEmpty == true
+        try await wait("restart retains partial preview") {
+            selectionGate.isWaiting && selectionModel.current?.children.count == 2
         }
-        precondition(selectionModel.selectedID == leaf.path && selectionModel.selected == nil,
-                     "A restarted scan must retain selection while its new root shell has no children yet")
+        precondition(selectionModel.selectedID == leaf.path && selectionModel.selected?.id == leaf.path,
+                     "A restarted scan must retain its partial map and selection")
         selectionGate.release()
         try await wait("selection after restart") { !selectionModel.isScanning && !selectionModel.isPartialMap }
         precondition(selectionModel.selectedID == leaf.path && selectionModel.selected?.id == leaf.path)
@@ -341,8 +502,8 @@ private final class PreviewGate: @unchecked Sendable {
         try Data([8]).write(to: switchedRoot.appendingPathComponent("different.bin"))
         let switchGate = PreviewGate()
         defer { switchGate.release() }
-        let switched = DiskModel(cacheDirectory: base.appendingPathComponent("switched-preview-cache"), preferences: preferences,
-                                 scanProgressObserver: { switchGate.observe($0) })
+        let switched = DiskModel(cacheDirectory: base.appendingPathComponent("switched-preview-cache"), preferences: preferences)
+        gateAtListing(switched, switchGate, root)
         switched.scan(root)
         try await wait("switch fixture partial") { switchGate.isWaiting && switched.current?.children.count == 2 }
         switched.scan(switchedRoot)
@@ -356,7 +517,8 @@ private final class PreviewGate: @unchecked Sendable {
         let failureCache = base.appendingPathComponent("failed-save-preview-cache")
         let failureGate = PreviewGate()
         defer { failureGate.release() }
-        let failed = DiskModel(cacheDirectory: failureCache, preferences: preferences, scanProgressObserver: { failureGate.observe($0) })
+        let failed = DiskModel(cacheDirectory: failureCache, preferences: preferences)
+        gateAtListing(failed, failureGate, root)
         failed.scan(root)
         try await wait("save failure fixture partial") { failureGate.isWaiting && failed.current?.children.count == 2 }
         failed.open(failed.current!.children.first { $0.id == folder.path }!)
@@ -370,11 +532,191 @@ private final class PreviewGate: @unchecked Sendable {
                      "A completed in-memory scan must remain browsable when persistence fails")
         precondition(failed.collect([failed.current!.children[0]]))
         failed.deleteCollectionPermanently()
-        precondition(!failed.isRemoving && fm.fileExists(atPath: folder.appendingPathComponent("inside.bin").path))
+        try await wait("remove from failed-save partial map") { !failed.isRemoving && !fm.fileExists(atPath: folder.appendingPathComponent("inside.bin").path) }
         failed.goBack()
         try await wait("failed-save parent navigation") { failed.current?.id == root.path && !failed.isOpeningFolder }
         failed.cancelScan()
         print("PASS: partial map retained after cancel, pending navigation after stop, restart route retention, stale root-switch suppression, failed-save browsing and removal lock")
+    }
+
+    @MainActor static func checkLargeSavedFolder(base: URL, preferences: UserDefaults) async throws {
+        let fm = FileManager.default
+        let root = base.appendingPathComponent("large-saved-fixture")
+        let cache = base.appendingPathComponent("large-saved-index")
+        let firstURL = root.appendingPathComponent("first-folder", isDirectory: true)
+        let secondURL = root.appendingPathComponent("second-folder", isDirectory: true)
+        try fm.createDirectory(at: firstURL, withIntermediateDirectories: true)
+        try fm.createDirectory(at: secondURL, withIntermediateDirectories: true)
+        let fileCount = 3_000
+        for index in 0..<fileCount {
+            try Data([1]).write(to: root.appendingPathComponent("document-\(index).bin"))
+        }
+        let targetID = root.appendingPathComponent("document-2999.bin").path
+        let checkpoint = try DiskChangeMonitor.capture(root: root)
+        let scanned = try DiskScanner().scan(root)
+        _ = try DiskIndexStore(directory: cache).save(scanned,
+                                                     eventID: checkpoint.eventID, eventIdentity: checkpoint.identity)
+        let model = DiskModel(cacheDirectory: cache, preferences: preferences)
+        model.scan(root)
+        try await wait("large saved root") { model.isSavedMap && !model.isScanning && model.current?.children.count == fileCount + 2 }
+        precondition(model.displayedItems.count == fileCount + 2 && model.childColorIndices.count == fileCount + 2)
+        let preparedItems = model.displayedItems
+        precondition(!model.displayedNodes.isEmpty)
+        precondition(preparedItems.withUnsafeBufferPointer { prepared in
+            model.displayedItems.withUnsafeBufferPointer { prepared.baseAddress == $0.baseAddress }
+        }, "Reading displayed nodes must retain the prepared row identities")
+        precondition(model.node(withID: targetID)?.size == 1)
+        model.query = "document-2999"
+        try await wait("large saved search") { !model.isSearching && model.searchResults.count == 1 }
+        precondition(model.displayedItems.first?.id == targetID)
+        model.query = ""
+        let first = model.current!.children.first { $0.id == firstURL.path }!
+        let second = model.current!.children.first { $0.id == secondURL.path }!
+        model.open(first)
+        model.open(second)
+        try await wait("latest large-folder navigation") { model.current?.id == secondURL.path && !model.isOpeningFolder }
+        model.query = "document"
+        try await wait("large filtered subfolder search") { !model.isSearching && model.searchResults.count == 300 }
+        let searchOnlyID = model.searchResults[0].id
+        model.selectedID = searchOnlyID
+        try Data([8]).write(to: secondURL.appendingPathComponent("new.bin"))
+        try await wait("large filtered subfolder refresh") {
+            model.current?.children.count == 1 && !model.isRefreshing && !model.isOpeningFolder && !model.isSearching
+        }
+        precondition(model.isFiltering && model.searchResults.count == 300 && model.searchResults.allSatisfy { model.node(withID: $0.id) != nil }
+                     && model.selectedID == searchOnlyID && model.node(withID: searchOnlyID) != nil,
+                     "Refreshing a filtered folder must retain current and selected search-result lookups")
+        model.query = ""
+        model.goBack()
+        precondition(model.isOpeningFolder, "A cached large folder must prepare off the main actor")
+        model.open(first)
+        try await wait("superseded large-folder navigation") { model.current?.id == firstURL.path && !model.isOpeningFolder }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        precondition(model.current?.id == firstURL.path, "A stale background preparation must not replace newer navigation")
+        model.goBack()
+        try await wait("cached large-folder return") { model.current?.id == root.path && !model.isOpeningFolder }
+        precondition(model.displayedItems.count == fileCount + 2 && model.node(withID: targetID)?.size == 1)
+        model.selectedID = targetID
+        let sizeItems = model.displayedItems
+        let sizeOrder = sizeItems.map(\.id)
+        model.sortByName = true
+        precondition(model.isSortingRows && model.displayedItems.map(\.id) == sizeOrder && model.selectedID == targetID,
+                     "The existing rows and selection must remain usable while a large name sort runs")
+        precondition(sizeItems.withUnsafeBufferPointer { previous in
+            model.displayedItems.withUnsafeBufferPointer { previous.baseAddress == $0.baseAddress }
+        }, "Starting a background sort must reuse the displayed row identities")
+        model.sortByName = false
+        precondition(!model.isSortingRows && model.displayedItems.map(\.id) == sizeOrder)
+        precondition(sizeItems.withUnsafeBufferPointer { previous in
+            model.displayedItems.withUnsafeBufferPointer { previous.baseAddress == $0.baseAddress }
+        }, "Cancelling the sort must retain the still-visible row identities")
+        try await Task.sleep(nanoseconds: 200_000_000)
+        precondition(!model.sortByName && model.displayedItems.map(\.id) == sizeOrder,
+                     "A cancelled name sort must not replace a later size order")
+        model.sortByName = true
+        precondition(model.isSortingRows)
+        model.query = "document-2999"
+        try await wait("search supersedes large sort") { !model.isSearching && !model.isSortingRows && model.searchResults.count == 1 }
+        precondition(model.displayedItems.map(\.id) == [targetID])
+        model.setMapInteractionActive(true)
+        model.query = ""
+        try await Task.sleep(nanoseconds: 250_000_000)
+        precondition(model.isSortingRows && model.displayedItems.map(\.id) == sizeOrder,
+                     "A held map or row gesture must defer publishing a background sort")
+        model.setMapInteractionActive(false)
+        try await wait("large name sort") { !model.isSortingRows && model.displayedNodes.count == fileCount + 2 }
+        let names = model.displayedNodes.map(\.name)
+        precondition(zip(names, names.dropFirst()).allSatisfy { $0.localizedStandardCompare($1) != .orderedDescending },
+                     "The completed background sort must use localized name ordering")
+        model.sortByName = false
+        precondition(sizeItems.withUnsafeBufferPointer { previous in
+            model.displayedItems.withUnsafeBufferPointer { previous.baseAddress == $0.baseAddress }
+        }, "Returning to size order must reuse the prepared rows")
+        try Data([1, 2]).write(to: URL(fileURLWithPath: targetID))
+        try await wait("same-count folder metadata refresh") {
+            model.node(withID: targetID)?.size == 2 && !model.isRefreshing && !model.isOpeningFolder
+        }
+        precondition(model.current?.children.count == fileCount + 2
+                     && model.displayedItems.first(where: { $0.id == targetID })?.node.size == 2,
+                     "A same-count refresh must replace cached row metadata")
+        model.query = "document-2999"
+        try await wait("refreshed search metadata") { !model.isSearching && model.searchResults.count == 1 }
+        precondition(model.displayedItems.first?.node.size == 2)
+        model.query = ""
+        precondition(model.displayedItems.first(where: { $0.id == targetID })?.node.size == 2,
+                     "Leaving search must restore the refreshed size-order rows")
+        model.cancelScan()
+
+        let previewCache = base.appendingPathComponent("large-preview-index")
+        let gate = PreviewGate()
+        defer { gate.release() }
+        let preview = DiskModel(cacheDirectory: previewCache, preferences: preferences)
+        gate.arm(callback: 1)
+        preview.testAfterStageStep = { stage in
+            guard let view = try? stage.view(path: nil, removals: [], cancellation: ScanCancellation()),
+                  view.folder.children.count == fileCount + 2 else { return }
+            gate.pauseOnce()
+        }
+        preview.scan(root)
+        try await wait("large preview listing") {
+            gate.isWaiting && preview.isPartialMap && preview.current?.children.count == fileCount + 2
+        }
+        precondition(preview.displayedItems.count == fileCount + 2 && preview.node(withID: targetID)?.size == 2)
+        let previewColors = preview.childColorIndices
+        let heldRevision = preview.mapRevision
+        preview.setMapInteractionActive(true)
+        gate.release()
+        try await wait("large preview index save") { DiskIndexStore(directory: previewCache).savedSnapshot(for: root) != nil }
+        precondition(preview.isPartialMap && preview.mapRevision == heldRevision,
+                     "A held graph gesture must defer a large preview and its final handoff")
+        preview.setMapInteractionActive(false)
+        try await wait("large preview completion") { !preview.isScanning && !preview.isPartialMap && !preview.isOpeningFolder }
+        precondition(preview.childColorIndices == previewColors && preview.node(withID: targetID)?.size == 2)
+        preview.cancelScan()
+        print("PASS: large saved and preview folders, filtered refresh, search, cached reopening, stale navigation, deferred gesture, and cancellable name sorting")
+    }
+
+    @MainActor static func checkSearchResultRetention(base: URL, preferences: UserDefaults) async throws {
+        let root = base.appendingPathComponent("search-retention-fixture", isDirectory: true)
+        let nested = root.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        for index in 0..<110 {
+            try Data([1, 2]).write(to: nested.appendingPathComponent("filler-\(index).bin"))
+        }
+        let alphaURL = nested.appendingPathComponent("alpha-target.bin")
+        let hoveredURL = nested.appendingPathComponent("alpha-target-two.bin")
+        let betaURL = nested.appendingPathComponent("beta-target.bin")
+        try Data([1]).write(to: alphaURL)
+        try Data([1]).write(to: hoveredURL)
+        try Data([1]).write(to: betaURL)
+        let model = DiskModel(cacheDirectory: base.appendingPathComponent("search-retention-cache"), preferences: preferences)
+        model.scan(root)
+        try await wait("search retention index") { model.current?.id == root.path && !model.isScanning && !model.isPartialMap }
+        model.cancelScan()
+        precondition(model.node(withID: alphaURL.path) == nil && model.node(withID: hoveredURL.path) == nil && model.node(withID: betaURL.path) == nil,
+                     "Search targets must be outside the bounded folder preview")
+
+        model.query = "alpha-target"
+        try await wait("first search") { !model.isSearching && model.searchResults.count == 2 }
+        let alpha = model.searchResults.first { $0.id == alphaURL.path }!
+        model.query = "beta-target"
+        model.selectedID = alpha.id
+        model.hoveredListID = hoveredURL.path
+        precondition(model.searchResults.contains { $0.id == alpha.id } && model.selected?.id == alpha.id,
+                     "Previous rows must remain usable while the next search runs")
+        precondition(model.collect([alpha]), "A previous search row must remain collectable")
+        try await wait("replacement search") { !model.isSearching && model.searchResults.first?.id == betaURL.path }
+        precondition(model.selected?.id == alpha.id && model.hoveredListID == hoveredURL.path &&
+                     model.node(withID: hoveredURL.path) != nil && model.collection.first?.id == alpha.id,
+                     "Replacement must preserve the selected, hovered and collected prior row")
+
+        model.query = "alpha-target"
+        try await wait("third search") { !model.isSearching && model.searchResults.count == 2 }
+        precondition(model.node(withID: betaURL.path) == nil, "Unreferenced previous results must be released")
+        model.query = ""
+        precondition(model.node(withID: alpha.id) == nil && model.node(withID: hoveredURL.path) == nil && model.collection.first?.id == alpha.id,
+                     "Clearing search must release its lookup without removing collected items")
+        print("PASS: search result retention, pending selection and hover, collection and query clearing")
     }
 
     @MainActor static func checkCachedRootValidation(base: URL, preferences: UserDefaults) async throws {
@@ -394,6 +736,12 @@ private final class PreviewGate: @unchecked Sendable {
         try await wait("cached root before journal validation") { cached.root != nil && !cached.isScanning }
         precondition(cached.isSavedMap && cached.root?.size == 3,
                      "An identity-matching cached root should display before background journal reconciliation")
+        let originalID = root.appendingPathComponent("indexed.bin").path
+        let originalColor = cached.childColorIndices[originalID]
+        precondition(originalColor != nil && cached.displayedItems.map(\.id) == [originalID])
+        precondition(cached.mapChildIDs == [originalID])
+        cached.searchResults = [DiskNode(url: URL(fileURLWithPath: originalID), name: "indexed.bin",
+                                         isDirectory: false, size: 999, allocatedSize: 999, fileCount: 1)]
         let revision = cached.mapRevision
         cached.selectedID = cached.current!.children[0].id
         cached.hoveredMapNodes = [cached.current!.children[0]]
@@ -404,8 +752,25 @@ private final class PreviewGate: @unchecked Sendable {
         }
         precondition(cached.mapRevision != revision,
                      "A completed folder publication must invalidate prepared map data")
+        let newID = root.appendingPathComponent("new.bin").path
+        precondition(cached.childColorIndices[originalID] == originalColor
+                     && cached.childColorIndices[newID] != nil
+                     && cached.childColorIndices[newID] != originalColor,
+                     "Refreshing a folder must preserve existing colors and assign new ones")
+        precondition(cached.displayedItems.map(\.id) == cached.current?.children.map(\.id)
+                     && cached.node(withID: originalID)?.size == 3 && cached.node(withID: newID)?.size == 2,
+                     "Refreshed folder metadata must take precedence over older search results")
+        precondition(cached.mapChildIDs == cached.current?.children.map(\.id),
+                     "A refreshed folder must publish its own graph child IDs")
         precondition(store.savedSnapshot(for: root)?.eventIdentity != "expired-journal-identity")
         cached.cancelScan()
+        let current = cached.current!
+        let alternateChildren = current.children.reversed().map { $0 }
+        cached.navigation = [DiskNode(url: current.url, name: current.name, isDirectory: true, size: current.size,
+                                      allocatedSize: current.allocatedSize, fileCount: current.fileCount,
+                                      children: alternateChildren)]
+        precondition(cached.mapChildIDs == nil,
+                     "Direct navigation replacement must invalidate graph IDs even for the same folder and child count")
 
         let originalRoot = base.appendingPathComponent("original-cached-root")
         try fm.moveItem(at: root, to: originalRoot)
@@ -489,7 +854,7 @@ private final class PreviewGate: @unchecked Sendable {
         let rowToken = rowItem.data(forType: DiskModel.collectionDragType)!
         precondition(rowItem.types == [DiskModel.collectionDragType] && model.collection.isEmpty,
                      "A search row drag must stage only a private payload until it is dropped")
-        precondition(model.selectedID == other.id && model.draggingItemCount == 1,
+        precondition(model.selectedID == other.id && model.draggingLabel == sourceRow.name,
                      "The dragged search row must be independent of the existing selection")
         model.endCollectionDrag()
         precondition(model.collectDrag(data: rowToken) && model.collection.map(\.id) == [sourceRow.id],
@@ -518,11 +883,14 @@ private final class PreviewGate: @unchecked Sendable {
         precondition(model.collectionCoverage.state(for: root.path) == .containsItems)
         precondition(model.collectionCoverage.state(for: [deep.id, other.id]) == .included
                      && model.collectionCoverage.state(for: [deep.id, stable.id]) == .containsItems)
+        precondition(model.collectionSize == model.collection.reduce(0) { $0 + $1.size }, "Collection total must track the current snapshot")
         model.collection.removeAll { $0.id == other.id }
+        precondition(model.collectionSize == model.collection.reduce(0) { $0 + $1.size }, "Removing an item must update the total")
         precondition(model.collectionCoverage.state(for: other.id) == .none
                      && model.collectionCoverage.state(for: branch.id) == .included,
                      "Removing a collected item must update cached coverage immediately")
         model.collection = []
+        precondition(model.collectionSize == model.collection.reduce(0) { $0 + $1.size }, "Collection total must track the current snapshot")
         precondition(model.collectionCoverage.state(for: root.path) == .none
                      && model.collectionCoverage.state(for: deep.id) == .none,
                      "Clearing the collection must clear coverage immediately")
@@ -536,10 +904,10 @@ private final class PreviewGate: @unchecked Sendable {
         let item = model.beginCollectionDrag([deep, other], label: "2 items")!
         precondition(item.types == [DiskModel.collectionDragType], "Collection drag must carry only its private token")
         let token = item.data(forType: DiskModel.collectionDragType)!
-        precondition(model.draggingItemCount == 2 && model.draggingLabel == "2 items")
+        precondition(model.draggingLabel == "2 items")
         precondition(model.collection.isEmpty, "Starting a drag must never collect")
         model.endCollectionDrag()
-        precondition(model.draggingLabel == nil && model.draggingItemCount == 0 && model.collection.isEmpty,
+        precondition(model.draggingLabel == nil && model.collection.isEmpty,
                      "Cancelling or ending a drag must never collect")
         precondition(model.canAcceptCollectionDrop, "Drop data may arrive after the native dragging session ends")
         precondition(!model.collectDrag(data: Data("unknown token".utf8)) && model.collection.isEmpty)
@@ -577,14 +945,124 @@ private final class PreviewGate: @unchecked Sendable {
         precondition(model.statusMessage == "A newer action status.", "A completed background validation must not overwrite a newer status")
         precondition(batch.allSatisfy { fm.fileExists(atPath: $0.id) }, "Grouped collection must not move files")
         model.collection = []
+        precondition(model.collect([stable]))
+        let mixed = [stable, protected, model.root!] + batch + [batch[0]]
+        let mixedToken = model.beginCollectionDrag(mixed, label: "mixed items")!.data(forType: DiskModel.collectionDragType)!
+        model.endCollectionDrag()
+        precondition(model.collectDrag(data: mixedToken) && model.isValidatingCollection)
+        try await wait("mixed grouped drop") { !model.isValidatingCollection }
+        precondition(Set(model.collection.map(\.id)) == Set(([stable] + batch).map(\.id)))
+        precondition(model.statusMessage?.contains("2 items already included") == true && model.statusMessage?.contains("Skipped 2 items") == true,
+                     "Deferred grouping must preserve duplicate and rejected-item reporting")
+        precondition(model.beginCollectionDrag(Array(repeating: stable, count: 72), label: "already collected") == nil,
+                     "A large group with no eligible items must not start a drag")
+        model.collection = []
+        var directArmed = true
+        let directObserver = model.objectWillChange.sink { _ in
+            MainActor.assumeIsolated {
+                if directArmed { directArmed = false; model.collection = [stable] }
+            }
+        }
+        model.collection = [batch[0]]
+        directObserver.cancel()
+        precondition(model.collectionSize == model.collection.reduce(0) { $0 + $1.size }, "Collection total must track the current snapshot")
+        precondition(!directArmed && model.collection.map(\.id) == [stable.id]
+                     && model.collectionCoverage.state(for: stable.id) == .included,
+                     "Later reentrant direct assignment must win without inconsistent coverage")
+        model.collection = []
+        var collectArmed = true
+        let collectObserver = model.objectWillChange.sink { _ in
+            MainActor.assumeIsolated {
+                if collectArmed { collectArmed = false; model.collection = [batch[0]] }
+            }
+        }
+        precondition(model.collect([stable]))
+        collectObserver.cancel()
+        precondition(model.collectionSize == model.collection.reduce(0) { $0 + $1.size }, "Collection total must track the current snapshot")
+        precondition(!collectArmed && Set(model.collection.map(\.id)) == Set([stable.id, batch[0].id])
+                     && model.collectionCoverage.state(for: stable.id) == .included
+                     && model.collectionCoverage.state(for: batch[0].id) == .included,
+                     "Synchronous collection must retry against reentrant changes")
+        model.collection = []
+        precondition(model.collect([stable]))
+        let publicationGate = CollectionGate()
+        model.testCollectionPrepare = { publicationGate.blockOnce() }
+        publicationGate.arm()
+        model.selectedID = stable.id
+        let revisionToken = model.beginCollectionDrag(batch, label: "revision")!.data(forType: DiskModel.collectionDragType)!
+        precondition(model.collectDrag(data: revisionToken))
+        try await wait("prepare gate") { publicationGate.isWaiting }
+        let replacement = DiskNode(url: stable.url, name: stable.name, isDirectory: false, size: 999,
+                                   allocatedSize: stable.allocatedSize, fileCount: stable.fileCount,
+                                   fileIdentity: stable.fileIdentity)
+        model.collection = [replacement]
+        publicationGate.release()
+        try await wait("changed collection retry") { !model.isValidatingCollection }
+        precondition(model.collectionSize == model.collection.reduce(0) { $0 + $1.size }, "Collection total must track the current snapshot")
+        precondition(model.collection.count == 73 && model.collection.first(where: { $0.id == stable.id })?.size == 999)
+        precondition(model.collectionCoverage.state(for: stable.id) == .included && model.selectedID == stable.id)
+        model.collection = []
+        publicationGate.arm()
+        let switchedToken = model.beginCollectionDrag(batch, label: "switch")!.data(forType: DiskModel.collectionDragType)!
+        precondition(model.collectDrag(data: switchedToken))
+        try await wait("switch prepare gate") { publicationGate.isWaiting }
+        let originalRoot = model.root
+        model.root = nil
+        model.root = originalRoot
+        publicationGate.release()
+        try await wait("same-root collection resumes") { !model.isValidatingCollection && model.collection.count == batch.count }
+        precondition(Set(model.collection.map(\.id)) == Set(batch.map(\.id)),
+                     "An accepted collection must resume when the same root is restored")
+        model.collection = [stable]
+        publicationGate.arm()
+        let reentrantToken = model.beginCollectionDrag(batch, label: "reentrant revision")!.data(forType: DiskModel.collectionDragType)!
+        precondition(model.collectDrag(data: reentrantToken))
+        try await wait("reentrant prepare gate") { publicationGate.isWaiting }
+        var armedRevision = true
+        let revisionObserver = model.objectWillChange.sink { _ in
+            MainActor.assumeIsolated {
+                if armedRevision { armedRevision = false; model.collection = [replacement] }
+            }
+        }
+        publicationGate.release()
+        try await wait("reentrant collection retry") { !model.isValidatingCollection }
+        revisionObserver.cancel()
+        precondition(model.collectionSize == model.collection.reduce(0) { $0 + $1.size }, "Collection total must track the current snapshot")
+        precondition(!armedRevision && model.collection.count == 73 && model.collection.first(where: { $0.id == stable.id })?.size == 999)
+        precondition(model.collectionCoverage.state(for: stable.id) == .included)
+        model.collection = []
+        publicationGate.arm()
+        let reentrantRootToken = model.beginCollectionDrag(batch, label: "reentrant root")!.data(forType: DiskModel.collectionDragType)!
+        precondition(model.collectDrag(data: reentrantRootToken))
+        try await wait("reentrant root prepare gate") { publicationGate.isWaiting }
+        var armedRoot = true
+        let rootObserver = model.objectWillChange.sink { _ in
+            MainActor.assumeIsolated {
+                if armedRoot { armedRoot = false; model.root = nil }
+            }
+        }
+        publicationGate.release()
+        try await wait("reentrant root detaches") { !armedRoot && model.root == nil && !model.isValidatingCollection }
+        rootObserver.cancel()
+        model.root = originalRoot
+        try await wait("reentrant root collection resumes") { !model.isValidatingCollection && model.collection.count == batch.count }
+        precondition(Set(model.collection.map(\.id)) == Set(batch.map(\.id)),
+                     "An accepted collection must return to its original root after a reentrant detachment")
+        print("PASS: reentrant collection mutation retries and collection survives root detachment")
+        model.collection = []
+        publicationGate.arm()
         let cancelledBatchToken = model.beginCollectionDrag(batch, label: "72 items")!.data(forType: DiskModel.collectionDragType)!
         precondition(model.collectDrag(data: cancelledBatchToken) && model.isValidatingCollection)
+        try await wait("paused scan collection gate") { publicationGate.isWaiting }
         model.cancelScan()
-        precondition(!model.isValidatingCollection && model.collection.isEmpty, "Cancelling work must clear background collection validation")
+        precondition(model.isValidatingCollection && model.collection.isEmpty, "Pausing mapping must retain accepted collection work")
         let newerStatus = model.statusMessage
-        try await Task.sleep(nanoseconds: 100_000_000)
-        precondition(model.collection.isEmpty && model.statusMessage == newerStatus,
-                     "Stale background validation must not apply items or overwrite a newer status")
+        publicationGate.release()
+        try await wait("paused scan collection finishes") { !model.isValidatingCollection && model.collection.count == batch.count }
+        precondition(Set(model.collection.map(\.id)) == Set(batch.map(\.id)) && model.statusMessage == newerStatus,
+                     "Collection work must finish without overwriting the newer scan status")
+        model.testCollectionPrepare = {}
+        model.collection = []
 
         let previousToken = model.beginCollectionDrag([stable], label: stable.name)!.data(forType: DiskModel.collectionDragType)!
         _ = model.beginCollectionDrag([stable], label: stable.name)
@@ -643,6 +1121,7 @@ private final class PreviewGate: @unchecked Sendable {
         try fm.createDirectory(at: staleDirectory, withIntermediateDirectories: true)
         try Data([13, 14]).write(to: staleDirectory.appendingPathComponent("replacement.bin"))
 
+        model.showCollection = true
         model.deleteCollectionPermanently()
         precondition(model.isRemoving, "Removal must run in the background")
         try await wait("permanent removal result") { !model.isRemoving }
@@ -657,12 +1136,16 @@ private final class PreviewGate: @unchecked Sendable {
         precondition(Set(model.collection.map(\.id)) == [staleFile.path, staleDirectory.path] && model.showCollection,
                      "Failed removals must remain available for review")
         precondition(model.errorMessage?.contains("stale.bin") == true && model.errorMessage?.contains("StaleFolder") == true)
+        let removalStore = DiskIndexStore(directory: cache)
         try await wait("map after permanent removal") {
-            !model.isRefreshing && !model.isOpeningFolder
-                && model.current?.children.contains(where: { $0.id == removeFile.path || $0.id == bundle.path }) == false
+            guard !model.isRefreshing, !model.isOpeningFolder,
+                  model.current?.children.contains(where: { $0.id == removeFile.path || $0.id == bundle.path }) == false,
+                  let snapshot = removalStore.savedSnapshot(for: root) else { return false }
+            return (try? removalStore.node(path: removeFile.path, snapshot: snapshot)) == nil
         }
         precondition(model.statusMessage?.contains("Deleted 2 items permanently.") == true,
                      "The removal outcome must survive the ensuing map update")
+        precondition(model.collectionSize == model.collection.reduce(0) { $0 + $1.size }, "Collection total must track the current snapshot")
         precondition(model.errorMessage?.contains("stale.bin") == true && model.collection.count == 2)
         let store = DiskIndexStore(directory: cache)
         let refreshed = store.savedSnapshot(for: root)!
@@ -693,7 +1176,29 @@ private final class PreviewGate: @unchecked Sendable {
     }
 
     @MainActor static func main() async throws {
+        checkCollectedAncestorParity()
         checkCollectionCoverage()
+        let oversized = (0..<2).map { i in
+            DiskNode(url: URL(fileURLWithPath: "/synthetic/oversized-\(i)"), name: "oversized-\(i)", isDirectory: false,
+                     size: i == 0 ? Int64.max : 1, allocatedSize: 0, fileCount: 1)
+        }
+        let totalModel = DiskModel(cacheDirectory: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("orbit-total-\(UUID())"))
+        totalModel.collection = oversized
+        precondition(totalModel.testCollectionPathIDs() == Set(oversized.map(\.id)), "Membership must match the collection")
+        let unicode = ["/synthetic/é", "/synthetic/e\u{0301}/file", "/synthetic/nested/file"].map { path in
+            DiskNode(url: URL(fileURLWithPath: path), name: path, isDirectory: false, size: 1, allocatedSize: 1, fileCount: 1)
+        }
+        totalModel.collection = unicode
+        precondition(totalModel.testCollectionPathIDs() == Set(unicode.map(\.id)))
+        for path in ["/synthetic/é", "/synthetic/e\u{0301}/file", "/synthetic/nested/file/child", "/synthetic/not-present"] {
+            precondition(hasCollectedAncestor(path, in: totalModel.testCollectionPathIDs()) == hasCollectedAncestor(path, in: Set(unicode.map(\.id))))
+        }
+        totalModel.collection = oversized
+        precondition(totalModel.collectionSize == Int64.max, "Collection totals must not overflow")
+        totalModel.collection.removeLast()
+        precondition(totalModel.collectionSize == Int64.max)
+        totalModel.collection = []
+        precondition(totalModel.collectionSize == 0)
         let base = URL(fileURLWithPath: CommandLine.arguments[1]).standardizedFileURL
         let root = base.appendingPathComponent("fixture")
         let nested = root.appendingPathComponent("Projects/One/Assets")
@@ -706,7 +1211,11 @@ private final class PreviewGate: @unchecked Sendable {
         let prefs = UserDefaults(suiteName: suite)!
         defer { prefs.removePersistentDomain(forName: suite) }
         checkGroupedHoverCaching(base: base, preferences: prefs)
+        checkLargeListHoverLookup(base: base, preferences: prefs)
+        try checkRefreshPlanner(base: base)
         checkPreparedGroupHover(base: base, preferences: prefs)
+        try await checkLargeSavedFolder(base: base, preferences: prefs)
+        try await checkSearchResultRetention(base: base, preferences: prefs)
         let model = DiskModel(cacheDirectory: cache, preferences: prefs)
         model.scan(root)
         try await wait("first map") { model.root != nil && !model.isScanning }
@@ -734,7 +1243,15 @@ private final class PreviewGate: @unchecked Sendable {
         model.hoveredMapNodes = [hovered]
         model.hoveredListID = hovered.id
         precondition(model.mapRevision == revisionBeforeUpdate)
+        model.setMapInteractionActive(true)
+        let beforeHeldRefresh = store.savedSnapshot(for: root)!.id
         try Data(repeating: 3, count: 777).write(to: nested.appendingPathComponent("live.bin"))
+        try await wait("held incremental update prepared") {
+            store.savedSnapshot(for: root)?.id != beforeHeldRefresh && !model.isRefreshing && model.hasDeferredIndexedFolder
+        }
+        precondition(model.root?.size == 5555 && model.current?.children.count == 1 && model.mapRevision == revisionBeforeUpdate,
+                     "An automatic refresh must not replace the map or rows during a held drag")
+        model.setMapInteractionActive(false)
         try await wait("live incremental update") { model.root?.size == 6332 && !model.isRefreshing && !model.isOpeningFolder }
         precondition(model.collection.count == 1, "Refresh must preserve collection")
         precondition(model.current?.id == nested.path, "Refresh must preserve navigation")
@@ -745,14 +1262,26 @@ private final class PreviewGate: @unchecked Sendable {
                      "Refreshing the same folder must preserve hover for an unchanged item")
         precondition(model.mapRelatedRowIDs == [hovered.id], "The list must remain synchronized with the hovered segment after refresh")
         precondition(model.mapRevision != revisionBeforeUpdate, "Published updates must replace the map revision")
+        model.setMapInteractionActive(true)
+        let beforeSupersededRefresh = store.savedSnapshot(for: root)!.id
+        try Data().write(to: nested.appendingPathComponent("stale.bin"))
+        try await wait("superseded incremental update prepared") {
+            store.savedSnapshot(for: root)?.id != beforeSupersededRefresh && !model.isRefreshing && model.hasDeferredIndexedFolder
+        }
         model.goBack()
+        model.setMapInteractionActive(false)
         precondition(model.hoveredMapNodes.isEmpty && model.hoveredListID == nil,
                      "Navigating to another folder must clear the previous hover")
         try await wait("parent navigation") { model.current?.id == nested.deletingLastPathComponent().path && !model.isOpeningFolder }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        precondition(model.current?.id == nested.deletingLastPathComponent().path,
+                     "A deferred refresh must not overwrite newer navigation")
         precondition(model.selectedID == nested.path)
         model.query = "pending search"
         model.cancelScan()
-        precondition(!model.isSearching, "Pause must stop the search indicator")
+        try await wait("search after pause") { !model.isSearching && !model.isSearchResultOutdated }
+        precondition(model.searchResults.isEmpty && !model.isScanning,
+                     "Pause must finish the search on the retained map without restarting mapping")
         let prior = store.savedSnapshot(for: root)!
         let reopened = DiskModel(cacheDirectory: cache, preferences: prefs)
         let began = Date()

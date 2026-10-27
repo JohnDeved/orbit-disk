@@ -20,12 +20,12 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
         super.init()
         controller = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: self, userDriverDelegate: nil)
         controller.updater.publisher(for: \.canCheckForUpdates)
-            .combineLatest(model.$isRemoving)
+            .combineLatest(model.$isRemovingAcrossSessions)
             .map { $0 && !$1 }
             .assign(to: &$canCheckForUpdates)
         controller.updater.publisher(for: \.automaticallyChecksForUpdates)
             .assign(to: &$automaticallyChecksForUpdates)
-        removalObservation = model.$isRemoving.removeDuplicates().sink { [weak self] removing in
+        removalObservation = model.$isRemovingAcrossSessions.removeDuplicates().sink { [weak self] removing in
             guard !removing else { return }
             // Published emits before the model changes; recheck on the next main-loop turn.
             DispatchQueue.main.async { self?.resumePendingRelaunch() }
@@ -39,7 +39,7 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
     }
 
     func checkForUpdates() {
-        guard canCheckForUpdates, model?.isRemoving != true else { return }
+        guard canCheckForUpdates, model?.hasActiveRemovals != true else { return }
         controller.checkForUpdates(nil)
     }
 
@@ -58,7 +58,7 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
 
     func updater(_ updater: SPUUpdater, shouldPostponeRelaunchForUpdate item: SUAppcastItem,
                  untilInvokingBlock installHandler: @escaping () -> Void) -> Bool {
-        guard model?.isRemoving == true else { return false }
+        guard model?.hasActiveRemovals == true else { return false }
         pendingRelaunch = installHandler
         isWaitingForRemoval = true
         return true
@@ -70,7 +70,7 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
     }
 
     private func requireRemovalFinished() throws {
-        guard model?.isRemoving == true else { return }
+        guard model?.hasActiveRemovals == true else { return }
         throw NSError(domain: "OrbitDisk.Updates", code: 1, userInfo: [
             NSLocalizedDescriptionKey: "Files are still being removed.",
             NSLocalizedRecoverySuggestionErrorKey: "Check for updates after file removal finishes."
@@ -78,7 +78,7 @@ final class AppUpdater: NSObject, ObservableObject, SPUUpdaterDelegate {
     }
 
     private func resumePendingRelaunch() {
-        guard model?.isRemoving != true, let pendingRelaunch else { return }
+        guard model?.hasActiveRemovals != true, let pendingRelaunch else { return }
         self.pendingRelaunch = nil
         isWaitingForRemoval = false
         pendingRelaunch()
@@ -133,7 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         // Sparkle can resume a downloaded update without asking its relaunch delegate again.
-        guard model?.isRemoving != true else {
+        guard model?.hasActiveRemovals != true else {
             model?.statusMessage = "Files are still being removed. Quit after this finishes."
             return .terminateCancel
         }

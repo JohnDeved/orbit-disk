@@ -16,11 +16,13 @@ struct ContentView: View {
     @FocusState private var searchFocused: Bool
     @FocusState private var fileListFocused: Bool
     @State private var collectionTargeted = false
+    @State private var collectionReviewOwner: CollectionReviewToken?
     @State private var mapPresentation = SunburstPresentationCache()
     @State private var listHoverTracking = ListHoverTracking()
 
     var body: some View {
-        HStack(spacing: 0) {
+        let reviewOwnerAtRender = collectionReviewOwner
+        return HStack(spacing: 0) {
             sidebar
             VStack(spacing: 0) {
                 if let current = model.current {
@@ -50,7 +52,9 @@ struct ContentView: View {
         .onChange(of: model.selectedID) { _, selected in
             if selected != nil { searchFocused = false; fileListFocused = true }
         }
-        .sheet(isPresented: $model.showCollection) { CollectionView(model: model) }
+        .sheet(isPresented: Binding(get: { model.showCollection }, set: { if !$0 { model.dismissCollection(review: reviewOwnerAtRender) } })) {
+            CollectionView(model: model, reviewOwner: reviewOwnerAtRender).id(reviewOwnerAtRender)
+        }
         .sheet(isPresented: $model.showIssues) { issuesView }
         .sheet(isPresented: Binding(get: { model.previewURL != nil }, set: { if !$0 { model.previewURL = nil } })) {
             if let url = model.previewURL {
@@ -68,15 +72,15 @@ struct ContentView: View {
             Button("OK", role: .cancel) { model.errorMessage = nil }
         } message: { Text(model.errorMessage ?? "") }
         .dismissSheetOnOutsideClick(isPresented: model.showCollection || model.showIssues || model.previewURL != nil || model.errorMessage != nil,
-                                   enabled: !model.isRemoving) {
-            if model.showCollection { model.errorMessage = nil; model.showCollection = false }
+                                   enabled: true) {
+            if model.showCollection { model.dismissCollection(review: reviewOwnerAtRender) }
             else if model.showIssues { model.showIssues = false }
             else if model.previewURL != nil { model.previewURL = nil }
             else { model.errorMessage = nil }
         }
         .background {
             Button("Find", action: { searchFocused = true })
-                .keyboardShortcut("f").disabled(model.isPartialMap).hidden().accessibilityHidden(true)
+                .keyboardShortcut("f").disabled(model.root == nil).hidden().accessibilityHidden(true)
         }
     }
 
@@ -109,18 +113,21 @@ struct ContentView: View {
                         GeometryReader { geo in
                             ZStack(alignment: .leading) {
                                 Capsule().fill(.white.opacity(0.14))
-                                Capsule().fill(OrbitStyle.accent)
-                                    .frame(width: geo.size.width * CGFloat(max(0, min(1, Double(volume.capacity - volume.available) / Double(max(1, volume.capacity))))))
+                                if volume.capacity > 0 {
+                                    Capsule().fill(OrbitStyle.accent)
+                                        .frame(width: geo.size.width * CGFloat(max(0, min(1, Double(volume.capacity - volume.available) / Double(max(1, volume.capacity))))))
+                                }
                             }
                         }.frame(height: 4)
-                        Text("\(formatBytes(volume.available)) available")
+                        Text(volume.capacity > 0 ? "\(formatBytes(volume.available)) available"
+                             : model.isDiscoveringVolumes ? "Checking available space…" : "Storage info unavailable")
                             .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted).lineLimit(1).monospacedDigit()
                     }
                     .padding(13)
                     .background(RoundedRectangle(cornerRadius: 9).fill(.white.opacity(0.045)))
                 }
                 .buttonStyle(.plain).pointingCursor().padding(.horizontal, 12).padding(.bottom, 14)
-                .help("Open saved map of \(volume.name)").disabled(model.isRemoving)
+                .help("Open saved map of \(volume.name)")
                }
               }
             }.frame(height: 100)
@@ -131,7 +138,7 @@ struct ContentView: View {
             place("Documents", icon: "doc.text", url: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents"))
             place("Applications", icon: "square.grid.2x2", url: URL(fileURLWithPath: "/Applications"))
             Button(action: model.chooseFolder) { Label("Choose a folder…", systemImage: "folder.badge.plus").frame(maxWidth: .infinity, alignment: .leading) }
-                .buttonStyle(.plain).pointingCursor().padding(.horizontal, 24).padding(.vertical, 12).disabled(model.isRemoving)
+                .buttonStyle(.plain).pointingCursor().padding(.horizontal, 24).padding(.vertical, 12)
             Spacer(minLength: 24)
         }
         .frame(width: 210).frame(maxHeight: .infinity)
@@ -143,7 +150,7 @@ struct ContentView: View {
         Button { model.scan(url) } label: {
             Label(title, systemImage: icon).frame(maxWidth: .infinity, alignment: .leading)
                 .font(.system(size: 13)).padding(.vertical, 11).padding(.horizontal, 24)
-        }.buttonStyle(.plain).pointingCursor().disabled(model.isRemoving)
+        }.buttonStyle(.plain).pointingCursor()
     }
 
     private var headerLocation: some View {
@@ -164,9 +171,9 @@ struct ContentView: View {
             Group {
                 HStack(spacing: 7) {
                     Image(systemName: "magnifyingglass").foregroundStyle(OrbitStyle.muted)
-                    TextField(model.isPartialMap ? "Search after mapping" : "Search indexed files", text: $model.query)
+                    TextField(model.isPartialMap ? "Search mapped files" : "Search indexed files", text: $model.query)
                         .textFieldStyle(.plain).focused($searchFocused)
-                        .accessibilityLabel("Search indexed files")
+                        .accessibilityLabel(model.isPartialMap ? "Search mapped files" : "Search indexed files")
                     Button { model.query = "" } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.plain).pointingCursor().help("Clear search")
                         .opacity(model.query.isEmpty ? 0 : 1).disabled(model.query.isEmpty)
@@ -174,15 +181,15 @@ struct ContentView: View {
                 }
                 .padding(9).frame(width: 210, height: 34).background(OrbitStyle.panel, in: RoundedRectangle(cornerRadius: 7))
                 .overlay(RoundedRectangle(cornerRadius: 7).stroke(searchFocused ? OrbitStyle.accent : OrbitStyle.muted.opacity(0.6), lineWidth: 1))
-                .disabled(model.isPartialMap || model.isScanning)
-                .help(model.isPartialMap ? "Search becomes available when the map is saved. You can browse folders now." : "Search the saved file index")
+                .disabled(model.isScanning && !model.isPartialMap)
+                .help(model.isPartialMap ? "Search files mapped so far" : "Search the saved file index")
                 Button(action: model.rescan) { Label("Refresh", systemImage: "arrow.clockwise").padding(.vertical, 2) }
                     .pointingCursor().help("Refresh the full map (⌘R)").fixedSize()
                     .accessibilityLabel("Refresh")
                     .disabled(model.isScanning || model.isRefreshing || model.isRemoving)
             }.opacity(model.root == nil ? 0 : 1).disabled(model.root == nil).accessibilityHidden(model.root == nil)
             Button(action: model.chooseFolder) { Label("Open Folder…", systemImage: "folder.badge.plus").padding(.vertical, 2) }
-                .pointingCursor().disabled(model.isRemoving).fixedSize()
+                .pointingCursor().fixedSize()
                 .accessibilityLabel("Open Folder…")
         }.padding(.trailing, 12)
             .frame(height: 40)
@@ -210,7 +217,7 @@ struct ContentView: View {
                 ZStack {
                     if model.isOpeningFolder { ProgressView().controlSize(.mini).help("Opening folder") }
                 }.frame(width: 14, height: 14)
-                Text("\(node.fileCount.formatted()) \(node.fileCount == 1 ? "file" : "files")\(node.isScanComplete ? "" : " found")")
+                Text(model.isUpdatingRemovalSizes ? "Updating sizes…" : "\(node.fileCount.formatted()) \(node.fileCount == 1 ? "file" : "files")\(node.isScanComplete ? "" : " found")")
                     .font(.system(size: 12)).foregroundStyle(OrbitStyle.muted).monospacedDigit().lineLimit(1)
                     .frame(width: 138, alignment: .trailing)
             }.padding(.horizontal, 28).frame(height: 48)
@@ -219,7 +226,8 @@ struct ContentView: View {
                     SunburstView(root: node, mapRevision: model.mapRevision, cache: mapPresentation,
                                  selectedID: model.selectedID, hoveredID: model.hoveredListID,
                                  collectionCoverage: model.collectionCoverage,
-                                 colorIndices: model.childColorIndices,
+                                 updatingSizes: model.isUpdatingRemovalSizes,
+                                 colorIndices: model.childColorIndices, rootChildIDs: model.mapChildIDs,
                                  onSelect: { model.selectedID = $0.id }, onOpen: model.open,
                                  onBack: model.goBack, canGoBack: model.navigation.count > 1,
                                  onHover: { nodes, group in
@@ -228,9 +236,9 @@ struct ContentView: View {
                                  onInteractionActive: model.setMapInteractionActive)
                         .padding(.horizontal, 16).frame(maxWidth: .infinity, maxHeight: .infinity)
                     HStack(spacing: 24) {
-                        metric(node.isScanComplete ? "File size" : "File size so far", value: node.scanState == .pending ? "Waiting" : formatBytes(node.size))
+                        metric(node.isScanComplete ? "File size" : "File size so far", value: model.isUpdatingRemovalSizes ? "Updating…" : node.scanState == .pending ? "Waiting" : formatBytes(node.size))
                         Rectangle().fill(.white.opacity(0.14)).frame(width: 1, height: 30)
-                        metric(node.isScanComplete ? "Allocated" : "Allocated so far", value: node.scanState == .pending ? "Waiting" : formatBytes(node.allocatedSize))
+                        metric(node.isScanComplete ? "Allocated" : "Allocated so far", value: model.isUpdatingRemovalSizes ? "Updating…" : node.scanState == .pending ? "Waiting" : formatBytes(node.allocatedSize))
                     }.padding(.bottom, 12)
                     HStack(spacing: 18) {
                         Label("In collection", systemImage: "checkmark.circle.fill")
@@ -238,7 +246,7 @@ struct ContentView: View {
                     }
                     .font(.system(size: 10)).foregroundStyle(OrbitStyle.muted)
                     .padding(.bottom, 10)
-                    Text(model.isPartialMap ? (model.isScanning ? "Explore now · Collect finished items · Sizes update as mapping continues" : "Explore partial results · Restart mapping to finish") : "")
+                    Text(model.isPartialMap ? (model.isScanning ? "Explore and collect while sizes update" : "Explore partial results · Restart mapping to finish") : "")
                         .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted)
                         .lineLimit(2).multilineTextAlignment(.center)
                         .frame(maxWidth: .infinity).frame(height: 28)
@@ -268,13 +276,13 @@ struct ContentView: View {
                 }.menuStyle(.borderlessButton).fixedSize().font(.system(size: 11)).pointingCursor().help("Sort contents")
             }.padding(.horizontal, 18).padding(.top, 18).padding(.bottom, 10)
             VStack(alignment: .leading, spacing: 4) {
-                Text(model.isFiltering ? "\(model.searchMatchCount.formatted()) \(model.searchMatchCount == 1 ? "match" : "matches") in this index" : "\(node.children.count.formatted()) items · \(node.isScanComplete ? (model.sortByName ? "sorted by name" : "largest first") : "sizes measured so far")")
+                Text(model.isFiltering ? (model.isSearching ? (model.searchResults.isEmpty ? "Searching…" : "Searching… · showing previous results") : model.isSearchResultOutdated ? (model.searchResults.isEmpty ? (model.searchFailed ? "Search unavailable · Refresh to retry" : "Search incomplete") : (model.searchFailed ? "Previous results · Refresh to retry" : "Previous results")) : "\(model.searchMatchCount.formatted()) \(model.searchMatchCount == 1 ? "match" : "matches") \(model.isPartialMap ? "so far" : "in this index")\(model.isSortingRows ? " · sorting by name…" : "")") : "\(node.children.count.formatted()) items · \(model.isSortingRows ? "sorting by name…" : node.isScanComplete ? (model.sortByName ? "sorted by name" : "largest first") : "sizes measured so far")")
                     .foregroundStyle(OrbitStyle.muted).lineLimit(1)
                 if let description = model.mapHoverDescription {
                     Label(description, systemImage: "cursorarrow")
                         .foregroundStyle(OrbitStyle.accent).lineLimit(2).truncationMode(.middle)
                 } else {
-                    Text(model.isFiltering && model.searchMatchCount > 300 ? "Showing the 300 largest matches. Refine your search for more." : "Hover to locate an item in the map.")
+                    Text(model.isFiltering && !model.isSearching && !model.isSearchResultOutdated && model.searchMatchCount > 300 ? "Showing the 300 largest matches. Refine your search for more." : "Hover to locate an item in the map.")
                         .foregroundStyle(OrbitStyle.muted).lineLimit(2)
                 }
             }
@@ -284,9 +292,9 @@ struct ContentView: View {
             if model.displayedNodes.isEmpty {
                 VStack(spacing: 12) {
                     Image(systemName: model.isFiltering ? "magnifyingglass" : "folder").font(.system(size: 25)).foregroundStyle(OrbitStyle.muted)
-                    Text(model.isSearching ? "Searching…" : model.isFiltering ? "No matching files" : !node.isAccessible ? "Contents unavailable. See skipped items." : node.scanState == .pending ? "Waiting to map this folder" : !node.isScanComplete ? "Reading this folder…" : "This folder is empty")
+                    Text(model.isSearching ? "Searching…" : model.isFiltering ? (model.isSearchResultOutdated ? (model.searchFailed ? "Search unavailable. Refresh to retry." : "Search incomplete") : model.isPartialMap ? "No matches found so far" : "No matching files") : !node.isAccessible ? "Contents unavailable. See skipped items." : node.scanState == .pending ? "Waiting to map this folder" : !node.isScanComplete ? "Reading this folder…" : "This folder is empty")
                         .font(.system(size: 13)).foregroundStyle(OrbitStyle.muted)
-                    if !node.isScanComplete {
+                    if !model.isFiltering && !node.isScanComplete {
                         Text(model.isScanning ? "You can explore other folders while mapping continues." : "Restart mapping to finish this folder.")
                             .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted)
                             .multilineTextAlignment(.center).padding(.horizontal, 22)
@@ -303,17 +311,18 @@ struct ContentView: View {
                                 .listRowInsets(EdgeInsets(top: 0, leading: 8, bottom: 0, trailing: 8))
                         }
                     }.listStyle(.plain).scrollContentBackground(.hidden).focused($fileListFocused)
-                    .onDisappear { listHoverTracking.detach() }
+                    .id(model.largeListIdentity)
                     .onChange(of: relatedIDs) { _, ids in
+                        guard !listHoverTracking.hasPendingRestore else { return }
+                        Self.revealRelatedRows(ids, model: model, tracking: listHoverTracking, proxy: proxy)
+                    }
+                    .onChange(of: model.displayedOrderRevision) { _, revision in
+                        let ids = relatedIDs
                         guard !ids.isEmpty else { return }
-                        let items = model.displayedItems
-                        if listHoverTracking.revealRow(expectedCount: items.count, rowIndex: {
-                            items.firstIndex { ids.contains($0.id) }
-                        }) { return }
-                        if ids.count == 1, let id = ids.first {
-                            proxy.scrollTo(id)
-                        } else if let first = model.displayedNodes.first(where: { ids.contains($0.id) }) {
-                            proxy.scrollTo(first.id)
+                        DispatchQueue.main.async {
+                            guard model.displayedOrderRevision == revision, model.mapRelatedRowIDs == ids,
+                                  !listHoverTracking.hasPendingRestore else { return }
+                            Self.revealRelatedRows(ids, model: model, tracking: listHoverTracking, proxy: proxy)
                         }
                     }
                     .contextMenu(forSelectionType: String.self) { ids in
@@ -340,6 +349,37 @@ struct ContentView: View {
                         model.openSelection()
                         return .handled
                     }
+                    .onAppear {
+                        let model = model
+                        let tracking = listHoverTracking
+                        tracking.onResetRestored = { [weak model, weak tracking] in
+                            guard let model, let tracking else { return }
+                            Self.revealRelatedRows(model.mapRelatedRowIDs, model: model, tracking: tracking, proxy: proxy)
+                        }
+                    }
+                }
+                .onAppear {
+                    let model = model
+                    let tracking = listHoverTracking
+                    model.largeListWillReset = { [weak model, weak tracking] in
+                        guard let model, let tracking, !tracking.hasPendingRestore else { return }
+                        let items = model.displayedItems
+                        let related = model.mapRelatedRowIDs
+                        let preferred = model.firstDisplayedRowIndex(matching: related)
+                        tracking.prepareForReset(preferredRow: preferred, itemIDAt: { index in
+                            items.indices.contains(index) ? items[index].id : nil
+                        }, rowIndexForID: { [weak model] id in
+                            model?.firstDisplayedRowIndex(matching: [id])
+                        })
+                    }
+                }
+                .onChange(of: model.current?.id) { _, _ in listHoverTracking.cancelPendingRestore() }
+                .onChange(of: model.query) { _, _ in listHoverTracking.cancelPendingRestore() }
+                .onDisappear {
+                    model.largeListWillReset = nil
+                    listHoverTracking.onResetRestored = nil
+                    listHoverTracking.cancelPendingRestore()
+                    listHoverTracking.detach()
                 }
             }
             inspector
@@ -349,6 +389,20 @@ struct ContentView: View {
         .padding(.trailing, 24).padding(.bottom, 18)
     }
 
+
+    private static func revealRelatedRows(_ ids: Set<String>, model: DiskModel,
+                                          tracking: ListHoverTracking, proxy: ScrollViewProxy) {
+        guard !ids.isEmpty else { return }
+        let items = model.displayedItems
+        if tracking.revealRow(expectedCount: items.count, rowIndex: {
+            model.firstDisplayedRowIndex(matching: ids)
+        }) { return }
+        if ids.count == 1, let id = ids.first {
+            proxy.scrollTo(id)
+        } else if let first = model.displayedNodes.first(where: { ids.contains($0.id) }) {
+            proxy.scrollTo(first.id)
+        }
+    }
 
     @ViewBuilder
     private func itemActions(_ item: DiskNode) -> some View {
@@ -407,7 +461,7 @@ struct ContentView: View {
                         .fontWeight(.medium).foregroundStyle(.white).lineLimit(1)
                         .frame(width: 172, alignment: .leading)
                     let found = model.root?.fileCount ?? 0
-                    Text("\(found.formatted()) \(found == 1 ? "file" : "files") found").monospacedDigit().lineLimit(1)
+                    Text(model.isUpdatingRemovalSizes ? "Updating sizes…" : "\(found.formatted()) \(found == 1 ? "file" : "files") found").monospacedDigit().lineLimit(1)
                         .frame(width: 140, alignment: .leading)
                 } else if let result = model.scanResult {
                     HStack(spacing: 4) {
@@ -435,7 +489,7 @@ struct ContentView: View {
                         .pointingCursor().frame(width: 130, alignment: .trailing)
                 }
             }.controlSize(.small).frame(height: 26)
-            Text(model.isPartialMap ? (model.isScanning ? model.statusMessage ?? model.scanPath : "You can keep exploring. Restart mapping to finish and save this map.") : model.statusMessage ?? (model.isScanning ? model.scanTitle : ""))
+            Text(model.isPartialMap ? (model.statusMessage ?? (model.isScanning ? model.scanPath : "You can keep exploring. Restart mapping to finish and save this map.")) : model.statusMessage ?? (model.isScanning ? model.scanTitle : ""))
                 .lineLimit(1).truncationMode(.middle)
                 .frame(maxWidth: .infinity, alignment: .leading).frame(height: 14, alignment: .top)
         }
@@ -449,22 +503,22 @@ struct ContentView: View {
         let ready = collectionTargeted && model.canAcceptCollectionDrop
         return HStack(spacing: 16) {
             ZStack {
-                if model.isValidatingCollection { ProgressView().controlSize(.small) }
+                if model.isValidatingCollection || model.isUpdatingCollection { ProgressView().controlSize(.small) }
                 else {
                     Image(systemName: ready ? "tray.and.arrow.down.fill" : "tray.and.arrow.down")
                         .font(.system(size: 28)).foregroundStyle(OrbitStyle.accent)
                 }
             }.frame(width: 36, height: 36)
             VStack(alignment: .leading, spacing: 5) {
-                Text(model.isValidatingCollection ? "Checking your collection…" : ready ? "Release to collect" : dragging ? "Drop here to collect" : model.collection.isEmpty ? "Drag files and folders here" : "\(model.collection.count) \(model.collection.count == 1 ? "item" : "items") in your collection")
+                Text(model.isValidatingCollection ? "Checking your collection…" : model.isUpdatingCollection ? "Removing from collection…" : ready ? "Release to collect" : dragging ? "Drop here to collect" : model.displayedCollection.isEmpty ? "Drag files and folders here" : "\(model.displayedCollection.count) \(model.displayedCollection.count == 1 ? "item" : "items") in your collection")
                     .font(.system(size: 14, weight: .semibold)).lineLimit(1).truncationMode(.middle)
-                Text(dragging ? model.draggingLabel ?? "" : model.isPartialMap ? "Collect finished items now. Removal is available after the map is saved." : model.collection.isEmpty ? "Drag from the map or file list. Review before removing anything." : "\(formatBytes(model.collectionSize)) · Drag more items here. Files stay in place until reviewed.")
+                Text(model.isUpdatingCollection ? "Files stay in place." : dragging ? model.draggingLabel ?? "" : model.isPartialMap ? (model.isScanning ? "Collect items while mapping continues." : "Collect items from this partial map.") : model.displayedCollection.isEmpty ? "Drag from the map or file list. Review before removing anything." : model.isUpdatingRemovalSizes ? "Updating sizes…" : "\(formatBytes(model.displayedCollectionSize)) · Drag more items here. Files stay in place until reviewed.")
                     .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted).lineLimit(1).truncationMode(.middle)
             }.frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
-            Button { model.showCollection = true } label: {
+            Button { if let owner = model.beginCollectionReview() { collectionReviewOwner = owner } } label: {
                 Label("Review Collection", systemImage: "tray.full").padding(.vertical, 3)
             }
-            .pointingCursor().disabled(model.collection.isEmpty || model.isValidatingCollection || dragging).fixedSize()
+            .pointingCursor().disabled(!model.canReviewDisplayedCollection || model.isRemoving || model.isValidatingCollection || model.isUpdatingCollection || dragging).fixedSize()
         }
         .padding(.horizontal, 20).frame(maxWidth: .infinity).frame(height: 80)
         .background(ready ? OrbitStyle.accent.opacity(0.16) : dragging ? OrbitStyle.accent.opacity(0.06) : .clear)
@@ -512,7 +566,7 @@ struct ContentView: View {
                 .font(.system(size: 12)).foregroundStyle(OrbitStyle.muted)
             HStack(spacing: 24) {
                 metric("Items found", value: model.progressCount.formatted())
-                metric("File size", value: formatBytes(model.progressBytes))
+                metric("File size", value: model.isUpdatingRemovalSizes ? "Updating…" : formatBytes(model.progressBytes))
             }
             Text(model.scanPath).font(.system(size: 11)).foregroundStyle(OrbitStyle.muted)
                 .lineLimit(1).truncationMode(.middle).frame(maxWidth: 520)
@@ -538,20 +592,42 @@ struct ContentView: View {
 
 struct CollectionView: View {
     @ObservedObject var model: DiskModel
+    @State private var reviewOwner: CollectionReviewToken?
     @State private var confirmPermanentDeletion = false
+    @State private var confirmTrash = false
+    @State private var permanentToken: CollectionReviewToken?
+    @State private var trashToken: CollectionReviewToken?
+    @State private var confirmationItems: [DiskNode] = []
+    @State private var confirmationSize: Int64 = 0
+    @State private var confirmationID = UUID()
+
+    init(model: DiskModel, reviewOwner: CollectionReviewToken? = nil) {
+        self.model = model
+        _reviewOwner = State(initialValue: reviewOwner ?? model.collectionReviewToken)
+    }
+
+    private var items: [DiskNode] { model.collectionReviewHasOwner(reviewOwner) ? model.displayedCollection : [] }
+    private var reviewToken: CollectionReviewToken? { model.collectionReviewHasOwner(reviewOwner) ? model.collectionReviewToken : nil }
+    private var hasIncompleteFolders: Bool { items.contains { $0.isDirectory && !$0.isScanComplete } }
+    private var visibleConfirmationItems: [DiskNode] { model.collectionReviewHasOwner(reviewOwner) ? confirmationItems : [] }
+    private var confirmationHasIncompleteFolders: Bool { visibleConfirmationItems.contains { $0.isDirectory && !$0.isScanComplete } }
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        let actionToken = reviewToken
+        let visibleItems = items
+        let trashTokenAtRender = trashToken
+        let confirmationIDAtRender = confirmationID
+        return VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Review your collection").font(.system(size: 23, weight: .semibold)).lineLimit(1).frame(height: 28)
                     Group {
-                        if let message = model.errorMessage {
+                        if model.collectionReviewHasOwner(reviewOwner), let message = model.errorMessage {
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack {
                                     Label("Some items could not be removed", systemImage: "exclamationmark.triangle")
                                         .font(.system(size: 12, weight: .semibold)).lineLimit(1)
                                     Spacer()
-                                    Button("Dismiss") { model.errorMessage = nil }.pointingCursor().controlSize(.small)
+                                    Button("Dismiss") { model.dismissCollectionError(review: actionToken) }.pointingCursor().controlSize(.small)
                                 }
                                 ScrollView {
                                     Text(message).font(.system(size: 11)).textSelection(.enabled)
@@ -559,15 +635,15 @@ struct CollectionView: View {
                                 }
                             }
                         } else {
-                            Text(model.isPartialMap ? "\(formatBytes(model.collectionSize)) collected so far. Removal is available after the map is saved." : "\(formatBytes(model.collectionSize)) in file sizes. Choose Trash or permanent deletion after review.")
+                            Text(model.isUpdatingRemovalSizes ? "Updating sizes…" : hasIncompleteFolders ? "Some folder sizes are incomplete." : "\(formatBytes(model.collectionReviewHasOwner(reviewOwner) ? model.displayedCollectionSize : 0)) in file sizes. Choose Trash or permanent deletion after review.")
                                 .font(.system(size: 12)).foregroundStyle(OrbitStyle.muted).lineLimit(2)
                         }
                     }.frame(maxWidth: .infinity, alignment: .leading).frame(height: 56, alignment: .top)
                 }
-                Button("Done") { model.errorMessage = nil; model.showCollection = false }.pointingCursor().keyboardShortcut(.cancelAction).disabled(model.isRemoving).fixedSize()
+                Button("Done") { model.dismissCollection(review: actionToken ?? reviewOwner) }.pointingCursor().keyboardShortcut(.cancelAction).fixedSize()
             }
             List {
-                ForEach(model.collection) { item in
+                ForEach(visibleItems) { item in
                     HStack {
                         Image(systemName: item.isDirectory ? "folder" : "doc").foregroundStyle(OrbitStyle.accent)
                         VStack(alignment: .leading, spacing: 4) {
@@ -575,56 +651,92 @@ struct CollectionView: View {
                             Text(item.url.path).font(.system(size: 10)).foregroundStyle(OrbitStyle.muted).lineLimit(1).truncationMode(.middle)
                         }
                         Spacer()
-                        Text(formatBytes(item.size)).monospacedDigit().lineLimit(1).frame(width: 80, alignment: .trailing)
-                        Button { model.collection.removeAll { $0.id == item.id } } label: { Label("Remove", systemImage: "minus.circle").padding(.vertical, 3) }
-                            .buttonStyle(.bordered).pointingCursor().help("Remove from collection").disabled(model.isRemoving || model.isValidatingCollection)
+                        Text(model.isUpdatingRemovalSizes ? "Updating…" : formatBytes(item.size) + (item.isDirectory && !item.isScanComplete ? " so far" : ""))
+                            .monospacedDigit().lineLimit(1).frame(width: 110, alignment: .trailing)
+                        Button { model.removeFromCollection(item.id, review: actionToken) } label: {
+                            Label {
+                                Text("Remove")
+                            } icon: {
+                                Image(systemName: "minus.circle")
+                                    .opacity(model.isRemovingFromCollection(item.id) ? 0 : 1)
+                                    .overlay { if model.isRemovingFromCollection(item.id) { ProgressView().controlSize(.small) } }
+                            }.padding(.vertical, 3)
+                        }
+                            .buttonStyle(.bordered).pointingCursor()
+                            .help(model.isRemovingFromCollection(item.id) ? "Removing from collection…" : "Remove from collection")
+                            .disabled(!model.collectionReviewMatches(actionToken) || model.isRemoving || model.isValidatingCollection || model.isRemovingFromCollection(item.id))
                     }.frame(height: 40).padding(.vertical, 6)
+                        .opacity(model.isRemovingFromCollection(item.id) ? 0.5 : 1)
                 }
             }.listStyle(.inset)
             HStack {
-                Button("Clear Collection") { model.collection = []; model.errorMessage = nil; model.showCollection = false }.pointingCursor().disabled(model.isRemoving || model.isValidatingCollection)
+                Button("Clear Collection") { model.clearCollection(review: actionToken) }.pointingCursor().disabled(!model.collectionReviewMatches(actionToken) || model.isRemoving || model.isValidatingCollection || model.isUpdatingCollection)
                 Spacer()
                 if model.isRemoving { ProgressView().controlSize(.small) }
-                Button(role: .destructive) { confirmPermanentDeletion = true } label: {
+                Button(role: .destructive) {
+                    guard !visibleItems.isEmpty, model.collectionReviewMatches(actionToken) else { return }
+                    confirmationID = UUID()
+                    permanentToken = actionToken; confirmationItems = visibleItems; confirmationSize = model.displayedCollectionSize
+                    confirmPermanentDeletion = true
+                } label: {
                     Text("Delete Permanently…")
                 }
                     .pointingCursor()
-                    .disabled(model.collection.isEmpty || model.isRemoving || model.isValidatingCollection || model.isPartialMap || model.isScanning)
-                Button { model.confirmTrash = true } label: {
+                    .disabled(visibleItems.isEmpty || !model.collectionReviewMatches(actionToken) || model.isRemoving || model.isValidatingCollection || model.isUpdatingCollection)
+                Button {
+                    guard !visibleItems.isEmpty, model.collectionReviewMatches(actionToken) else { return }
+                    confirmationID = UUID()
+                    trashToken = actionToken; confirmationItems = visibleItems; confirmationSize = model.displayedCollectionSize
+                    confirmTrash = true
+                } label: {
                     Text("Move to Trash…").foregroundStyle(OrbitStyle.canvas)
                 }
                     .buttonStyle(.borderedProminent).tint(OrbitStyle.accent).foregroundStyle(OrbitStyle.canvas)
                     .pointingCursor()
-                    .disabled(model.collection.isEmpty || model.isRemoving || model.isValidatingCollection || model.isPartialMap || model.isScanning)
+                    .disabled(visibleItems.isEmpty || !model.collectionReviewMatches(actionToken) || model.isRemoving || model.isValidatingCollection || model.isUpdatingCollection)
             }
         }
         .padding(26).frame(width: 720, height: 470)
         .background(OrbitStyle.canvas)
         .buttonStyle(.bordered).controlSize(.large)
-        .interactiveDismissDisabled(model.isRemoving)
         .sheet(isPresented: $confirmPermanentDeletion) { permanentDeletionConfirmation }
-        .alert("Move \(model.collection.count) \(model.collection.count == 1 ? "item" : "items") to Trash?", isPresented: $model.confirmTrash) {
-            Button("Cancel", role: .cancel) {}
-            Button("Move to Trash", role: .destructive, action: model.moveCollectionToTrash)
-        } message: { Text("You can restore these items from Trash in Finder. Orbit Disk never empties the Trash.") }
-        .dismissSheetOnOutsideClick(isPresented: confirmPermanentDeletion || model.confirmTrash,
+        .alert("Move \(visibleConfirmationItems.count) \(visibleConfirmationItems.count == 1 ? "item" : "items") to Trash?", isPresented: $confirmTrash) {
+            Button("Cancel", role: .cancel) { if confirmationID == confirmationIDAtRender { confirmationID = UUID() } }
+            Button("Move to Trash", role: .destructive) {
+                guard confirmationID == confirmationIDAtRender else { return }
+                confirmationID = UUID()
+                model.moveCollectionToTrash(review: trashTokenAtRender)
+            }
+                .disabled(!model.collectionReviewMatches(trashTokenAtRender) || model.isRemoving || model.isValidatingCollection || model.isUpdatingCollection)
+        } message: {
+            if confirmationHasIncompleteFolders {
+                Text("Selected folders may not be fully mapped. Moving them to Trash includes everything inside, including files not shown yet. You can restore them from Trash in Finder.")
+            } else { Text("You can restore these items from Trash in Finder. Orbit Disk never empties the Trash.") }
+        }
+        .dismissSheetOnOutsideClick(isPresented: confirmPermanentDeletion || confirmTrash,
                                    enabled: !model.isRemoving) {
+            guard confirmationID == confirmationIDAtRender else { return }
+            confirmationID = UUID()
             if confirmPermanentDeletion { confirmPermanentDeletion = false }
-            else { model.confirmTrash = false }
+            else { confirmTrash = false }
         }
     }
 
     private var permanentDeletionConfirmation: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Text("Delete \(model.collection.count) \(model.collection.count == 1 ? "item" : "items") permanently?")
+        let tokenAtRender = permanentToken
+        let confirmationIDAtRender = confirmationID
+        return VStack(alignment: .leading, spacing: 18) {
+            Text("Delete \(visibleConfirmationItems.count) \(visibleConfirmationItems.count == 1 ? "item" : "items") permanently?")
                 .font(.system(size: 23, weight: .semibold))
-            Text("These items and all contents of the listed folders will be deleted immediately. They will not go to Trash. This cannot be undone.")
+            Text(confirmationHasIncompleteFolders
+                 ? "Selected folders may not be fully mapped. Deleting them includes everything inside, including files not shown yet. This cannot be undone."
+                 : "These items and all contents of the listed folders will be deleted immediately. They will not go to Trash. This cannot be undone.")
                 .font(.system(size: 13)).fixedSize(horizontal: false, vertical: true)
-            Text("\(formatBytes(model.collectionSize)) in file sizes")
+            Text(model.isUpdatingRemovalSizes ? "Updating sizes…" : "\(formatBytes(model.collectionReviewHasOwner(reviewOwner) ? confirmationSize : 0)) in file sizes\(confirmationHasIncompleteFolders ? " so far" : "")")
                 .font(.system(size: 12)).foregroundStyle(OrbitStyle.muted)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
-                    ForEach(model.collection) { item in
+                    ForEach(visibleConfirmationItems) { item in
                         VStack(alignment: .leading, spacing: 4) {
                             Label(item.name, systemImage: item.isDirectory ? "folder" : "doc")
                                 .font(.system(size: 13, weight: .medium))
@@ -637,16 +749,21 @@ struct CollectionView: View {
             .background(OrbitStyle.panel, in: RoundedRectangle(cornerRadius: 8))
             HStack {
                 Spacer()
-                Button("Cancel") { confirmPermanentDeletion = false }
+                Button("Cancel") {
+                    guard confirmationID == confirmationIDAtRender else { return }
+                    confirmationID = UUID(); confirmPermanentDeletion = false
+                }
                     .keyboardShortcut(.cancelAction).pointingCursor()
                 Button(role: .destructive) {
+                    guard confirmationID == confirmationIDAtRender else { return }
+                    confirmationID = UUID()
                     confirmPermanentDeletion = false
-                    model.deleteCollectionPermanently()
+                    model.deleteCollectionPermanently(review: tokenAtRender)
                 } label: {
                     Text("Delete Permanently")
                 }
                 .pointingCursor()
-                .disabled(model.collection.isEmpty || model.isRemoving || model.isValidatingCollection || model.isPartialMap || model.isScanning)
+                .disabled(!model.collectionReviewMatches(tokenAtRender) || model.isRemoving || model.isValidatingCollection || model.isUpdatingCollection)
             }
         }
         .padding(26).frame(width: 640, height: 430)

@@ -10,11 +10,11 @@ Choose a folder or a device, then click a map folder to open it. Click the map c
 
 Orbit Disk checks the public GitHub release feed daily while it is open. No GitHub account or login is needed. Turn automatic checks off in **Orbit Disk → Settings…**, or use **Orbit Disk → Check for Updates…** at any time. You choose when to install and restart; automatic installation is disabled. Update feeds and downloaded apps must pass signature verification before installation.
 
-Restarting clears the current collection and interrupts any active scan. Saved disk maps remain available. File removal blocks update checks and quitting; a requested update restart waits for removal to finish.
+Restarting clears the collections and interrupts active scans. Saved maps remain available, and unfinished mapping can resume from committed progress when you reopen its location. File removal blocks update checks and quitting; a requested update restart waits for removal to finish.
 
-You can start exploring during the first scan. Folders appear as they are discovered, and measured sizes fill in as mapping progresses. **Waiting** means the folder's contents have not been read yet; **so far** marks an unfinished total. You can open folders, preview files, reveal items in Finder, and collect finished items. Search and removal become available when the completed map is saved.
+You can start exploring during the first scan. Folders appear as they are discovered, and measured sizes fill in as mapping progresses. **Waiting** means the folder's contents have not been read yet; **so far** marks an unfinished total. You can search the files mapped so far, open folders, preview files, reveal items in Finder, and collect or remove eligible items while mapping continues. Sizes for unfinished folders are incomplete, and removing a folder includes everything inside it, including items not yet shown.
 
-**Stop Mapping** keeps a browsable partial map for the current session. **Restart Mapping** starts a fresh scan to finish and save it. Navigation and selection are retained as new results arrive and when the completed map takes over. The map holds updates during a click or drag so its targets stay in place.
+**Stop Mapping** keeps a browsable partial map. **Restart Mapping** resumes from committed progress to finish and save it. Switch to another location and its current scan continues in the background; return to see its latest results and collection. Navigation and selection are retained as new results arrive and when the completed map takes over. The map holds updates during a click or drag so its targets stay in place.
 
 Drag a map segment or a row from the file list into the collection tray to stage that file or folder. Rows in search results work too. Grouped map segments collect the eligible items they represent. Release over the tray to collect, or press Escape to cancel. Files stay in place until you review the collection and confirm a removal action. You can also select a file and use **Add to Collection** or ⌘K.
 
@@ -22,7 +22,7 @@ Collected segments keep their branch color and show diagonal stripes plus a chec
 
 The collection offers **Move to Trash…** and **Delete Permanently…**. Permanent deletion has a separate confirmation listing every item's full path; it removes those items and folder contents immediately, bypasses Trash, and cannot be undone. Both actions recheck file identities and protected locations. Failed items remain in the collection for review.
 
-Click the app background outside a dialog to dismiss it. For a removal confirmation, this cancels the confirmation and returns to your collection. Escape and the Done/Cancel buttons work too. Collection review stays open while a removal is running.
+Click the app background outside a dialog to dismiss it. For a removal confirmation, this cancels the confirmation and returns to your collection. Escape and the Done/Cancel buttons work too. You can close collection review and switch locations while a removal continues.
 
 Hovering a segment highlights and reveals its related row in Contents. For deeper rings, the parent row is highlighted and the exact nested path appears above the list. Hovering a row highlights its segment in return. Selected rows use the same soft coral fill and outline, with a slightly stronger border. Hover does not change your selection or the inspector's action buttons.
 
@@ -35,12 +35,12 @@ The map, list, inspector and action controls keep their positions while navigati
 - Native map and file-list dragging into a large collection tray, with grouped map items, duplicate prevention, and background validation for large drops.
 - Persistent collection marks on the map and file list, including inherited folder coverage and partially collected groups.
 - Linked map/list hover, visible nested paths, and labeled actions with larger click targets.
-- Sorted file and folder lists, breadcrumbs, and SQLite name search across the saved index.
+- Sorted file and folder lists, breadcrumbs, and name search across the partial or saved map.
 - Logical file sizes and separately reported allocated bytes. Hard-link allocation is counted once.
 - Saved maps for each scanned location, restored on launch without another filesystem walk.
 - Cached chart layouts and selection lookups, so pointer movement reuses the prepared map.
 - Filesystem change tracking, including changes made while closed, with background updates of affected folders.
-- Progressive first-scan browsing, completed-item collection, cancellation, inaccessible-item reporting, and an explicit full refresh when needed.
+- Progressive browsing and search, collection and removal of eligible visible items, background mapping for other locations, resumable scans, inaccessible-item reporting, and an explicit full refresh when needed.
 - Finder reveal, native Quick Look, and collection review with confirmed Trash or permanent deletion.
 - System folders, Library, hidden configuration directories, the scan root, home, symlinks, and volume roots protected from collection.
 - Signed GitHub update checks and native installation, with manual restart and a daily-check preference.
@@ -50,7 +50,7 @@ The map, list, inspector and action controls keep their positions while navigati
 | Action | Shortcut |
 |---|---|
 | Open folder map | ⌘O |
-| Search saved index | ⌘F |
+| Search mapped files | ⌘F |
 | Refresh full map | ⌘R |
 | Go up | ⌘[ |
 | Open selected folder | Return or ⌘↓ |
@@ -67,6 +67,7 @@ Install Apple's Swift command-line tools or Xcode with Swift 6.3 or later, plus 
 ./build-app.sh
 swift run OrbitCoreChecks
 ./check-app.sh
+./check-session.sh
 ./check-updater.sh
 ./check-rendering.sh
 ./check-layout.sh
@@ -82,15 +83,15 @@ GitHub Actions builds and checks pushes to `main` and pull requests. Version tag
 
 `OrbitCoreChecks` is a dependency-free test executable so the tests run with Command Line Tools alone, even when XCTest is unavailable. It creates temporary fixtures and checks metadata, bulk/fallback parity, resource forks, sparse files, hard links, Unicode, cancellation, unreadable roots, cleanup policy, persistent indexes, incremental updates, stale revisions, and cancellation during index writes. Progressive checks cover discovery states, preview bounds and exact completed totals. `check-app.sh` checks the app model with real filesystem events, including live changes, cached relaunch, offline replay, and navigation/collection retention. It also checks partial browsing, stop/restart, save failures, gesture-held updates, linked hover, private drag tokens, grouped collection, duplicate prevention, stale identities, large-drop validation/cancellation, and native chart hit testing and gesture thresholds.
 
-`check-app.sh` also checks list-hover suppression through wheel input, scrollbar dragging and momentum, including pointer restoration and teardown. `check-rendering.sh` checks native graph pixels through hover, selection, and collection changes, plus drawing-cache invalidation. The layout suite checks stable frames through navigation and interaction, native toolbar alignment and resizing.
+`check-session.sh` exercises background location switching, partial collection and removal, and reconciliation after scan and refresh races. `check-app.sh` also checks list-hover suppression through wheel input, scrollbar dragging and momentum, including pointer restoration and teardown. `check-rendering.sh` checks native graph pixels through hover, selection, and collection changes, plus drawing-cache invalidation. The layout suite checks stable frames through navigation and interaction, native toolbar alignment and resizing.
 
 ## Scope and limits
 
-The first visit to Home, a device, or another folder still needs a complete metadata scan, with partial results available during the scan. The app saves the completed map in a local SQLite cache under `~/Library/Caches/local.orbitdisk.app/Indexes` and remembers the last location. Partial previews are never written over a saved map. Later visits load only the displayed folder and chart detail; search reads the saved index. Opening a subfolder already covered by the current map reuses that index too. macOS filesystem events trigger updates of changed folders, including changes recorded while the app was closed. The map remains usable while updating.
+The first visit to Home, a device, or another folder still needs a complete metadata scan, with partial results available during the scan. Separate locations can continue mapping while you use another location, as long as the app remains open. The app saves the completed map in a local SQLite cache under `~/Library/Caches/local.orbitdisk.app/Indexes` and remembers the last location. Partial previews never replace a saved map. Mapping progress is committed in private batches under `~/Library/Application Support/local.orbitdisk.app/Mapping`, so a stopped or interrupted scan can resume when you reopen the location, including after the app restarts. When a saved map exists, it remains available while interrupted mapping resumes in the background. Later visits load only the displayed folder and chart detail; search covers discovered items during mapping and the saved index afterward. Opening a subfolder already covered by the current map reuses that index too. macOS filesystem events trigger updates of changed folders, including changes recorded while the app was closed. The map remains usable while updating.
 
 Saved maps appear after checking the root's filesystem identity; event-history validation continues in the background. Chart geometry, group lookup, and collection marks are reused across hover and selection updates. New indexed data rebuilds the chart even when paths and sizes have stayed the same.
 
-A cleared cache, incompatible event history, or filesystem identity change requires a new baseline scan. A failed or incomplete incremental update retains the previous map and pauses updates; use **Refresh Full Map** (⌘R) to retry. Volumes without reusable change history keep the saved map available and require manual refresh. A manually cancelled refresh also pauses automatic updates. Changes are coalesced briefly, so the map can lag active writes. The cache stores paths, names, and size metadata, never file contents, and has owner-only filesystem permissions. Cache files may be removed by macOS.
+A cleared cache without a retained mapping stage, incompatible event history, or filesystem identity change requires a new baseline scan. A failed or incomplete incremental update retains the previous map and pauses updates; use **Refresh Full Map** (⌘R) to retry. Volumes without reusable change history keep the saved map available and require manual refresh. A manually cancelled refresh also pauses automatic updates. Changes are coalesced briefly, so the map can lag active writes. The cache and private mapping stages store paths, names, and size metadata, never file contents, and have owner-only filesystem permissions. macOS may remove cache files; mapping stages are kept separately in Application Support.
 
 Scanning and indexing happen locally. The app contacts GitHub and its download infrastructure for update checks and downloads; it does not upload scanned paths, sizes, or file contents. There is no cloud-storage connector, snapshot manager, or automatic cleanup. Sparkle includes helpers for installing app updates; the scanner does not use a privileged helper.
 
