@@ -4,6 +4,20 @@ on:
 permissions:
   contents: read
 jobs:
+  portable:
+    name: Portable core and release metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Show Swift toolchain
+        run: swift --version
+      - name: Check portable core logic
+        run: ./check-portable-core.sh
+      - name: Check release validation
+        run: python3 scripts/test-release.py
   check:
     name: ${{ matrix.name }}
     runs-on: macos-26

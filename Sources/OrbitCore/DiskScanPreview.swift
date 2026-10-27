@@ -1,11 +1,5 @@
 import Foundation
 
-public struct ScanRemoval: Sendable {
-    public let path: String
-    public let identity: String
-    public init(path: String, identity: String) { self.path = path; self.identity = identity }
-}
-
 public struct ScanPreviewView: Sendable {
     public let root: DiskNode
     public let folder: DiskNode

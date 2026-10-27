@@ -9,7 +9,7 @@ Push a stable `vX.Y.Z` tag to publish a universal app for macOS 14 or later. The
 
 The disk image contains the app and an Applications shortcut. Its stable name supports direct downloads from `https://github.com/JohnDeved/orbit-disk/releases/latest/download/Orbit-Disk.dmg`. Sparkle uses the versioned ZIP, not the disk image. Assets are uploaded to a draft before it becomes the latest public release. The app reads `https://github.com/JohnDeved/orbit-disk/releases/latest/download/appcast.xml`; users do not need GitHub credentials. Existing releases are never overwritten.
 
-Both workflows use the `macos-26` runner and explicitly select Xcode 26.6 through `DEVELOPER_DIR`. They print the Xcode and Swift versions in the job log. This build environment does not raise the app's macOS 14 deployment target.
+Both workflows share parallel check jobs. Portable core logic and release metadata checks run on `ubuntu-24.04`; filesystem, app, and rendering integration checks run on `macos-26`. The macOS jobs explicitly select Xcode 26.6 through `DEVELOPER_DIR`. Toolchain versions appear in the job logs. App packaging and publishing wait for every check job to pass. This build environment does not raise the app's macOS 14 deployment target.
 
 ## Version and tag
 
@@ -37,8 +37,11 @@ Sparkle signatures authenticate the app archive and update feed. They do not rep
 
 Use Swift 6.3 or later command-line tools or Xcode, Python 3, and macOS. CI uses Swift 6.3.3 from Xcode 26.6. Publishing locally also needs an authenticated GitHub CLI with release access.
 
+`check-portable-core.sh` also runs on Linux. It compiles the production value types, removal projection, path ordering, and collection membership code without the macOS scanner. The session suite builds an optimized app-model test module once and shares it across its test programs. Its largest test harness uses `-Onone` to reduce compilation time; the app code and the timing-sensitive volume checks remain optimized.
+
 ```sh
 ./build-app.sh --universal
+./check-portable-core.sh
 swift run -c release OrbitCoreChecks
 ./check-app.sh
 ./check-updater.sh
