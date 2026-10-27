@@ -6,7 +6,7 @@ fixture=$(mktemp -d "${temp_root%/}/OrbitStageChecks.XXXXXX")
 trap 'rm -rf "$fixture"' EXIT
 target="$(uname -m)-apple-macosx14.0"
 swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
-  -I Sources/CSQLite Sources/OrbitCore/*.swift Tests/OrbitStageChecks/main.swift -o "$fixture/StageChecks"
+  -I Sources/CSQLite Sources/OrbitCore/*.swift Tests/OrbitStageChecks/*.swift -o "$fixture/StageChecks"
 "$fixture/StageChecks" "$fixture/data"
 swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
   -I Sources/CSQLite Sources/OrbitCore/*.swift Sources/OrbitDisk/DiskChangeMonitor.swift \

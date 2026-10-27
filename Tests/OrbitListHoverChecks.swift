@@ -224,6 +224,12 @@ enum OrbitListHoverChecks {
             let end = Date(timeIntervalSinceNow: duration)
             while Date() < end { RunLoop.main.run(until: min(end, Date(timeIntervalSinceNow: 0.005))) }
         }
+        func waitForRestore(_ tracking: ListHoverTracking, table: NSTableView) {
+            let deadline = Date(timeIntervalSinceNow: 2)
+            while tracking.hasPendingRestore && Date() < deadline { runLoop(for: 0.005) }
+            precondition(!tracking.hasPendingRestore,
+                         "Restore timed out: rows=\(table.numberOfRows), visible=\(table.rows(in: table.visibleRect))")
+        }
         scroll.contentView.setBoundsOrigin(.zero)
         pointer = window.convertPoint(toScreen: point(in: first))
         let timed = ListHoverTracking(settleDelay: 0.12, pointerLocation: { pointer })
@@ -284,8 +290,7 @@ enum OrbitListHoverChecks {
         precondition(resetTracking.hasPendingRestore, "List teardown must retain a pending reset")
         let (replacementScroll, replacementTable, replacementRow) = resetList()
         resetTracking.register(replacementRow, id: "item-99", table: replacementTable)
-        runLoop(for: 0.04)
-        precondition(!resetTracking.hasPendingRestore)
+        waitForRestore(resetTracking, table: replacementTable)
         precondition(restorationCount == 1)
         precondition(abs(offset(82, in: replacementTable, scroll: replacementScroll) - before) < 0.5,
                      "The visible hovered row must keep its pixel offset after reordering")
@@ -303,8 +308,7 @@ enum OrbitListHoverChecks {
         resetTracking.detach()
         let (nextScroll, nextTable, nextRow) = resetList()
         resetTracking.register(nextRow, id: "item-10", table: nextTable)
-        runLoop(for: 0.04)
-        precondition(!resetTracking.hasPendingRestore)
+        waitForRestore(resetTracking, table: nextTable)
         precondition(restorationCount == 2)
         precondition(abs(offset(30, in: nextTable, scroll: nextScroll) - beforeTop) < 0.5,
                      "An offscreen preferred row must fall back to the first visible row")
@@ -325,8 +329,7 @@ enum OrbitListHoverChecks {
         let sameScrollRow = NSView(frame: sameScrollTable.rect(ofRow: 0))
         sameScrollTable.addSubview(sameScrollRow)
         resetTracking.register(sameScrollRow, id: "new-item", table: sameScrollTable)
-        runLoop(for: 0.04)
-        precondition(!resetTracking.hasPendingRestore)
+        waitForRestore(resetTracking, table: sameScrollTable)
         precondition(restorationCount == 3)
         precondition(abs(offset(visibleRow, in: sameScrollTable, scroll: nextScroll) - beforeMissing) < 0.5,
                      "A missing item must fall back to the previous row index on a reused scroll view")
@@ -349,8 +352,7 @@ enum OrbitListHoverChecks {
         precondition(resetTracking.hasPendingRestore, "An incomplete table must wait for its anchor row")
         dataSource.count = 100
         loadingTable.reloadData()
-        runLoop(for: 0.12)
-        precondition(!resetTracking.hasPendingRestore)
+        waitForRestore(resetTracking, table: loadingTable)
         precondition(restorationCount == 4)
         precondition(abs(offset(70, in: loadingTable, scroll: nextScroll) - beforeDelayed) < 0.5,
                      "A reset must retry once its anchor row becomes available")
@@ -373,7 +375,7 @@ enum OrbitListHoverChecks {
         }
         let (intermediateTable, intermediateRow) = replacementInSameScroll("intermediate")
         let (finalTable, finalRow) = replacementInSameScroll("final")
-        withExtendedLifetime((intermediateTable, intermediateRow, finalRow)) { runLoop(for: 0.08) }
+        withExtendedLifetime((intermediateTable, intermediateRow, finalRow)) { waitForRestore(resetTracking, table: finalTable) }
         precondition(!resetTracking.hasPendingRestore && restorationCount == 5)
         precondition(abs(offset(40, in: finalTable, scroll: nextScroll) - beforeRace) < 0.5,
                      "A newer replacement table must inherit the pending restore")

@@ -9,8 +9,8 @@ struct ListRowInteractionView: NSViewRepresentable {
     let onSelect: (DiskNode) -> Void
     let onOpen: (DiskNode) -> Void
     let makeDrag: ([DiskNode], String) -> NSPasteboardItem?
-    let onDragEnded: () -> Void
-    var onInteractionActive: (Bool) -> Void = { _ in }
+    let onDragEnded: (NSPasteboardItem) -> Void
+    var beginInteraction: () -> (() -> Void) = { {} }
 
     func makeNSView(context: Context) -> ListRowInteractionNSView {
         let view = ListRowInteractionNSView()
@@ -28,6 +28,9 @@ struct ListRowInteractionView: NSViewRepresentable {
 }
 
 final class ListRowInteractionNSView: NSView, NSDraggingSource {
+    #if ORBIT_TESTING
+    var testLastDragSession: NSDraggingSession?
+    #endif
     var interaction: ListRowInteractionView? {
         didSet {
             if oldValue?.trailingExclusion != interaction?.trailingExclusion || oldValue?.contentWidth != interaction?.contentWidth {
@@ -38,10 +41,15 @@ final class ListRowInteractionNSView: NSView, NSDraggingSource {
     private var pressedNode: DiskNode?
     private var pressedEvent: NSEvent?
     private var pressedPoint = CGPoint.zero
+    private var gestureEpoch: UInt64 = 0
+    private var pressedEpoch: UInt64?
     private var opensOnMouseUp = false
     private var lastClick: (nodeID: String, timestamp: TimeInterval)?
     private var movedBeyondClick = false
     private var isDragging = false
+    private weak var activeDragSession: NSDraggingSession?
+    private var pendingDragStart: UUID?
+    private var endedDuringStart: [NSDraggingSession] = []
     private var interactionCompletion: (() -> Void)?
     private var dragCompletion: (() -> Void)?
 
@@ -86,7 +94,10 @@ final class ListRowInteractionNSView: NSView, NSDraggingSource {
     }
 
     override func mouseDown(with event: NSEvent) {
-        cancelInteraction()
+        gestureEpoch &+= 1
+        let epoch = gestureEpoch
+        cancelInteraction(invalidateEpoch: false)
+        guard gestureEpoch == epoch else { return }
         if Self.isContextClick(event) {
             tableView?.mouseDown(with: event)
             return
@@ -97,26 +108,32 @@ final class ListRowInteractionNSView: NSView, NSDraggingSource {
         pressedNode = interaction.node
         pressedEvent = event
         pressedPoint = point
+        pressedEpoch = epoch
         movedBeyondClick = false
         if let lastClick {
             let interval = event.timestamp - lastClick.timestamp
             opensOnMouseUp = event.clickCount == 2 && lastClick.nodeID == interaction.node.id
                 && interval >= 0 && interval <= NSEvent.doubleClickInterval
         }
-        let onActivity = interaction.onInteractionActive
-        interactionCompletion = { onActivity(false) }
-        onActivity(true)
+        let completion = interaction.beginInteraction()
+        guard gestureEpoch == epoch, pressedEpoch == epoch else { completion(); return }
+        interactionCompletion = completion
         if let tableView { window?.makeFirstResponder(tableView) }
+        guard gestureEpoch == epoch, pressedEpoch == epoch else { return }
         interaction.onSelect(interaction.node)
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard !isDragging, !movedBeyondClick, let pressedNode, let pressedEvent, let interaction,
+        guard !isDragging, !movedBeyondClick, let pressedNode, let pressedEvent, let interaction, let epoch = pressedEpoch,
               pressedNode.id == interaction.node.id else { return }
         let point = convert(event.locationInWindow, from: nil)
         guard hypot(point.x - pressedPoint.x, point.y - pressedPoint.y) >= 5 else { return }
         movedBeyondClick = true
         guard let pasteboardItem = interaction.makeDrag([pressedNode], pressedNode.name) else { return }
+        guard gestureEpoch == epoch, pressedEpoch == epoch, !isDragging else {
+            interaction.onDragEnded(pasteboardItem)
+            return
+        }
 
         let preview = dragPreview(for: pressedNode)
         let item = NSDraggingItem(pasteboardWriter: pasteboardItem)
@@ -124,19 +141,37 @@ final class ListRowInteractionNSView: NSView, NSDraggingSource {
                              y: min(max(0, pressedPoint.y - preview.size.height / 2), max(0, bounds.height - preview.size.height)))
         item.setDraggingFrame(NSRect(origin: origin, size: preview.size), contents: preview)
         isDragging = true
-        dragCompletion = interaction.onDragEnded
+        let onDragEnded = interaction.onDragEnded
+        dragCompletion = { onDragEnded(pasteboardItem) }
+        let start = UUID()
+        pendingDragStart = start
         let session = beginDraggingSession(with: [item], event: pressedEvent, source: self)
+        guard pendingDragStart == start && isDragging else { return }
+        pendingDragStart = nil
+        let endedEarly = endedDuringStart.contains { $0 === session }
+        endedDuringStart.removeAll()
+        activeDragSession = session
+        #if ORBIT_TESTING
+        testLastDragSession = session
+        #endif
         session.animatesToStartingPositionsOnCancelOrFail = true
+        if endedEarly { draggingSession(session, endedAt: .zero, operation: []) }
     }
 
     override func mouseUp(with event: NSEvent) {
         guard !isDragging else { return }
-        defer { resetPress(); finishInteraction() }
-        guard !movedBeyondClick, let pressedNode, let pressedEvent, let interaction,
-              pressedNode.id == interaction.node.id,
-              containsInteractionPoint(convert(event.locationInWindow, from: nil)) else { return }
-        lastClick = (pressedNode.id, pressedEvent.timestamp)
-        if opensOnMouseUp { interaction.onOpen(pressedNode) }
+        let opened: (ListRowInteractionView, DiskNode)?
+        if !movedBeyondClick, let pressedNode, let pressedEvent, let interaction,
+           pressedNode.id == interaction.node.id,
+           containsInteractionPoint(convert(event.locationInWindow, from: nil)) {
+            lastClick = (pressedNode.id, pressedEvent.timestamp)
+            opened = opensOnMouseUp ? (interaction, pressedNode) : nil
+        } else { opened = nil }
+        let completion = interactionCompletion
+        interactionCompletion = nil
+        resetPress()
+        if let (interaction, node) = opened { interaction.onOpen(node) }
+        completion?()
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -156,16 +191,27 @@ final class ListRowInteractionNSView: NSView, NSDraggingSource {
     func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }
 
     func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        guard activeDragSession === session else {
+            if pendingDragStart != nil { endedDuringStart.append(session) }
+            return
+        }
+        activeDragSession = nil
         isDragging = false
         resetPress()
         let completion = dragCompletion
         dragCompletion = nil
+        let interactionCompletion = self.interactionCompletion
+        self.interactionCompletion = nil
         completion?()
-        finishInteraction()
+        interactionCompletion?()
     }
 
-    func cancelInteraction(deferNotification: Bool = false) {
+    func cancelInteraction(deferNotification: Bool = false, invalidateEpoch: Bool = true) {
+        if invalidateEpoch { gestureEpoch &+= 1 }
         isDragging = false
+        activeDragSession = nil
+        pendingDragStart = nil
+        endedDuringStart.removeAll()
         resetPress()
         let dragCompletion = self.dragCompletion
         self.dragCompletion = nil
@@ -175,12 +221,6 @@ final class ListRowInteractionNSView: NSView, NSDraggingSource {
         let finish: () -> Void = { dragCompletion?(); interactionCompletion?() }
         if deferNotification { DispatchQueue.main.async(execute: finish) }
         else { finish() }
-    }
-
-    private func finishInteraction() {
-        let completion = interactionCompletion
-        interactionCompletion = nil
-        completion?()
     }
 
     private var tableView: NSTableView? {
@@ -195,6 +235,7 @@ final class ListRowInteractionNSView: NSView, NSDraggingSource {
     private func resetPress() {
         pressedNode = nil
         pressedEvent = nil
+        pressedEpoch = nil
         opensOnMouseUp = false
         movedBeyondClick = false
     }

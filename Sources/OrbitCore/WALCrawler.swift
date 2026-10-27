@@ -15,6 +15,7 @@ final class DurableCrawler {
     var forceFallback = false
     #if ORBIT_TESTING
     var testFallbackAfterFirstBuffer: (() -> Void)?
+    var testBeforeListing: (() -> Void)?
     #endif
     enum Interrupt: Error { case afterBatch }
 
@@ -62,7 +63,8 @@ final class DurableCrawler {
 
     func step(maxBatches: Int? = nil, beforeAccounting: (() throws -> Void)? = nil,
               onRecordCount: ((Int) -> Void)? = nil, onBatch: ((Data, Int) throws -> Void)? = nil,
-              onListingComplete: (() -> Void)? = nil) throws -> Bool {
+              onListingComplete: (() -> Void)? = nil,
+              onListingStart: ((Data, String) -> Void)? = nil, onListingEnd: (() -> Void)? = nil) throws -> Bool {
         guard !cancellation.isCancelled else { throw CancellationError() }
         try root.validate(url: rootURL)
         if try store.markFullRefreshChunk() { return true }
@@ -120,16 +122,22 @@ final class DurableCrawler {
         do { descriptor = try root.openDirectory(components) }
         catch { return try recoverDirectory(error) }
         defer { close(descriptor) }
+        onListingStart?(directory.path, "\(directory.device):\(directory.inode)")
+        defer { onListingEnd?() }
+        #if ORBIT_TESTING
+        testBeforeListing?()
+        #endif
         let revision = try store.dirtyRevision(parent: directory.path)
         let fullGeneration = try store.fullRefreshState().generation
-        var epoch = try store.begin(parent: directory.path)
+        // Commit the new epoch with its first batch, or with the trim marker for an empty listing.
+        var epoch: Int64?
         var batches = 0
         var pending: [FileMetadata] = []
         var listingIssues: [String] = []
         var listingIssueCount = 0
         func commitPending() throws {
             guard !pending.isEmpty else { return }
-            try store.append(parent: directory.path, epoch: epoch, records: pending, rootDevice: root.identity.device)
+            epoch = try store.append(parent: directory.path, epoch: epoch, records: pending, rootDevice: root.identity.device)
             onRecordCount?(pending.count)
             pending.removeAll(keepingCapacity: true)
             try beforeAccounting?()
@@ -164,7 +172,7 @@ final class DurableCrawler {
             do { try list(forceFallback: forceFallback, testFallback: testFallback) }
             catch StreamingBulkDirectory.Failure.needsFallback {
                 pending.removeAll(keepingCapacity: true); listingIssues.removeAll(keepingCapacity: true); listingIssueCount = 0
-                epoch = try store.begin(parent: directory.path)
+                epoch = nil
                 try list(forceFallback: true, testFallback: nil)
             }
         } catch ListingStage.Reconcile.pruneRequired { return true }

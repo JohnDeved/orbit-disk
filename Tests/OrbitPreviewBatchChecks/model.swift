@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 import OrbitCore
 struct InjectedFailure: Error {}
@@ -46,16 +47,48 @@ final class Gate: @unchecked Sendable {
         try await wait("back to partial root") { model.current?.id == root.path && !model.isOpeningFolder }
         model.selectedID=folder.id
         let revision=model.mapRevision
-        model.setMapInteractionActive(true)
+        guard let drag = model.beginCollectionDrag([folder], label: folder.name) else { fatalError("partial folder not draggable") }
+        let oldInteraction = model.beginMapInteraction()
+        let currentInteraction = model.beginMapInteraction()
+        oldInteraction()
+        precondition(model.testMapInteractionActive)
         testingBatch.release()
         try await wait("save while interacting") { DiskIndexStore(directory: cache).savedSnapshot(for: root) != nil }
         try await Task.sleep(nanoseconds: 100_000_000)
         precondition(model.mapRevision == revision && model.isPartialMap, "gesture changed map")
-        model.setMapInteractionActive(false)
+        model.endCollectionDrag(drag)
+        precondition(model.testMapInteractionActive && model.mapRevision == revision, "source completion changed the held map")
+        currentInteraction()
         try await wait("complete") { !model.isScanning && !model.isPartialMap && !model.isOpeningFolder }
         precondition(model.selectedID == folder.id && model.current?.children.allSatisfy(\.isScanComplete) == true)
         model.cancelScan()
         print("PASS: pending collection available; provisional navigation/back, selection, held geometry and final handoff")
+        for refresh in [false, true] {
+            testingBatch.arm(fail: false)
+            let reentrantCache = base.appendingPathComponent(refresh ? "refresh-reentrant" : "stop-reentrant")
+            let reentrant = DiskModel(cacheDirectory: reentrantCache, preferences: preferences)
+            reentrant.testScanner = DiskScanner(testBatch: { try testingBatch.wait() })
+            reentrant.scan(root)
+            try await wait("reentrant partial map") { testingBatch.isWaiting && reentrant.current?.children.isEmpty == false }
+            let end = reentrant.beginMapInteraction()
+            testingBatch.release()
+            try await wait("reentrant saved map") { DiskIndexStore(directory: reentrantCache).savedSnapshot(for: root) != nil }
+            try await Task.sleep(nanoseconds: 100_000_000)
+            var entered = false
+            var finishNew: (() -> Void)?
+            let observer = reentrant.objectWillChange.sink { _ in
+                guard !entered, !reentrant.testMapInteractionActive else { return }
+                entered = true
+                if refresh { reentrant.scan(root, force: true) } else { reentrant.cancelScan() }
+                finishNew = reentrant.beginMapInteraction()
+            }
+            end()
+            precondition(entered && reentrant.testMapInteractionActive, "Reentrant \(refresh ? "refresh" : "stop") lost the new interaction")
+            finishNew?()
+            observer.cancel()
+            reentrant.cancelScan()
+        }
+        print("PASS: reentrant stop and refresh preserve a newly started interaction")
         for removed in [false, true] {
             let rollbackCache=base.appendingPathComponent(removed ? "removed" : "retained")
             testingBatch.arm(fail:true)

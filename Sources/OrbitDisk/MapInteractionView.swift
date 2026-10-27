@@ -10,8 +10,8 @@ struct MapInteractionView: NSViewRepresentable {
     let onHover: (SunburstSegment?) -> Void
     let onActivate: (SunburstSegment) -> Void
     let makeDrag: (SunburstSegment) -> NSPasteboardItem?
-    let onDragEnded: () -> Void
-    var onInteractionActive: (Bool) -> Void = { _ in }
+    let onDragEnded: (NSPasteboardItem) -> Void
+    var beginInteraction: () -> (() -> Void) = { {} }
 
     func makeNSView(context: Context) -> MapInteractionNSView {
         let view = MapInteractionNSView()
@@ -29,6 +29,9 @@ struct MapInteractionView: NSViewRepresentable {
 }
 
 final class MapInteractionNSView: NSView, NSDraggingSource {
+    #if ORBIT_TESTING
+    var testLastDragSession: NSDraggingSession?
+    #endif
     var interaction: MapInteractionView? {
         didSet {
             let layoutChanged = oldValue?.layoutRevision != interaction?.layoutRevision ||
@@ -50,8 +53,13 @@ final class MapInteractionNSView: NSView, NSDraggingSource {
     private var pressedEvent: NSEvent?
     private var pressedPoint = CGPoint.zero
     private var pressedRootID: String?
+    private var gestureEpoch: UInt64 = 0
+    private var pressedEpoch: UInt64?
     private var movedBeyondClick = false
     private var isDragging = false
+    private weak var activeDragSession: NSDraggingSession?
+    private var pendingDragStart: UUID?
+    private var endedDuringStart: [NSDraggingSession] = []
     private var interactionCompletion: (() -> Void)?
     private var dragCompletion: (() -> Void)?
 
@@ -96,26 +104,35 @@ final class MapInteractionNSView: NSView, NSDraggingSource {
     }
 
     override func mouseDown(with event: NSEvent) {
-        cancelInteraction()
+        gestureEpoch &+= 1
+        let epoch = gestureEpoch
+        cancelInteraction(invalidateEpoch: false)
+        guard gestureEpoch == epoch else { return }
         pressedEvent = event
         pressedPoint = convert(event.locationInWindow, from: nil)
         pressedSegment = segment(at: pressedPoint)
         pressedRootID = interaction?.rootID
+        pressedEpoch = epoch
         movedBeyondClick = false
-        if pressedSegment != nil, let onActivity = interaction?.onInteractionActive {
-            interactionCompletion = { onActivity(false) }
-            onActivity(true)
+        if pressedSegment != nil, let interaction {
+            let completion = interaction.beginInteraction()
+            guard gestureEpoch == epoch, pressedEpoch == epoch else { completion(); return }
+            interactionCompletion = completion
         }
         updateHover(with: event)
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard !isDragging, !movedBeyondClick, let pressedSegment, let pressedEvent, let interaction,
+        guard !isDragging, !movedBeyondClick, let pressedSegment, let pressedEvent, let interaction, let epoch = pressedEpoch,
               pressedRootID == interaction.rootID else { return }
         let point = convert(event.locationInWindow, from: nil)
         guard hypot(point.x - pressedPoint.x, point.y - pressedPoint.y) >= 5 else { return }
         movedBeyondClick = true
         guard let pasteboardItem = interaction.makeDrag(pressedSegment) else { return }
+        guard gestureEpoch == epoch, pressedEpoch == epoch, !isDragging else {
+            interaction.onDragEnded(pasteboardItem)
+            return
+        }
 
         let preview = dragPreview(for: pressedSegment)
         let item = NSDraggingItem(pasteboardWriter: pasteboardItem)
@@ -123,18 +140,36 @@ final class MapInteractionNSView: NSView, NSDraggingSource {
                              y: min(max(0, pressedPoint.y - preview.size.height / 2), max(0, bounds.height - preview.size.height)))
         item.setDraggingFrame(NSRect(origin: origin, size: preview.size), contents: preview)
         isDragging = true
-        dragCompletion = interaction.onDragEnded
+        let onDragEnded = interaction.onDragEnded
+        dragCompletion = { onDragEnded(pasteboardItem) }
+        let start = UUID()
+        pendingDragStart = start
         let session = beginDraggingSession(with: [item], event: pressedEvent, source: self)
+        guard pendingDragStart == start && isDragging else { return }
+        pendingDragStart = nil
+        let endedEarly = endedDuringStart.contains { $0 === session }
+        endedDuringStart.removeAll()
+        activeDragSession = session
+        #if ORBIT_TESTING
+        testLastDragSession = session
+        #endif
         session.animatesToStartingPositionsOnCancelOrFail = true
+        if endedEarly { draggingSession(session, endedAt: .zero, operation: []) }
     }
 
     override func mouseUp(with event: NSEvent) {
         guard !isDragging else { return }
-        defer { resetPress(); finishInteraction() }
-        guard !movedBeyondClick, let pressedSegment, let interaction,
-              pressedRootID == interaction.rootID,
-              segment(at: convert(event.locationInWindow, from: nil))?.id == pressedSegment.id else { return }
-        interaction.onActivate(pressedSegment)
+        let activated: (MapInteractionView, SunburstSegment)?
+        if !movedBeyondClick, let pressedSegment, let interaction,
+           pressedRootID == interaction.rootID,
+           segment(at: convert(event.locationInWindow, from: nil))?.id == pressedSegment.id {
+            activated = (interaction, pressedSegment)
+        } else { activated = nil }
+        let completion = interactionCompletion
+        interactionCompletion = nil
+        resetPress()
+        if let (interaction, segment) = activated { interaction.onActivate(segment) }
+        completion?()
     }
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
@@ -144,17 +179,28 @@ final class MapInteractionNSView: NSView, NSDraggingSource {
     func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }
 
     func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        guard activeDragSession === session else {
+            if pendingDragStart != nil { endedDuringStart.append(session) }
+            return
+        }
+        activeDragSession = nil
         isDragging = false
         resetPress()
-        setHovered(nil)
         let completion = dragCompletion
         dragCompletion = nil
+        let interactionCompletion = self.interactionCompletion
+        self.interactionCompletion = nil
+        setHovered(nil)
         completion?()
-        finishInteraction()
+        interactionCompletion?()
     }
 
-    func cancelInteraction(deferNotification: Bool = false) {
+    func cancelInteraction(deferNotification: Bool = false, invalidateEpoch: Bool = true) {
+        if invalidateEpoch { gestureEpoch &+= 1 }
         isDragging = false
+        activeDragSession = nil
+        pendingDragStart = nil
+        endedDuringStart.removeAll()
         resetPress()
         let dragCompletion = self.dragCompletion
         self.dragCompletion = nil
@@ -166,16 +212,11 @@ final class MapInteractionNSView: NSView, NSDraggingSource {
         else { finish() }
     }
 
-    private func finishInteraction() {
-        let completion = interactionCompletion
-        interactionCompletion = nil
-        completion?()
-    }
-
     private func resetPress() {
         pressedSegment = nil
         pressedEvent = nil
         pressedRootID = nil
+        pressedEpoch = nil
         movedBeyondClick = false
     }
 

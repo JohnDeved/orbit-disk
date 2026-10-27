@@ -741,7 +741,8 @@ final class DiskModel: ObservableObject {
         removeFromCollection(id, expectedReview: token)
     }
 
-    private(set) var draggingLabel: String? { willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 } }
+    private(set) var draggingLabel: String?
+    private var collectionDragEpoch: UInt64 = 0
     private(set) var isValidatingCollection = false { willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 } }
     var hoveredMapNodes: [DiskNode] = [] {
         willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 }
@@ -859,6 +860,13 @@ final class DiskModel: ObservableObject {
     var testBeforePreviewRead: @Sendable () -> Void = {}
     var testRecoveryParentLimit = 10_000
     var testHasDeferredPreview: Bool { deferredPreview != nil }
+    var testMapInteractionActive: Bool { mapInteractionActive }
+    var testHasDeferredNameSort: Bool { deferredNameSort != nil }
+    func testSetDeferredPublication(first: @escaping () -> Void, second: @escaping () -> Void) {
+        deferredScanCompletion = first
+        deferredIndexedFolder = second
+        deferredNameSort = ([], [], [:], nameSortRevision)
+    }
     func testRefreshPreview() {
         guard let preview = scanPreview, let token = scanCancellation else { return }
         lastPreviewRevision = nil
@@ -887,6 +895,7 @@ final class DiskModel: ObservableObject {
     private var lastPreviewRevision: UInt64?
     private var lastPreviewPath: String?
     private var mapInteractionActive = false
+    private var mapInteractionOwner: UUID?
     private var deferredPreview: (view: PreparedPreview, scanID: UUID, browseID: UUID)?
     private var deferredScanCompletion: (() -> Void)?
     private var deferredIndexedFolder: (() -> Void)?
@@ -2054,6 +2063,17 @@ final class DiskModel: ObservableObject {
         if isFiltering && searchTask == nil { search() }
     }
 
+    func beginMapInteraction() -> () -> Void {
+        let owner = UUID()
+        mapInteractionOwner = owner
+        setMapInteractionActive(true)
+        return { [weak self] in
+            guard let self, self.mapInteractionOwner == owner else { return }
+            self.mapInteractionOwner = nil
+            self.setMapInteractionActive(false)
+        }
+    }
+
     func setMapInteractionActive(_ active: Bool) {
         mapInteractionActive = active
         guard !active else { return }
@@ -2069,10 +2089,12 @@ final class DiskModel: ObservableObject {
                 publishPreview(pending.view)
             }
         }
+        guard !mapInteractionActive else { return }
         if let publishFolder = deferredIndexedFolder {
             deferredIndexedFolder = nil
             publishFolder()
         }
+        guard !mapInteractionActive else { return }
         if let pending = deferredNameSort {
             deferredNameSort = nil
             finishNameSort(nodes: pending.nodes, items: pending.items, indices: pending.indices, revision: pending.revision)
@@ -2086,7 +2108,7 @@ final class DiskModel: ObservableObject {
         folderPreparationWorker?.cancel(); folderPreparationWorker = nil
         folderPreparationCancellation?.cancel(); folderPreparationCancellation = nil
         deferredPreview = nil; deferredScanCompletion = nil; deferredIndexedFolder = nil
-        mapInteractionActive = false
+        mapInteractionActive = false; mapInteractionOwner = nil
         if let pending = deferredNameSort {
             deferredNameSort = nil
             finishNameSort(nodes: pending.nodes, items: pending.items, indices: pending.indices, revision: pending.revision)
@@ -2849,7 +2871,9 @@ final class DiskModel: ObservableObject {
     }
 
     func beginCollectionDrag(_ nodes: [DiskNode], label: String) -> NSPasteboardItem? {
+        let epoch = collectionDragEpoch &+ 1
         clearCollectionDrag()
+        guard collectionDragEpoch == epoch else { return nil }
         guard displayedRootMatchesActiveSession, let root, (!isScanning || isPartialMap), !isRemoving, !isValidatingCollection, !isUpdatingCollection else { return nil }
         let collected = collectionState.pathIDs
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -2876,14 +2900,28 @@ final class DiskModel: ObservableObject {
                                         nodes: isLarge ? nodes : eligible,
                                         omitted: isLarge ? [] : nodes.filter { !eligibleIDs.contains($0.id) },
                                         groupContext: isLarge ? context : nil)
-        draggingLabel = label
+        setDraggingLabel(label, epoch: epoch)
+        guard collectionDragEpoch == epoch, collectionDrag?.token == token else { return nil }
         let item = NSPasteboardItem()
         item.setData(token, forType: Self.collectionDragType)
         return item
     }
 
     func endCollectionDrag() {
-        draggingLabel = nil
+        collectionDragEpoch &+= 1
+        setDraggingLabel(nil, epoch: collectionDragEpoch)
+    }
+
+    private func setDraggingLabel(_ label: String?, epoch: UInt64) {
+        if !atomicFolderInstall { objectWillChange.send() }
+        guard collectionDragEpoch == epoch else { return }
+        folderStateVersion &+= 1
+        draggingLabel = label
+    }
+
+    func endCollectionDrag(_ item: NSPasteboardItem) {
+        guard let token = item.data(forType: Self.collectionDragType), collectionDrag?.token == token else { return }
+        endCollectionDrag()
     }
 
     private func clearCollectionDrag() {

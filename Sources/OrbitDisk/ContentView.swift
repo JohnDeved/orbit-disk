@@ -233,7 +233,7 @@ struct ContentView: View {
                                  onHover: { nodes, group in
                                      model.setMapHover(nodes: nodes, groupID: group?.id, preparedGroup: group)
                                  }, makeDrag: model.beginCollectionDrag, onDragEnded: model.endCollectionDrag,
-                                 onInteractionActive: model.setMapInteractionActive)
+                                 beginInteraction: model.beginMapInteraction)
                         .padding(.horizontal, 16).frame(maxWidth: .infinity, maxHeight: .infinity)
                     HStack(spacing: 24) {
                         metric(node.isScanComplete ? "File size" : "File size so far", value: model.isUpdatingRemovalSizes ? "Updating…" : node.scanState == .pending ? "Waiting" : formatBytes(node.size))

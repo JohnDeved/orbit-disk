@@ -359,7 +359,7 @@ public struct DiskIndexStore: Sendable {
     }
 
     public func stagedSearch(query: String, snapshot: IndexSnapshot, revision: UInt64,
-                             removals: [ScanRemoval], cancellation: ScanCancellation, limit: Int = 300) throws -> (nodes: [DiskNode], count: Int, revision: UInt64, removalsChanged: Bool) {
+                             activeDirectory: (path: Data, identity: String)? = nil, removals: [ScanRemoval], cancellation: ScanCancellation, limit: Int = 300) throws -> (nodes: [DiskNode], count: Int, revision: UInt64, removalsChanged: Bool) {
         try Task.checkCancellation()
         let needle = Self.fold(query.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !needle.isEmpty else { return ([], 0, revision, false) }
@@ -414,12 +414,15 @@ public struct DiskIndexStore: Sendable {
                 #endif
                 continue
             }
-            let state: NodeScanState = !directory ? (statement.integer(12) == 0 ? .complete : .pending)
+            let initialState: NodeScanState = !directory ? (statement.integer(12) == 0 ? .complete : .pending)
                 : (statement.integer(10) == 0 ? .complete : (statement.integer(11) == 0 ? .pending : .scanning))
+            let identity = statement.text(9)
+            var state = initialState
+            if let activeDirectory, initialState == .pending, directory, activeDirectory.identity == identity, path.utf8.elementsEqual(activeDirectory.path) { state = .scanning }
             let raw = DiskNode(url: url, name: name,
                 isDirectory: directory, isSymbolicLink: statement.integer(3) != 0, size: statement.integer(5),
                 allocatedSize: statement.integer(6), fileCount: Int(statement.integer(7)), isAccessible: statement.integer(4) != 0,
-                rawAllocatedSize: statement.integer(8), fileIdentity: statement.text(9), scanState: state)
+                rawAllocatedSize: statement.integer(8), fileIdentity: identity, scanState: state)
             if removals.isEmpty { retain(raw) }
             else if let node = try projection.apply(raw, cancellation: cancellation) { count += 1; retain(node) }
         }
@@ -431,7 +434,7 @@ public struct DiskIndexStore: Sendable {
 
     // All rows in the returned partial view come from one read transaction.
     public func stagedView(path: String?, snapshot: IndexSnapshot, revision: UInt64,
-                           removals: [ScanRemoval] = [], cancellation: ScanCancellation? = nil) throws -> ScanPreviewView? {
+                           activeDirectory: (path: Data, identity: String)? = nil, removals: [ScanRemoval] = [], cancellation: ScanCancellation? = nil) throws -> ScanPreviewView? {
         try check(cancellation)
         let db = try open(snapshot, cancellation: cancellation)
         try db.execute("BEGIN")
@@ -447,12 +450,15 @@ public struct DiskIndexStore: Sendable {
                     throw DiskIndexError.invalid("A staged disk index entry is damaged.")
                 }
                 let isDirectory = query.integer(2) != 0
-                let state: NodeScanState = !isDirectory ? (query.integer(12) == 0 ? .complete : .pending)
+                let initialState: NodeScanState = !isDirectory ? (query.integer(12) == 0 ? .complete : .pending)
                     : (query.integer(10) == 0 ? .complete : (query.integer(11) == 0 ? .pending : .scanning))
+                let identity = query.text(9)
+                var state = initialState
+                if let activeDirectory, initialState == .pending, isDirectory, activeDirectory.identity == identity, path.utf8.elementsEqual(activeDirectory.path) { state = .scanning }
                 nodes.append(DiskNode(url: URL(fileURLWithPath: path, isDirectory: isDirectory), name: name,
                     isDirectory: isDirectory, isSymbolicLink: query.integer(3) != 0, size: query.integer(5),
                     allocatedSize: query.integer(6), fileCount: Int(query.integer(7)), isAccessible: query.integer(4) != 0,
-                    rawAllocatedSize: query.integer(8), fileIdentity: query.text(9), scanState: state))
+                    rawAllocatedSize: query.integer(8), fileIdentity: identity, scanState: state))
             }
             return nodes
         }

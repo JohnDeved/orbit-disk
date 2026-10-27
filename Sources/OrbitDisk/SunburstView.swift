@@ -192,8 +192,8 @@ struct SunburstView: View {
     let canGoBack: Bool
     let onHover: ([DiskNode]?, PreparedMapHoverGroup?) -> Void
     let makeDrag: ([DiskNode], String) -> NSPasteboardItem?
-    let onDragEnded: () -> Void
-    let onInteractionActive: (Bool) -> Void
+    let onDragEnded: (NSPasteboardItem) -> Void
+    let beginInteraction: () -> (() -> Void)
 
     private let presentation: SunburstPresentation
     private var segments: [SunburstSegment] { presentation.layout.segments }
@@ -208,8 +208,8 @@ struct SunburstView: View {
          colorIndices: [String: Int] = [:], rootChildIDs: [String]? = nil, onSelect: @escaping (DiskNode) -> Void,
          onOpen: @escaping (DiskNode) -> Void, onBack: @escaping () -> Void, canGoBack: Bool,
          onHover: @escaping ([DiskNode]?, PreparedMapHoverGroup?) -> Void,
-         makeDrag: @escaping ([DiskNode], String) -> NSPasteboardItem?, onDragEnded: @escaping () -> Void,
-         onInteractionActive: @escaping (Bool) -> Void = { _ in }) {
+         makeDrag: @escaping ([DiskNode], String) -> NSPasteboardItem?, onDragEnded: @escaping (NSPasteboardItem) -> Void,
+         beginInteraction: @escaping () -> (() -> Void) = { {} }) {
         self.root = root
         self.selectedID = selectedID
         self.hoveredID = hoveredID
@@ -221,7 +221,7 @@ struct SunburstView: View {
         self.onHover = onHover
         self.makeDrag = makeDrag
         self.onDragEnded = onDragEnded
-        self.onInteractionActive = onInteractionActive
+        self.beginInteraction = beginInteraction
         self.presentation = cache.presentation(root: root, mapRevision: mapRevision, coverage: collectionCoverage,
                                                colorIndices: colorIndices, rootChildIDs: rootChildIDs)
     }
@@ -261,7 +261,7 @@ struct SunburstView: View {
                                        onHover(segment?.members, presentation.layout.hoverGroup(for: segment?.id))
                                    }, onActivate: activate,
                                    makeDrag: { makeDrag($0.members, $0.name) }, onDragEnded: onDragEnded,
-                                   onInteractionActive: onInteractionActive)
+                                   beginInteraction: beginInteraction)
                     .accessibilityHidden(true)
 
                 center(active, radius: metrics.innerRadius, hovered: isCenterHovered)

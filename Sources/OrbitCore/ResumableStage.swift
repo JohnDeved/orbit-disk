@@ -28,6 +28,7 @@ public final class ResumableStage: @unchecked Sendable {
     private var removalReplayPrepared = false
     private let revisionLock = NSLock()
     private var revisionValue: UInt64 = 0
+    private var activeDirectory: (path: Data, identity: String)?
     private var lastProgressTime: TimeInterval = 0
     private var progressItems = 0
     #if ORBIT_TESTING
@@ -167,6 +168,12 @@ public final class ResumableStage: @unchecked Sendable {
 
     public var revision: UInt64 { revisionLock.lock(); defer { revisionLock.unlock() }; return revisionValue }
     private func bumpRevision() { revisionLock.lock(); revisionValue &+= 1; revisionLock.unlock() }
+    private func capturePreviewState() -> (UInt64, (path: Data, identity: String)?) {
+        revisionLock.lock(); defer { revisionLock.unlock() }; return (revisionValue, activeDirectory)
+    }
+    private func setActiveDirectory(_ value: (path: Data, identity: String)?) {
+        revisionLock.lock(); activeDirectory = value; revisionValue &+= 1; revisionLock.unlock()
+    }
 
     public func removalReplayReadiness() -> (cursor: RemovalCursor?, blocked: Bool, generation: UInt64) {
         let state = removalReplay.viewState()
@@ -185,7 +192,8 @@ public final class ResumableStage: @unchecked Sendable {
         #if ORBIT_TESTING
         Self.testBeforeStagedRead?()
         #endif
-        let result = try previewStore.stagedView(path: path, snapshot: previewSnapshot, revision: revision,
+        let (previewRevision, active) = capturePreviewState()
+        let result = try previewStore.stagedView(path: path, snapshot: previewSnapshot, revision: previewRevision, activeDirectory: active,
                                                   removals: removals + state.overlay, cancellation: cancellation)
         let after = removalReplay.viewState()
         guard !after.blocked, after.generation == state.generation else { throw CancellationError() }
@@ -206,7 +214,8 @@ public final class ResumableStage: @unchecked Sendable {
         #if ORBIT_TESTING
         Self.testBeforeStagedRead?()
         #endif
-        let result = try previewStore.stagedSearch(query: query, snapshot: previewSnapshot, revision: revision,
+        let (previewRevision, active) = capturePreviewState()
+        let result = try previewStore.stagedSearch(query: query, snapshot: previewSnapshot, revision: previewRevision, activeDirectory: active,
                                                    removals: removals + state.overlay, cancellation: cancellation, limit: limit)
         let after = removalReplay.viewState()
         guard !after.blocked, after.generation == state.generation else { throw CancellationError() }
@@ -242,6 +251,10 @@ public final class ResumableStage: @unchecked Sendable {
             #if ORBIT_TESTING
             self.testScanner?.testAfterListing?()
             #endif
+        }, onListingStart: { [self] path, identity in
+            setActiveDirectory((path, identity))
+        }, onListingEnd: { [self] in
+            setActiveDirectory(nil)
         })
         try removalReplay.refreshIfNeeded()
         let stable = try removalReplay.settleIfPossible()

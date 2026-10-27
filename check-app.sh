@@ -65,3 +65,4 @@ swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING 
   Sources/OrbitDisk/DiskChangeMonitor.swift Tests/OrbitMonitorChecks.swift \
   -o "$build_path/OrbitMonitorChecks"
 "$build_path/OrbitMonitorChecks"
+./check-interaction-ownership.sh

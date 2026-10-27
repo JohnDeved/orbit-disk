@@ -89,7 +89,7 @@ struct FileRowView: View {
                                        else { model.selectedID = node.id; model.previewSelection() }
                                    }, makeDrag: model.beginCollectionDrag,
                                    onDragEnded: model.endCollectionDrag,
-                                   onInteractionActive: model.setMapInteractionActive)
+                                   beginInteraction: model.beginMapInteraction)
                 .accessibilityHidden(true)
         }
         .onHover { inside in

@@ -10,6 +10,7 @@ final class ListingStage {
     #if ORBIT_TESTING
     static var testQueueMigrationProgress: (@Sendable () -> Void)?
     static var testAfterFirstQueueIndex: (@Sendable () -> Void)?
+    static var testListingCommit: ((String) -> Void)?
     #endif
     let databasePath: String
     let mirror: Bool
@@ -416,18 +417,21 @@ final class ListingStage {
         guard sqlite3_changes(db) == 1 else { throw SnapshotExpectation.Failure.changed }
     }
 
+    private func nextEpoch(parent: Data) throws -> Int64 {
+        let update = try prepare("INSERT INTO epochs(parent,value) VALUES(?,1) ON CONFLICT(parent) DO UPDATE SET value=value+1")
+        defer { sqlite3_finalize(update) }
+        bind(parent, 1, update); try step(update)
+        let select = try prepare("SELECT value FROM epochs WHERE parent=?")
+        defer { sqlite3_finalize(select) }
+        bind(parent, 1, select)
+        guard sqlite3_step(select) == SQLITE_ROW else { throw Failure.sqlite("missing epoch") }
+        return sqlite3_column_int64(select, 0)
+    }
+
     func begin(parent: Data) throws -> Int64 {
         try exec("BEGIN IMMEDIATE")
         do {
-            let update = try prepare("INSERT INTO epochs(parent,value) VALUES(?,1) ON CONFLICT(parent) DO UPDATE SET value=value+1")
-            defer { sqlite3_finalize(update) }
-            bind(parent, 1, update)
-            try step(update)
-            let select = try prepare("SELECT value FROM epochs WHERE parent=?")
-            defer { sqlite3_finalize(select) }
-            bind(parent, 1, select)
-            guard sqlite3_step(select) == SQLITE_ROW else { throw Failure.sqlite("missing epoch") }
-            let epoch = sqlite3_column_int64(select, 0)
+            let epoch = try nextEpoch(parent: parent)
             try exec("COMMIT")
             return epoch
         } catch { try? exec("ROLLBACK"); throw error }
@@ -435,7 +439,8 @@ final class ListingStage {
 
     enum Reconcile: Error { case pruneRequired }
 
-    func append(parent: Data, epoch: Int64, records: [FileMetadata], rootDevice: Int32? = nil) throws {
+    @discardableResult
+    func append(parent: Data, epoch: Int64?, records: [FileMetadata], rootDevice: Int32? = nil) throws -> Int64 {
         if let rootDevice {
             var prefix = parent
             if prefix.last != 47 { prefix.append(47) }
@@ -465,6 +470,10 @@ final class ListingStage {
         }
         try exec("BEGIN IMMEDIATE")
         do {
+            let batchEpoch = try epoch ?? nextEpoch(parent: parent)
+            #if ORBIT_TESTING
+            if epoch == nil { Self.testListingCommit?("batch-epoch") }
+            #endif
             let parentCheck = try prepare("SELECT id FROM nodes WHERE path=CAST(? AS TEXT) AND is_dir=1")
             defer { sqlite3_finalize(parentCheck) }
             bind(parent, 1, parentCheck)
@@ -560,7 +569,7 @@ final class ListingStage {
                 sqlite3_bind_int(insert, 6, record.isSymbolicLink ? 1 : 0)
                 sqlite3_bind_int(insert, 7, record.isMountPoint ? 1 : 0)
                 sqlite3_bind_int64(insert, 8, record.size); sqlite3_bind_int64(insert, 9, record.allocatedSize)
-                sqlite3_bind_int64(insert, 10, Int64(record.linkCount)); sqlite3_bind_int64(insert, 11, epoch)
+                sqlite3_bind_int64(insert, 10, Int64(record.linkCount)); sqlite3_bind_int64(insert, 11, batchEpoch)
                 if mayHaveIssues {
                     sqlite3_reset(clearIssue); sqlite3_clear_bindings(clearIssue); bind(fullPath, 1, clearIssue); try step(clearIssue)
                 }
@@ -583,11 +592,15 @@ final class ListingStage {
             }
             if rootDevice != nil { try adjustAncestors(parent: parent, logical: logicalDelta, allocated: allocatedDelta, files: fileDelta) }
             try exec("COMMIT")
+            #if ORBIT_TESTING
+            if epoch == nil { Self.testListingCommit?("batch-committed") }
+            #endif
+            return batchEpoch
         } catch { try? exec("ROLLBACK"); throw error }
     }
 
     // A completed enumeration schedules bounded trimming; acknowledgements happen after trimming.
-    func finish(parent: Data, epoch: Int64, expectedRevision: Int64, expectedFullGeneration: Int64? = nil, issueCount: Int = 0, issues: [String] = []) throws -> Bool {
+    func finish(parent: Data, epoch: Int64?, expectedRevision: Int64, expectedFullGeneration: Int64? = nil, issueCount: Int = 0, issues: [String] = []) throws -> Bool {
         try exec("BEGIN IMMEDIATE")
         do {
             let full = try fullRefreshState()
@@ -596,6 +609,10 @@ final class ListingStage {
                 try exec("ROLLBACK")
                 return false
             }
+            let completedEpoch = try epoch ?? nextEpoch(parent: parent)
+            #if ORBIT_TESTING
+            if epoch == nil { Self.testListingCommit?("empty-epoch") }
+            #endif
             let clearIssues = try prepare("DELETE FROM listing_issues WHERE parent=?")
             defer { sqlite3_finalize(clearIssues) }
             bind(parent, 1, clearIssues); try step(clearIssues)
@@ -608,10 +625,13 @@ final class ListingStage {
             }
             let statement = try prepare("INSERT OR REPLACE INTO trim(parent,epoch,revision,full_generation) VALUES(?,?,?,?)")
             defer { sqlite3_finalize(statement) }
-            bind(parent, 1, statement); sqlite3_bind_int64(statement, 2, epoch)
+            bind(parent, 1, statement); sqlite3_bind_int64(statement, 2, completedEpoch)
             sqlite3_bind_int64(statement, 3, expectedRevision); sqlite3_bind_int64(statement, 4, expectedFullGeneration ?? -1)
             try step(statement)
             try exec("COMMIT")
+            #if ORBIT_TESTING
+            if epoch == nil { Self.testListingCommit?("empty-committed") }
+            #endif
             return true
         } catch { try? exec("ROLLBACK"); throw error }
     }

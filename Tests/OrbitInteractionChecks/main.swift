@@ -249,8 +249,8 @@ func configuration(rootID: String = root.id, layoutRevision: UUID = mapRevision,
     MapInteractionView(rootID: rootID, layoutRevision: layoutRevision, segments: sectors, metrics: chartMetrics, canGoBack: canGoBack,
                        onHover: { hovered.append($0?.id); hoveredMembers.append($0?.members.map(\.id) ?? []) },
                        onActivate: { activated.append($0.id) },
-                       makeDrag: { requestedDrags.append($0.id); return nil }, onDragEnded: {},
-                       onInteractionActive: { chartActivity.append($0) })
+                       makeDrag: { requestedDrags.append($0.id); return nil }, onDragEnded: { _ in },
+                       beginInteraction: { chartActivity.append(true); return { chartActivity.append(false) } })
 }
 view.interaction = configuration()
 precondition(view.hitTest(view.convert(metrics.center, to: container)) == nil)
@@ -405,7 +405,8 @@ func rowConfiguration(_ node: DiskNode = children[0]) -> ListRowInteractionView 
                                draggedRowSizes.append(contentsOf: nodes.map(\.size))
                                return nil
                            },
-                           onDragEnded: {}, onInteractionActive: { rowActivity.append($0) })
+                           onDragEnded: { _ in },
+                           beginInteraction: { rowActivity.append(true); return { rowActivity.append(false) } })
 }
 func rowEvent(_ type: NSEvent.EventType, _ point: CGPoint, count: Int = 1,
               modifiers: NSEvent.ModifierFlags = []) -> NSEvent {
@@ -475,7 +476,7 @@ let chartActivityCount = chartActivity.count
 view.mouseDown(with: event(.leftMouseDown, largePoint))
 var replacementChartActivity: [Bool] = []
 var newChartConfiguration = configuration()
-newChartConfiguration.onInteractionActive = { replacementChartActivity.append($0) }
+newChartConfiguration.beginInteraction = { replacementChartActivity.append(true); return { replacementChartActivity.append(false) } }
 view.interaction = newChartConfiguration
 view.mouseUp(with: event(.leftMouseUp, largePoint))
 precondition(Array(chartActivity.dropFirst(chartActivityCount)) == [true, false] && replacementChartActivity.isEmpty)
@@ -494,7 +495,7 @@ let rowActivityCount = rowActivity.count
 row.mouseDown(with: rowEvent(.leftMouseDown, rowPoint))
 var replacementRowActivity: [Bool] = []
 var newRowConfiguration = rowConfiguration()
-newRowConfiguration.onInteractionActive = { replacementRowActivity.append($0) }
+newRowConfiguration.beginInteraction = { replacementRowActivity.append(true); return { replacementRowActivity.append(false) } }
 row.interaction = newRowConfiguration
 row.mouseUp(with: rowEvent(.leftMouseUp, rowPoint))
 precondition(Array(rowActivity.dropFirst(rowActivityCount)) == [true, false] && replacementRowActivity.isEmpty)

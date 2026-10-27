@@ -87,7 +87,13 @@ func checkLookupPreflight(_ base: URL) throws {
 }
 @main struct Check {
  static func main() throws {
+  let args = CommandLine.arguments
+  if args.count == 4 && args[1] == "listing-epoch-child" {
+   try ListingEpochChecks.crashChild(URL(fileURLWithPath: args[2], isDirectory: true), boundary: args[3])
+   return
+  }
   let base=URL(fileURLWithPath:CommandLine.arguments[1],isDirectory:true).standardizedFileURL, fm=FileManager.default
+  try ListingEpochChecks.run(base.appendingPathComponent("listing-epochs",isDirectory:true))
   try checkDirectoryRegistrationRollback(base.appendingPathComponent("directory-rollback",isDirectory:true))
   try checkIdentityLookup(base.appendingPathComponent("identity",isDirectory:true))
   try checkLookupPreflight(base.appendingPathComponent("lookup",isDirectory:true))

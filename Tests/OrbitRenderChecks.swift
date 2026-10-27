@@ -90,7 +90,7 @@ private struct Pixels {
             let map = SunburstView(root: root, mapRevision: mapRevision, cache: cache,
                                    selectedID: selected, hoveredID: hovered, collectionCoverage: coverage,
                                    onSelect: { _ in }, onOpen: { _ in }, onBack: {}, canGoBack: false,
-                                   onHover: { _, _ in }, makeDrag: { _, _ in nil }, onDragEnded: {})
+                                   onHover: { _, _ in }, makeDrag: { _, _ in nil }, onDragEnded: { _ in })
                 .frame(width: size.width, height: size.height)
                 .background(Color(red: 0.04, green: 0.05, blue: 0.07))
                 .environment(\.colorScheme, .dark)
