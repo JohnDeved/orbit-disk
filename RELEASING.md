@@ -11,6 +11,8 @@ The disk image contains the app and an Applications shortcut. Its stable name su
 
 Both workflows share parallel check jobs. Portable core logic and release metadata checks run on `ubuntu-24.04`; filesystem, app, and rendering integration checks run on `macos-26`. The macOS jobs explicitly select Xcode 26.6 through `DEVELOPER_DIR`. Toolchain versions appear in the job logs. App packaging and publishing wait for every check job to pass. This build environment does not raise the app's macOS 14 deployment target.
 
+After publication, the release workflow renders the README screenshots from the released commit and commits only the generated images to `main`. Ordinary pushes do not refresh screenshots. If the images are unchanged, no screenshot commit is created.
+
 ## Version and tag
 
 1. Change `CFBundleShortVersionString` in `Config/Info.plist` to the new version and increase the integer `CFBundleVersion`. Both must be newer than previous release tags. For example, after version `0.9.0`, build `12`, use version `0.9.1`, build `13`.

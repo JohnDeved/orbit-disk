@@ -75,4 +75,4 @@ Install Swift 6.3 or later and Python 3, then run:
 
 The script builds `../Orbit Disk.app` and resolves the pinned Sparkle dependency on the first run. The [guide](docs/GUIDE.md) covers shortcuts, tests, limitations, and release steps. See [technical notes](TECHNICAL-NOTES.md) for implementation details.
 
-The screenshots and flow illustrations use sample data rendered from the app’s views. Run `./scripts/capture-marketing.sh` to refresh them locally; GitHub Actions refreshes them after app changes reach `main`.
+The screenshots and flow illustrations use sample data rendered from the app’s views. Run `./scripts/capture-marketing.sh` to refresh them locally; GitHub Actions refreshes them from the released commit only after a release is published.

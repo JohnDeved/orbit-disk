@@ -43,3 +43,6 @@ jobs:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: ./scripts/release.sh "$RELEASE_TAG"
+  screenshots:
+    needs: release
+    uses: ./.github/workflows/screenshots.yml
