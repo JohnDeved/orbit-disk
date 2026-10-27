@@ -386,6 +386,8 @@ final class CollectionGate: @unchecked Sendable {
 
     @MainActor static func checkProgressiveMapping(base: URL, preferences: UserDefaults) async throws {
         func gateAtListing(_ model: DiskModel, _ gate: PreviewGate, _ root: URL) {
+            // This fixture needs undiscovered descendants while the writer is paused.
+            model.testConfigureStage = { $0.testDisableAsyncDiscovery = true }
             model.testAfterStageStep = { stage in
                 guard let view = try? stage.view(path: nil, removals: [], cancellation: ScanCancellation()),
                       view.folder.id == root.path, view.folder.children.count == 2, !view.isListing else { return }

@@ -151,7 +151,9 @@ final class SortGate: @unchecked Sendable {
             installedSize = size
             recorder.frames = [:]
             host.rootView = AnyView(view.preferredColorScheme(.dark)
-                .onPreferenceChange(FramePreference.self) { recorder.frames = $0; recorder.history.append($0) })
+                .onPreferenceChange(FramePreference.self) { recorder.frames = $0; recorder.history.append($0) }
+                // Reinstalling identical geometry must still populate the fresh recorder.
+                .id(UUID()))
             window.setContentSize(size)
         }
         func toolbarFrames() -> [String: CGRect] {

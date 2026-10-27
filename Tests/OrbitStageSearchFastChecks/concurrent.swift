@@ -10,8 +10,16 @@ final class Gate: @unchecked Sendable {
  static func main() async throws {
  let base=URL(fileURLWithPath:CommandLine.arguments[1]),root=base.appendingPathComponent("root"),cache=base.appendingPathComponent(UUID().uuidString)
  let stage=try ResumableStage(cache:cache,root:root,current:StageCheckpoint(rootPath:root.path,identity:"bench",eventID:0))
- let advanced = try stage.advance(progress:{_ in}); precondition(advanced)
  let store=DiskIndexStore(directory:cache), snapshot=stage.testPreviewSnapshot
+ // Discovery can run ahead; establish the durable root boundary before pausing the reader.
+ let deadline=ProcessInfo.processInfo.systemUptime+10
+ while true {
+  let committed=try store.stagedSearch(query:"file",snapshot:snapshot,revision:1,removals:[],cancellation:ScanCancellation(),limit:0).count
+  if committed == 2000 {break}
+  precondition(committed < 2000,"Writer passed the root-only snapshot")
+  precondition(ProcessInfo.processInfo.systemUptime < deadline,"Root listing did not reach the durable snapshot")
+  let advanced=try stage.advance(progress:{_ in});precondition(advanced)
+ }
  let before=try store.stagedSearch(query:"file",snapshot:snapshot,revision:1,removals:[],cancellation:ScanCancellation(),limit:300)
  precondition(before.count == 2000)
  let prepared = try store.prepareStagedSearch(snapshot:snapshot); precondition(prepared)

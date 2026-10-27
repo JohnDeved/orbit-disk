@@ -226,43 +226,54 @@ final class NthGate: @unchecked Sendable {
         precondition(statusModel.isRemoving && statusModel.statusMessage?.contains("Deleting collected items") == true)
         statusRemoval.release();try await wait("status removal completed") {!statusModel.isRemovingAcrossSessions && !fm.fileExists(atPath:statusFile.path)}
         statusModel.cancelScan()
-        let partial=dir.appendingPathComponent("partial-delete"), victimFile=partial.appendingPathComponent("pending-file"), victimDir=partial.appendingPathComponent("pending-dir")
-        try fm.createDirectory(at:victimDir,withIntermediateDirectories:true)
-        try Data([1,2]).write(to:victimFile);try Data([3,4,5]).write(to:victimDir.appendingPathComponent("child"))
-        let pg=RootGate(partial.path), partialCache=dir.appendingPathComponent("partial-index")
-        let mp=DiskModel(cacheDirectory:partialCache,preferences:prefs,scanProgressObserver:{pg.observe($0)})
-        mp.scan(partial);try await wait("partial deletion fixture") {pg.waiting && mp.current?.children.count == 2}
-        precondition(mp.current!.children.first{$0.id == victimDir.path}!.scanState != .complete)
-        let partialFile = mp.current!.children.first { $0.id == victimFile.path }!
-        let fileDrag = mp.beginCollectionDrag([partialFile], label: partialFile.name)!
-        let fileToken = fileDrag.data(forType: DiskModel.collectionDragType)!
-        mp.endCollectionDrag(fileDrag)
-        precondition(mp.collectDrag(data: fileToken), "A file must accept a drop while mapping is held")
-        try await wait("partial file collection") { !mp.isValidatingCollection }
-        let pendingDirectory = mp.current!.children.first { $0.id == victimDir.path }!
-        let staleDrag = mp.beginCollectionDrag([pendingDirectory], label: pendingDirectory.name)!
-        let staleToken = staleDrag.data(forType: DiskModel.collectionDragType)!
-        mp.scan(b);try await wait("switch away from held partial map") {mp.root?.id == b.path && !mp.isScanning}
-        precondition(pg.waiting && !mp.collectDrag(data: staleToken), "A drag must not cross mapped roots")
-        mp.scan(partial);try await wait("return to held partial map") {mp.root?.id == partial.path && mp.current?.children.count == 2}
-        precondition(pg.waiting && mp.isScanning && mp.collection.map(\.id) == [victimFile.path])
-        let returnedDirectory = mp.current!.children.first { $0.id == victimDir.path }!
-        let directoryDrag = mp.beginCollectionDrag([returnedDirectory], label: returnedDirectory.name)!
-        let directoryToken = directoryDrag.data(forType: DiskModel.collectionDragType)!
-        mp.endCollectionDrag(directoryDrag)
-        precondition(mp.collectDrag(data: directoryToken), "A pending folder must accept a drop after switching back")
-        try await wait("partial folder collection") { !mp.isValidatingCollection }
-        mp.deleteCollectionPermanently()
-        try await wait("partial deletion finishes") {!mp.isRemoving && !fm.fileExists(atPath:victimFile.path) && !fm.fileExists(atPath:victimDir.path)}
-        precondition(pg.waiting && mp.isScanning)
-        try await wait("partial overlay applied") {mp.current?.children.isEmpty == true}
-        precondition(mp.root?.fileCount == 0)
-        pg.release()
-        try await wait("partial reconciliation") {!mp.isScanning && !mp.isRefreshing && !mp.isPartialMap && mp.root?.fileCount == 0}
-        let final=DiskIndexStore(directory:partialCache).savedSnapshot(for:partial)!
-        let finalFolder = try DiskIndexStore(directory:partialCache).loadFolder(path:partial.path,snapshot:final)
-        precondition(finalFolder.children.isEmpty)
-        mp.cancelScan()
+        for asyncDiscovery in [false, true] {
+            let mode = asyncDiscovery ? "async" : "serial"
+            let partial=dir.appendingPathComponent("partial-delete-" + mode), victimFile=partial.appendingPathComponent("pending-file"), victimDir=partial.appendingPathComponent("pending-dir")
+            try fm.createDirectory(at:victimDir,withIntermediateDirectories:true)
+            try Data([1,2]).write(to:victimFile);try Data([3,4,5]).write(to:victimDir.appendingPathComponent("child"))
+            let pg=RootGate(partial.path), partialCache=dir.appendingPathComponent("partial-index-" + mode)
+            let mp=DiskModel(cacheDirectory:partialCache,preferences:prefs,scanProgressObserver:{pg.observe($0)})
+            mp.testConfigureStage = { $0.testDisableAsyncDiscovery = !asyncDiscovery }
+            mp.scan(partial);try await wait("partial deletion fixture") {pg.waiting && mp.current?.children.count == 2}
+            if asyncDiscovery {
+                try await wait("RAM-only child listing") {
+                    mp.current?.children.first(where: { $0.id == victimDir.path })?.scanState == .complete
+                }
+                precondition(pg.waiting && mp.isScanning, "Discovery must complete the child while its writer remains held")
+            } else {
+                precondition(mp.current!.children.first{$0.id == victimDir.path}!.scanState != .complete)
+            }
+            let partialFile = mp.current!.children.first { $0.id == victimFile.path }!
+            let fileDrag = mp.beginCollectionDrag([partialFile], label: partialFile.name)!
+            let fileToken = fileDrag.data(forType: DiskModel.collectionDragType)!
+            mp.endCollectionDrag(fileDrag)
+            precondition(mp.collectDrag(data: fileToken), "A file must accept a drop while mapping is held")
+            try await wait("partial file collection") { !mp.isValidatingCollection }
+            let pendingDirectory = mp.current!.children.first { $0.id == victimDir.path }!
+            let staleDrag = mp.beginCollectionDrag([pendingDirectory], label: pendingDirectory.name)!
+            let staleToken = staleDrag.data(forType: DiskModel.collectionDragType)!
+            mp.scan(b);try await wait("switch away from held partial map") {mp.root?.id == b.path && !mp.isScanning}
+            precondition(pg.waiting && !mp.collectDrag(data: staleToken), "A drag must not cross mapped roots")
+            mp.scan(partial);try await wait("return to held partial map") {mp.root?.id == partial.path && mp.current?.children.count == 2}
+            precondition(pg.waiting && mp.isScanning && mp.collection.map(\.id) == [victimFile.path])
+            let returnedDirectory = mp.current!.children.first { $0.id == victimDir.path }!
+            let directoryDrag = mp.beginCollectionDrag([returnedDirectory], label: returnedDirectory.name)!
+            let directoryToken = directoryDrag.data(forType: DiskModel.collectionDragType)!
+            mp.endCollectionDrag(directoryDrag)
+            precondition(mp.collectDrag(data: directoryToken), "A discovered folder must accept a drop after switching back")
+            try await wait("partial folder collection") { !mp.isValidatingCollection }
+            mp.deleteCollectionPermanently()
+            try await wait("partial deletion finishes") {!mp.isRemoving && !fm.fileExists(atPath:victimFile.path) && !fm.fileExists(atPath:victimDir.path)}
+            precondition(pg.waiting && mp.isScanning)
+            try await wait("partial overlay applied") {mp.current?.children.isEmpty == true}
+            precondition(mp.root?.fileCount == 0)
+            pg.release()
+            try await wait("partial reconciliation") {!mp.isScanning && !mp.isRefreshing && !mp.isPartialMap && mp.root?.fileCount == 0}
+            let final=DiskIndexStore(directory:partialCache).savedSnapshot(for:partial)!
+            let finalFolder = try DiskIndexStore(directory:partialCache).loadFolder(path:partial.path,snapshot:final)
+            precondition(finalFolder.children.isEmpty)
+            mp.cancelScan()
+        }
         let retainedRoot=dir.appendingPathComponent("retained-actions")
         try fm.createDirectory(at:retainedRoot,withIntermediateDirectories:true)
         let retainedFirst=retainedRoot.appendingPathComponent("first"), retainedSecond=retainedRoot.appendingPathComponent("second")
@@ -356,6 +367,8 @@ final class NthGate: @unchecked Sendable {
         for i in 0..<1200 {try Data([UInt8(i % 251)]).write(to:pendingRoot.appendingPathComponent("file-\(i)"))}
         let pendingGate=ResolutionGate(), pendingCache=dir.appendingPathComponent("pending-index")
         let pendingModel=DiskModel(cacheDirectory:pendingCache,preferences:prefs)
+        // This fixture needs an unfinished listing, so its gate must hold discovery too.
+        pendingModel.testConfigureStage = { $0.testDisableAsyncDiscovery = true }
         pendingModel.testScanner = DiskScanner(testBatch:{pendingGate.pause()})
         pendingModel.scan(pendingRoot)
         try await wait("pending batch") {pendingGate.waiting && pendingModel.current?.children.isEmpty == false}
@@ -478,6 +491,8 @@ final class NthGate: @unchecked Sendable {
         let unknownRoot=dir.appendingPathComponent("replace-unknown"), unknown=unknownRoot.appendingPathComponent("one/two"), unknownOld=unknownRoot.appendingPathComponent("one/two-old")
         try fm.createDirectory(at:unknown,withIntermediateDirectories:true);try Data([1]).write(to:unknown.appendingPathComponent("old"))
         let ug=RootGate(unknownRoot.path), um=DiskModel(cacheDirectory:dir.appendingPathComponent("replace-unknown-index"),preferences:prefs,scanProgressObserver:{ug.observe($0)})
+        // Keep the destination undiscovered until its identity changes below.
+        um.testConfigureStage = { $0.testDisableAsyncDiscovery = true }
         um.scan(unknownRoot);try await wait("unknown root gated") {ug.waiting && um.root?.id == unknownRoot.path}
         um.scan(unknown);try await wait("unknown resolution complete") {um.isOpeningFolder}
         try await Task.sleep(nanoseconds:100_000_000)

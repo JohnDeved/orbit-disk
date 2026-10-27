@@ -4,9 +4,19 @@ import OrbitCore
  static func main() throws {
   let base=URL(fileURLWithPath:CommandLine.arguments[1]), root=base.appendingPathComponent("root"), cache=base.appendingPathComponent(UUID().uuidString)
   let stage=try ResumableStage(cache:cache,root:root,current:StageCheckpoint(rootPath:root.path,identity:"test",eventID:0))
-  let firstAdvance = try stage.advance(progress:{_ in}); precondition(firstAdvance)
-  let firstView = try stage.view(path:root.path,removals:[],cancellation:ScanCancellation())!
-  let firstSearch = try stage.search(query:"file",cancellation:ScanCancellation(),removals:[],limit:10000)
+  let store=DiskIndexStore(directory:cache), snapshot=stage.testPreviewSnapshot
+  let rootChildren=try FileManager.default.contentsOfDirectory(atPath:root.path).count
+  let deadline=ProcessInfo.processInfo.systemUptime+10
+  // Test the partial SQLite snapshot while asynchronous discovery may already know descendants.
+  while true {
+   let committed=try store.stagedView(path:root.path,snapshot:snapshot,revision:1,removals:[],cancellation:ScanCancellation())!.folder.children.count
+   if committed == rootChildren {break}
+   precondition(committed < rootChildren,"Root listing exceeded the fixture")
+   precondition(ProcessInfo.processInfo.systemUptime < deadline,"Root listing did not reach the durable snapshot")
+   let advanced=try stage.advance(progress:{_ in});precondition(advanced)
+  }
+  let firstView = try store.stagedView(path:root.path,snapshot:snapshot,revision:1,removals:[],cancellation:ScanCancellation())!
+  let firstSearch = try store.stagedSearch(query:"file",snapshot:snapshot,revision:1,removals:[],cancellation:ScanCancellation(),limit:10000)
   let expectedFirst = firstView.folder.children.filter { $0.name.hasPrefix("file") }
   precondition(firstSearch.count == expectedFirst.count)
   let expectedByPath = Dictionary(uniqueKeysWithValues: expectedFirst.map { (Data($0.id.utf8), $0) })
