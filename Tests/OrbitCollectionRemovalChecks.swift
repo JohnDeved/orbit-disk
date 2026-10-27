@@ -22,14 +22,14 @@ final class Gate: @unchecked Sendable {
         let root = base.appendingPathComponent("root"), otherRoot = base.appendingPathComponent("other")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: otherRoot, withIntermediateDirectories: true)
-        let a = root.appendingPathComponent("a"), b = root.appendingPathComponent("b")
-        try Data([1,2,3]).write(to: a); try Data([4,5]).write(to: b)
+        let a = root.appendingPathComponent("a"), b = root.appendingPathComponent("b"), c = root.appendingPathComponent("c")
+        try Data([1,2,3]).write(to: a); try Data([4,5]).write(to: b); try Data([6]).write(to: c)
         let suite = "ui-row-edit-\(UUID())", prefs = UserDefaults(suiteName: suite)!
         defer { prefs.removePersistentDomain(forName: suite) }
         let model = DiskModel(cacheDirectory: base.appendingPathComponent("cache"), preferences: prefs)
         model.scan(root); try await wait("initial scan") { model.root?.id == root.path && !model.isScanning && model.node(withID: a.path) != nil }
         model.cancelScan()
-        let first = model.node(withID: a.path)!, second = model.node(withID: b.path)!
+        let first = model.node(withID: a.path)!, second = model.node(withID: b.path)!, third = model.node(withID: c.path)!
         let existing = (0..<1_200).map { i in
             DiskNode(url: root.appendingPathComponent("fake-\(i)"), name: "fake-\(i)", isDirectory: false,
                      size: 1, allocatedSize: 1, fileCount: 1, fileIdentity: "fake:\(i)")
@@ -41,11 +41,14 @@ final class Gate: @unchecked Sendable {
         precondition(model.isUpdatingCollection && model.isRemovingFromCollection(first.id))
         model.deleteCollectionPermanently()
         precondition(!model.isRemoving && FileManager.default.fileExists(atPath: a.path))
-        precondition(!model.collect([first]) && model.beginCollectionDrag([first], label: "a") == nil)
+        let queued = model.beginCollectionDrag([third], label: "c")!
+        let token = queued.data(forType: DiskModel.collectionDragType)!
+        model.endCollectionDrag(queued)
+        precondition(model.collectDrag(data: token), "A drag should queue while collection edits are in progress")
         model.removeFromCollection(second.id)
         precondition(model.isRemovingFromCollection(second.id))
-        gate.release(); try await wait("queued removals") { !model.isUpdatingCollection }
-        precondition(model.collection.count == 1_200 && model.collectionSize == 1_200
+        gate.release(); try await wait("queued removals and addition") { !model.isUpdatingCollection && !model.isValidatingCollection }
+        precondition(model.collection.count == 1_201 && model.collectionSize == 1_201 && model.collection.contains { $0.id == third.id }
                      && !model.collection.contains { $0.id == first.id || $0.id == second.id })
 
         model.collection = existing

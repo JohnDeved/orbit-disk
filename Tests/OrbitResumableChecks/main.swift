@@ -65,9 +65,11 @@ func waitForSignal(_ semaphore: DispatchSemaphore) -> Bool { semaphore.wait(time
             if savedFirst {
                 try await wait("saved map during resume") { gate.waiting && model.root?.id == root.path && model.current?.children.count == 1 && model.isRefreshing }
                 guard model.collect([model.current!.children[0]]) else { throw NSError(domain:"saved collection unavailable",code:1) }
+                try await wait("saved collection") { !model.isValidatingCollection }
             } else {
                 try await wait("recovered partial map") { gate.waiting && model.root?.id == root.path && (model.current?.children.count ?? 0) >= 128 && model.isPartialMap }
                 guard model.collect([model.current!.children[0]]) else { throw NSError(domain:"partial collection unavailable",code:1) }
+                try await wait("partial collection") { !model.isValidatingCollection }
             }
             let selected=model.current!.children[0].id
             model.selectedID=selected
@@ -124,6 +126,7 @@ func waitForSignal(_ semaphore: DispatchSemaphore) -> Bool { semaphore.wait(time
         model.scan(root)
         try await wait("partial map before stop") { first.waiting && model.isPartialMap && (model.current?.children.count ?? 0) >= 128 }
         guard let selected=model.current?.children.first, model.collect([selected]) else { throw NSError(domain:"stop collection unavailable",code:1) }
+        try await wait("collection before stop") { !model.isValidatingCollection }
         model.selectedID=selected.id
         model.cancelScan(); first.release()
         model.testScanner=DiskScanner()

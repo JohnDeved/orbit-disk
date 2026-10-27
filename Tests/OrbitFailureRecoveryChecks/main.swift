@@ -59,6 +59,7 @@ enum Injected: Error {case failure}
     try await wait("B resolution completes") {model.root?.id == b.path && !model.isOpeningFolder && !model.isScanning}
     model.scan(child)
    } else if mode == "reentrant" {
+    try await wait("A visible before reentrant failure") { model.root?.id == a.path }
     var fired=false
     let observer=model.objectWillChange.sink {
      MainActor.assumeIsolated {

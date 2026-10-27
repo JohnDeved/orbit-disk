@@ -419,6 +419,7 @@ final class CollectionGate: @unchecked Sendable {
         precondition(!pending.isScanComplete && pending.children.isEmpty && ready.isScanComplete)
         precondition(model.canCollect(pending), "Visible incomplete folders must be collectable")
         precondition(model.canCollect(ready) && model.collect([ready]))
+        try await wait("accepted collection") { !model.isValidatingCollection }
         model.query = "ready"
         try await wait("partial preview search") { !model.isSearching && model.searchResults.contains { $0.id == ready.id } }
         precondition(model.isPartialMap, "Partial search must use the current preview")
@@ -531,6 +532,7 @@ final class CollectionGate: @unchecked Sendable {
                      && failed.current?.children.first?.name == "inside.bin",
                      "A completed in-memory scan must remain browsable when persistence fails")
         precondition(failed.collect([failed.current!.children[0]]))
+        try await wait("accepted collection") { !failed.isValidatingCollection }
         failed.deleteCollectionPermanently()
         try await wait("remove from failed-save partial map") { !failed.isRemoving && !fm.fileExists(atPath: folder.appendingPathComponent("inside.bin").path) }
         failed.goBack()
@@ -705,6 +707,7 @@ final class CollectionGate: @unchecked Sendable {
         precondition(model.searchResults.contains { $0.id == alpha.id } && model.selected?.id == alpha.id,
                      "Previous rows must remain usable while the next search runs")
         precondition(model.collect([alpha]), "A previous search row must remain collectable")
+        try await wait("accepted collection") { !model.isValidatingCollection }
         try await wait("replacement search") { !model.isSearching && model.searchResults.first?.id == betaURL.path }
         precondition(model.selected?.id == alpha.id && model.hoveredListID == hoveredURL.path &&
                      model.node(withID: hoveredURL.path) != nil && model.collection.first?.id == alpha.id,
@@ -857,7 +860,9 @@ final class CollectionGate: @unchecked Sendable {
         precondition(model.selectedID == other.id && model.draggingLabel == sourceRow.name,
                      "The dragged search row must be independent of the existing selection")
         model.endCollectionDrag()
-        precondition(model.collectDrag(data: rowToken) && model.collection.map(\.id) == [sourceRow.id],
+        precondition(model.collectDrag(data: rowToken))
+        try await wait("search row collection") { !model.isValidatingCollection }
+        precondition(model.collection.map(\.id) == [sourceRow.id],
                      "Dropping a search row must collect its exact source instead of the selected row")
         precondition(model.selectedID == other.id)
         precondition(model.beginCollectionDrag([sourceRow], label: sourceRow.name) == nil
@@ -873,6 +878,7 @@ final class CollectionGate: @unchecked Sendable {
         model.query = ""
 
         precondition(model.collect([deep, branch, branch, other, model.root!, protected]))
+        try await wait("accepted collection") { !model.isValidatingCollection }
         precondition(Set(model.collection.map(\.id)) == [branch.id, other.id], "Collection must collapse descendants and reject protected locations")
         precondition(model.statusMessage?.contains("2 items already included") == true)
         precondition(model.statusMessage?.contains("Skipped 2 items") == true)
@@ -895,6 +901,7 @@ final class CollectionGate: @unchecked Sendable {
                      && model.collectionCoverage.state(for: deep.id) == .none,
                      "Clearing the collection must clear coverage immediately")
         precondition(model.collect([deep]))
+        try await wait("accepted collection") { !model.isValidatingCollection }
         precondition(model.collectionCoverage.state(for: branch.id) == .containsItems
                      && model.collectionCoverage.state(for: deep.id) == .included,
                      "Collecting a nested file must mark its ancestors as containing collected items")
@@ -911,7 +918,9 @@ final class CollectionGate: @unchecked Sendable {
                      "Cancelling or ending a drag must never collect")
         precondition(model.canAcceptCollectionDrop, "Drop data may arrive after the native dragging session ends")
         precondition(!model.collectDrag(data: Data("unknown token".utf8)) && model.collection.isEmpty)
-        precondition(model.collectDrag(data: token) && model.collection.count == 2)
+        precondition(model.collectDrag(data: token))
+        try await wait("two-item drop") { !model.isValidatingCollection }
+        precondition(model.collection.count == 2)
         precondition(!model.collectDrag(data: token), "A drop token must be consumed once")
         precondition(fm.fileExists(atPath: deep.id) && fm.fileExists(atPath: other.id), "Collecting must not move files")
         model.collection = []
@@ -920,14 +929,18 @@ final class CollectionGate: @unchecked Sendable {
         let originalBranch = root.appendingPathComponent("Original Branch")
         try fm.moveItem(at: branchURL, to: originalBranch)
         try fm.createDirectory(at: branchURL, withIntermediateDirectories: true)
-        precondition(!model.collectDrag(data: directoryToken) && model.collection.isEmpty,
+        precondition(model.collectDrag(data: directoryToken))
+        try await wait("replacement directory rejection") { !model.isValidatingCollection }
+        precondition(model.collection.isEmpty,
                      "A replacement directory must not be collected using an indexed directory's identity")
         precondition(model.errorMessage?.contains("changed since indexing") == true)
         let fileToken = model.beginCollectionDrag([other], label: other.name)!.data(forType: DiskModel.collectionDragType)!
         let originalOther = root.appendingPathComponent("original-other.bin")
         try fm.moveItem(at: other.url, to: originalOther)
         try Data([8, 9]).write(to: other.url)
-        precondition(!model.collectDrag(data: fileToken) && model.collection.isEmpty,
+        precondition(model.collectDrag(data: fileToken))
+        try await wait("replacement file rejection") { !model.isValidatingCollection }
+        precondition(model.collection.isEmpty,
                      "A replacement file must not be collected using an indexed file's identity")
         precondition(fm.fileExists(atPath: originalOther.path) && fm.fileExists(atPath: other.id)
                      && fm.fileExists(atPath: originalBranch.appendingPathComponent("Sub/item.bin").path),
@@ -937,8 +950,8 @@ final class CollectionGate: @unchecked Sendable {
         precondition(model.collectDrag(data: batchToken))
         precondition(model.isValidatingCollection && model.collection.isEmpty,
                      "Large drops must validate in the background before applying one batch")
-        precondition(!model.canCollect(stable) && !model.canAcceptCollectionDrop && !model.collectDrag(data: batchToken),
-                     "Busy validation must prevent duplicate collection actions")
+        precondition(model.canCollect(stable) && !model.canAcceptCollectionDrop && !model.collectDrag(data: batchToken),
+                     "Validation must leave new items actionable while consuming each drop token once")
         model.statusMessage = "A newer action status."
         try await wait("large grouped drop") { !model.isValidatingCollection }
         precondition(model.collection.count == 72 && Set(model.collection.map(\.id)) == Set(batch.map(\.id)))
@@ -946,6 +959,7 @@ final class CollectionGate: @unchecked Sendable {
         precondition(batch.allSatisfy { fm.fileExists(atPath: $0.id) }, "Grouped collection must not move files")
         model.collection = []
         precondition(model.collect([stable]))
+        try await wait("accepted collection") { !model.isValidatingCollection }
         let mixed = [stable, protected, model.root!] + batch + [batch[0]]
         let mixedToken = model.beginCollectionDrag(mixed, label: "mixed items")!.data(forType: DiskModel.collectionDragType)!
         model.endCollectionDrag()
@@ -954,8 +968,11 @@ final class CollectionGate: @unchecked Sendable {
         precondition(Set(model.collection.map(\.id)) == Set(([stable] + batch).map(\.id)))
         precondition(model.statusMessage?.contains("2 items already included") == true && model.statusMessage?.contains("Skipped 2 items") == true,
                      "Deferred grouping must preserve duplicate and rejected-item reporting")
-        precondition(model.beginCollectionDrag(Array(repeating: stable, count: 72), label: "already collected") == nil,
-                     "A large group with no eligible items must not start a drag")
+        let includedDrag = model.beginCollectionDrag(Array(repeating: stable, count: 72), label: "already collected")!
+        precondition(model.collectDrag(data: includedDrag.data(forType: DiskModel.collectionDragType)!))
+        try await wait("already included group") { !model.isValidatingCollection }
+        precondition(Set(model.collection.map(\.id)) == Set(([stable] + batch).map(\.id)),
+                     "Large group eligibility runs off-main and must not duplicate collected items")
         model.collection = []
         var directArmed = true
         let directObserver = model.objectWillChange.sink { _ in
@@ -977,14 +994,16 @@ final class CollectionGate: @unchecked Sendable {
             }
         }
         precondition(model.collect([stable]))
+        try await wait("accepted collection") { !model.isValidatingCollection }
         collectObserver.cancel()
         precondition(model.collectionSize == model.collection.reduce(0) { $0 + $1.size }, "Collection total must track the current snapshot")
         precondition(!collectArmed && Set(model.collection.map(\.id)) == Set([stable.id, batch[0].id])
                      && model.collectionCoverage.state(for: stable.id) == .included
                      && model.collectionCoverage.state(for: batch[0].id) == .included,
-                     "Synchronous collection must retry against reentrant changes")
+                     "Queued collection must retry against reentrant changes")
         model.collection = []
         precondition(model.collect([stable]))
+        try await wait("accepted collection") { !model.isValidatingCollection }
         let publicationGate = CollectionGate()
         model.testCollectionPrepare = { publicationGate.blockOnce() }
         publicationGate.arm()
@@ -1106,13 +1125,17 @@ final class CollectionGate: @unchecked Sendable {
         model.scan(root)
         try await wait("permanent removal map") { model.root != nil && !model.isScanning }
         model.cancelScan()
-        precondition(!model.collect([model.root!, model.node(withID: protected.path)!]) && model.collection.isEmpty,
+        precondition(model.collect([model.root!, model.node(withID: protected.path)!]))
+        try await wait("protected item rejection") { !model.isValidatingCollection }
+        precondition(model.collection.isEmpty,
                      "Mapped roots and protected folders must never enter the collection")
         model.deleteCollectionPermanently()
         precondition(!model.isRemoving && fm.fileExists(atPath: root.path) && fm.fileExists(atPath: protected.path))
 
         let removals = [removeFile, bundle, staleFile, staleDirectory].map { model.node(withID: $0.path)! }
-        precondition(model.collect(removals) && model.collection.count == 4)
+        precondition(model.collect(removals))
+        try await wait("removal collection") { !model.isValidatingCollection }
+        precondition(model.collection.count == 4)
         let originalStaleFile = base.appendingPathComponent("original-stale.bin")
         let originalStaleDirectory = base.appendingPathComponent("original-stale-folder")
         try fm.moveItem(at: staleFile, to: originalStaleFile)
@@ -1160,6 +1183,7 @@ final class CollectionGate: @unchecked Sendable {
         model.cancelScan()
         model.collection = []
         precondition(model.collect([model.node(withID: staleFile.path)!]))
+        try await wait("accepted collection") { !model.isValidatingCollection }
         let originalRoot = base.appendingPathComponent("original-removal-root")
         try fm.moveItem(at: root, to: originalRoot)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
@@ -1237,6 +1261,7 @@ final class CollectionGate: @unchecked Sendable {
         precondition(model.current?.children.count == 1)
         model.selectedID = model.current?.children[0].id
         model.collectSelection()
+        try await wait("selected item validation") { !model.isValidatingCollection }
         precondition(model.collection.count == 1)
         let hovered = model.current!.children[0]
         let revisionBeforeUpdate = model.mapRevision

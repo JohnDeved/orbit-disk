@@ -55,6 +55,7 @@ final class NthGate: @unchecked Sendable {
         model.scan(a); try await wait("preview a") {gate.waiting && model.current?.children.count == 2}
         checkMapMembership(model)
         precondition(model.collect([model.current!.children.first {$0.name == "first"}!]))
+        try await wait("accepted collection") { !model.isValidatingCollection }
         model.scan(sub);try await wait("navigate partial") {model.current?.id == sub.path}
         checkMapMembership(model)
         precondition(store.savedSnapshot(for:sub) == nil)
@@ -65,6 +66,7 @@ final class NthGate: @unchecked Sendable {
         model.query = ""; model.sortByName = false; checkMapMembership(model)
         precondition(gate.waiting && model.collection.isEmpty && model.collectionSize == 0)
         precondition(model.collect([model.current!.children.first!]))
+        try await wait("accepted collection") { !model.isValidatingCollection }
         model.scan(a);try await wait("reattach a") {model.root?.id == a.path && model.current?.id == sub.path}
         checkMapMembership(model)
         precondition(gate.waiting && model.isScanning && store.savedSnapshot(for:a) == nil)
@@ -167,6 +169,7 @@ final class NthGate: @unchecked Sendable {
         let deletionGate=ResolutionGate(), m7=DiskModel(cacheDirectory:dir.appendingPathComponent("removal-index"),preferences:prefs)
         m7.scan(rem);try await wait("removal initial save") {m7.root?.id == rem.path && !m7.isScanning}
         precondition(m7.collect([m7.current!.children[0]]))
+        try await wait("accepted collection") { !m7.isValidatingCollection }
         m7.testBeforeRemoval = {deletionGate.pause()};m7.deleteCollectionPermanently()
         try await wait("removal gated") {deletionGate.waiting && m7.isRemoving}
         m7.scan(b);try await wait("switch during removal") {m7.root?.id == b.path && !m7.isScanning && !m7.isRemoving}
@@ -186,11 +189,13 @@ final class NthGate: @unchecked Sendable {
         let multipleModel=DiskModel(cacheDirectory:dir.appendingPathComponent("multiple-index"),preferences:prefs)
         multipleModel.scan(multipleA);try await wait("multiple A map") {!multipleModel.isScanning && multipleModel.root?.id == multipleA.path}
         let gateA=ResolutionGate(), gateB=ResolutionGate()
-        precondition(multipleModel.collect([multipleModel.current!.children[0]]));multipleModel.testBeforeRemoval={gateA.pause()};multipleModel.deleteCollectionPermanently()
+        precondition(multipleModel.collect([multipleModel.current!.children[0]]))
+        try await wait("accepted collection") { !multipleModel.isValidatingCollection };multipleModel.testBeforeRemoval={gateA.pause()};multipleModel.deleteCollectionPermanently()
         try await wait("multiple A held") {gateA.waiting && multipleModel.isRemovingAcrossSessions}
         multipleModel.scan(multipleB);try await wait("multiple B map") {!multipleModel.isScanning && multipleModel.root?.id == multipleB.path}
         precondition(!multipleModel.isRemoving && multipleModel.isRemovingAcrossSessions)
-        precondition(multipleModel.collect([multipleModel.current!.children[0]]));multipleModel.testBeforeRemoval={gateB.pause()};multipleModel.deleteCollectionPermanently()
+        precondition(multipleModel.collect([multipleModel.current!.children[0]]))
+        try await wait("accepted collection") { !multipleModel.isValidatingCollection };multipleModel.testBeforeRemoval={gateB.pause()};multipleModel.deleteCollectionPermanently()
         try await wait("multiple B held") {gateB.waiting && multipleModel.isRemovingAcrossSessions}
         gateA.release();try await wait("multiple A completed") {!fm.fileExists(atPath:multipleFileA.path)}
         try await Task.sleep(nanoseconds:100_000_000)
@@ -202,6 +207,7 @@ final class NthGate: @unchecked Sendable {
         let confirmedModel=DiskModel(cacheDirectory:dir.appendingPathComponent("confirmed-index"),preferences:prefs)
         confirmedModel.scan(confirmedRoot);try await wait("confirmed map") {!confirmedModel.isScanning && confirmedModel.current?.children.count == 1}
         precondition(confirmedModel.collect([confirmedModel.current!.children[0]]))
+        try await wait("accepted collection") { !confirmedModel.isValidatingCollection }
         let confirmedObserver=confirmedModel.$isRemovingAcrossSessions.dropFirst().sink { active in
             if active { confirmedModel.collection = [] }
         }
@@ -213,7 +219,8 @@ final class NthGate: @unchecked Sendable {
         let statusScan=RootGate(statusRoot.path), statusRemoval=ResolutionGate()
         let statusModel=DiskModel(cacheDirectory:dir.appendingPathComponent("scan-save-status-index"),preferences:prefs,scanProgressObserver:{statusScan.observe($0)})
         statusModel.scan(statusRoot);try await wait("status preview") {statusScan.waiting && statusModel.current?.children.count == 1}
-        precondition(statusModel.collect([statusModel.current!.children[0]]));statusModel.testBeforeRemoval={statusRemoval.pause()};statusModel.deleteCollectionPermanently()
+        precondition(statusModel.collect([statusModel.current!.children[0]]))
+        try await wait("accepted collection") { !statusModel.isValidatingCollection };statusModel.testBeforeRemoval={statusRemoval.pause()};statusModel.deleteCollectionPermanently()
         try await wait("status removal held") {statusRemoval.waiting && statusModel.isRemoving}
         statusScan.release();try await wait("status scan saved") {!statusModel.isScanning && !statusModel.isPartialMap}
         precondition(statusModel.isRemoving && statusModel.statusMessage?.contains("Deleting collected items") == true)
@@ -226,7 +233,25 @@ final class NthGate: @unchecked Sendable {
         let mp=DiskModel(cacheDirectory:partialCache,preferences:prefs,scanProgressObserver:{pg.observe($0)})
         mp.scan(partial);try await wait("partial deletion fixture") {pg.waiting && mp.current?.children.count == 2}
         precondition(mp.current!.children.first{$0.id == victimDir.path}!.scanState != .complete)
-        precondition(mp.collect(mp.current!.children))
+        let partialFile = mp.current!.children.first { $0.id == victimFile.path }!
+        let fileDrag = mp.beginCollectionDrag([partialFile], label: partialFile.name)!
+        let fileToken = fileDrag.data(forType: DiskModel.collectionDragType)!
+        mp.endCollectionDrag(fileDrag)
+        precondition(mp.collectDrag(data: fileToken), "A file must accept a drop while mapping is held")
+        try await wait("partial file collection") { !mp.isValidatingCollection }
+        let pendingDirectory = mp.current!.children.first { $0.id == victimDir.path }!
+        let staleDrag = mp.beginCollectionDrag([pendingDirectory], label: pendingDirectory.name)!
+        let staleToken = staleDrag.data(forType: DiskModel.collectionDragType)!
+        mp.scan(b);try await wait("switch away from held partial map") {mp.root?.id == b.path && !mp.isScanning}
+        precondition(pg.waiting && !mp.collectDrag(data: staleToken), "A drag must not cross mapped roots")
+        mp.scan(partial);try await wait("return to held partial map") {mp.root?.id == partial.path && mp.current?.children.count == 2}
+        precondition(pg.waiting && mp.isScanning && mp.collection.map(\.id) == [victimFile.path])
+        let returnedDirectory = mp.current!.children.first { $0.id == victimDir.path }!
+        let directoryDrag = mp.beginCollectionDrag([returnedDirectory], label: returnedDirectory.name)!
+        let directoryToken = directoryDrag.data(forType: DiskModel.collectionDragType)!
+        mp.endCollectionDrag(directoryDrag)
+        precondition(mp.collectDrag(data: directoryToken), "A pending folder must accept a drop after switching back")
+        try await wait("partial folder collection") { !mp.isValidatingCollection }
         mp.deleteCollectionPermanently()
         try await wait("partial deletion finishes") {!mp.isRemoving && !fm.fileExists(atPath:victimFile.path) && !fm.fileExists(atPath:victimDir.path)}
         precondition(pg.waiting && mp.isScanning)
@@ -238,6 +263,28 @@ final class NthGate: @unchecked Sendable {
         let finalFolder = try DiskIndexStore(directory:partialCache).loadFolder(path:partial.path,snapshot:final)
         precondition(finalFolder.children.isEmpty)
         mp.cancelScan()
+        let retainedRoot=dir.appendingPathComponent("retained-actions")
+        try fm.createDirectory(at:retainedRoot,withIntermediateDirectories:true)
+        let retainedFirst=retainedRoot.appendingPathComponent("first"), retainedSecond=retainedRoot.appendingPathComponent("second")
+        try Data([1]).write(to:retainedFirst);try Data([2]).write(to:retainedSecond)
+        let retained=DiskModel(cacheDirectory:dir.appendingPathComponent("retained-actions-index"),preferences:prefs)
+        retained.scan(retainedRoot);try await wait("retained actions map") {!retained.isScanning && retained.current?.children.count == 2}
+        precondition(!retained.isPartialMap)
+        retained.isScanning = true
+        let retainedNodes=retained.current!.children
+        precondition(retained.canCollect(retainedNodes[0]) && retained.collect([retainedNodes[0]]),
+                     "A visible saved-map item must remain collectable while its session opens")
+        try await wait("accepted collection") { !retained.isValidatingCollection }
+        let retainedDrag=retained.beginCollectionDrag([retainedNodes[1]],label:retainedNodes[1].name)!
+        let retainedToken=retainedDrag.data(forType:DiskModel.collectionDragType)!
+        precondition(retained.canAcceptCollectionDrop)
+        retained.endCollectionDrag(retainedDrag)
+        precondition(retained.collectDrag(data:retainedToken))
+        try await wait("retained folder collection") { !retained.isValidatingCollection }
+        retained.deleteCollectionPermanently()
+        try await wait("delete retained items") {!retained.isRemoving && !fm.fileExists(atPath:retainedFirst.path) && !fm.fileExists(atPath:retainedSecond.path)}
+        retained.isScanning = false
+        retained.cancelScan()
         for recreate in [false, true] {
             let suffix = recreate ? "recreated" : "deleted"
             let resumedRoot = dir.appendingPathComponent("stopped-removal-" + suffix)
@@ -265,6 +312,7 @@ final class NthGate: @unchecked Sendable {
             try await wait("stopped removal scanner released") {!gate.waiting && !model.isScanning}
             guard let original = model.current?.children.first(where:{$0.id == victim.path}) else { preconditionFailure("Missing mapped victim") }
             precondition(model.collect([original]))
+            try await wait("accepted collection") { !model.isValidatingCollection }
             model.deleteCollectionPermanently()
             try await wait("remove while stopped") {!model.isRemoving && !fm.fileExists(atPath:victim.path)}
             try await wait("stopped removal hidden") {model.current?.children.contains(where:{$0.id == victim.path}) == false}
@@ -313,6 +361,7 @@ final class NthGate: @unchecked Sendable {
         try await wait("pending batch") {pendingGate.waiting && pendingModel.current?.children.isEmpty == false}
         let pendingFile=pendingModel.current!.children.first!
         precondition(!pendingFile.isScanComplete && pendingModel.collect([pendingFile]))
+        try await wait("accepted collection") { !pendingModel.isValidatingCollection }
         pendingModel.setMapInteractionActive(true);let revision=pendingModel.mapRevision
         pendingModel.deleteCollectionPermanently()
         try await wait("pending deletion") {!pendingModel.isRemoving && !fm.fileExists(atPath:pendingFile.id)}
@@ -337,6 +386,7 @@ final class NthGate: @unchecked Sendable {
         saveModel.scan(saveRoot)
         try await wait("save paused") {saveGate.waiting && saveModel.current?.children.count == 1}
         precondition(saveModel.collect([saveModel.current!.children[0]]))
+        try await wait("accepted collection") { !saveModel.isValidatingCollection }
         saveModel.deleteCollectionPermanently()
         try await wait("delete while save paused") {!saveModel.isRemoving && !fm.fileExists(atPath:saveFile.path)}
         precondition(saveGate.waiting)
@@ -354,7 +404,8 @@ final class NthGate: @unchecked Sendable {
         nm.testScanner = DiskScanner(testBatch:{nestedGate.pause()});nm.scan(nestedRoot)
         try await wait("nested open while scanning") {nestedGate.waiting && nm.current?.children.count == 1}
         let branch=nm.current!.children[0]
-        precondition(nm.collect([branch]));nm.open(branch)
+        precondition(nm.collect([branch]))
+        try await wait("accepted collection") { !nm.isValidatingCollection };nm.open(branch)
         try await wait("inside folder to remove") {nm.current?.id == nestedDir.path}
         nm.deleteCollectionPermanently()
         try await wait("delete open scanning folder") {!nm.isRemoving && !fm.fileExists(atPath:nestedDir.path)}
@@ -372,6 +423,7 @@ final class NthGate: @unchecked Sendable {
         let restartModel=DiskModel(cacheDirectory:dir.appendingPathComponent("restart-delete-index"),preferences:prefs,scanProgressObserver:{scanGate.observe($0)})
         restartModel.scan(restartRoot);try await wait("restart initial gate") {scanGate.waiting && restartModel.current?.children.count == 1}
         precondition(restartModel.collect([restartModel.current!.children[0]]))
+        try await wait("accepted collection") { !restartModel.isValidatingCollection }
         restartModel.testBeforeRemoval = {deleteGate.pause()};restartModel.deleteCollectionPermanently()
         try await wait("restart deletion gate") {deleteGate.waiting && restartModel.isRemoving}
         restartModel.cancelScan();restartModel.rescan();scanGate.release()
@@ -385,6 +437,7 @@ final class NthGate: @unchecked Sendable {
         let lm=DiskModel(cacheDirectory:linkCache,preferences:prefs,scanProgressObserver:{lg.observe($0)})
         lm.scan(links);try await wait("hardlinks preview") {lg.waiting && lm.current?.children.count == 2}
         precondition(lm.collect([lm.current!.children.first{$0.id == original.path}!]))
+        try await wait("accepted collection") { !lm.isValidatingCollection }
         lm.deleteCollectionPermanently();try await wait("hardlink deletion") {!lm.isRemoving && !fm.fileExists(atPath:original.path)}
         precondition(lg.waiting);lg.release()
         try await wait("hardlink reconciliation") {!lm.isScanning && !lm.isRefreshing && !lm.isPartialMap}
@@ -396,6 +449,7 @@ final class NthGate: @unchecked Sendable {
         let mg=RootGate(mixed.path), mm=DiskModel(cacheDirectory:dir.appendingPathComponent("mixed-index"),preferences:prefs,scanProgressObserver:{mg.observe($0)})
         mm.scan(mixed);try await wait("mixed preview") {mg.waiting && mm.current?.children.count == 2}
         precondition(mm.collect(mm.current!.children))
+        try await wait("accepted collection") { !mm.isValidatingCollection }
         try fm.moveItem(at:one,to:old);try Data([4,5]).write(to:one)
         let mixedGate=ResolutionGate();mm.testBeforeRemoval={mixedGate.pause()};mm.showCollection=true
         mm.deleteCollectionPermanently();try await wait("mixed deletion held") {mixedGate.waiting && mm.isRemoving}
@@ -436,6 +490,7 @@ final class NthGate: @unchecked Sendable {
         savedModel.scan(savedRoot);try await wait("saved overlay ready") {savedModel.root?.id == savedRoot.path && !savedModel.isScanning}
         let savedGate=ResolutionGate();savedModel.testBeforeRefreshSave={savedGate.pause()}
         precondition(savedModel.collect([savedModel.current!.children.first{$0.id == savedA.path}!]))
+        try await wait("accepted collection") { !savedModel.isValidatingCollection }
         savedModel.deleteCollectionPermanently()
         try await wait("saved removal projected") {!savedModel.isRemoving && savedModel.current?.children.map(\.name) == ["b"] && savedModel.root?.size == 3}
         try await wait("saved refresh gated") {savedGate.waiting && savedModel.isRefreshing}
@@ -456,6 +511,7 @@ final class NthGate: @unchecked Sendable {
         let parentModel=DiskModel(cacheDirectory:dir.appendingPathComponent("saved-parent-index"),preferences:prefs)
         parentModel.scan(parentRoot);try await wait("saved parent ready") {parentModel.root?.id == parentRoot.path && !parentModel.isScanning}
         let parentNode=parentModel.current!.children[0];precondition(parentModel.collect([parentNode]))
+        try await wait("accepted collection") { !parentModel.isValidatingCollection }
         parentModel.scan(nestedChild);try await wait("open requested nested child") {parentModel.current?.id == nestedChild.path && !parentModel.isOpeningFolder && !parentModel.isScanning}
         let parentGate=ResolutionGate();parentModel.testBeforeRefreshSave={parentGate.pause()}
         parentModel.deleteCollectionPermanently();try await wait("deleted ancestor redirected") {parentModel.current?.id == parentRoot.path && parentModel.current?.children.isEmpty == true}
@@ -467,7 +523,8 @@ final class NthGate: @unchecked Sendable {
         let crossScan=RootGate(cross.path), crossDelete=ResolutionGate()
         let cm=DiskModel(cacheDirectory:dir.appendingPathComponent("cross-index"),preferences:prefs,scanProgressObserver:{crossScan.observe($0)})
         cm.scan(cross);try await wait("cross preview") {crossScan.waiting && cm.current?.children.count == 1}
-        precondition(cm.collect([cm.current!.children[0]]));cm.testBeforeRemoval={crossDelete.pause()};cm.deleteCollectionPermanently()
+        precondition(cm.collect([cm.current!.children[0]]))
+        try await wait("accepted collection") { !cm.isValidatingCollection };cm.testBeforeRemoval={crossDelete.pause()};cm.deleteCollectionPermanently()
         try await wait("cross deletion started") {crossDelete.waiting && cm.isRemoving}
         cm.scan(b);try await wait("cross switched") {cm.root?.id == b.path && !cm.isScanning && !cm.isRemoving}
         crossDelete.release();try await wait("cross removal detached") {!fm.fileExists(atPath:crossFile.path)}
@@ -482,12 +539,16 @@ final class NthGate: @unchecked Sendable {
         let tm=DiskModel(cacheDirectory:dir.appendingPathComponent("transition-index"),preferences:prefs)
         tm.scan(transB);try await wait("transition b ready") {tm.root?.id == transB.path && !tm.isScanning}
         precondition(tm.collect([tm.current!.children[0]]))
+        try await wait("accepted collection") { !tm.isValidatingCollection }
         tm.scan(transA);try await wait("transition a ready") {tm.root?.id == transA.path && !tm.isScanning}
         let oldNode=tm.current!.children[0];precondition(tm.collect([oldNode]))
+        try await wait("accepted collection") { !tm.isValidatingCollection }
         let transitionGate=ResolutionGate();tm.testBeforeScannerStart={transitionGate.pause()}
         tm.scan(transB,force:true);try await wait("transition before new preview") {transitionGate.waiting}
-        precondition(tm.root?.id == transA.path && !tm.canCollect(oldNode) && !tm.collect([oldNode]))
-        tm.deleteCollectionPermanently()
+        precondition(tm.root?.id == transB.path && !tm.canCollect(oldNode))
+        precondition(tm.collect([oldNode]))
+        try await wait("reject former root item") { !tm.isValidatingCollection }
+        precondition(tm.collection.map(\.id) == [transFileB.path])
         precondition(!tm.isRemoving && fm.fileExists(atPath:transFileA.path) && fm.fileExists(atPath:transFileB.path))
         transitionGate.release();try await wait("transition complete") {tm.root?.id == transB.path && !tm.isScanning && !tm.isRefreshing}
         precondition(tm.collection.map(\.id) == [transFileB.path]);tm.cancelScan()
@@ -496,7 +557,8 @@ final class NthGate: @unchecked Sendable {
         let stoppedScan=RootGate(stoppedRoot.path), stoppedDelete=ResolutionGate()
         let sm=DiskModel(cacheDirectory:dir.appendingPathComponent("stop-removal-index"),preferences:prefs,scanProgressObserver:{stoppedScan.observe($0)})
         sm.scan(stoppedRoot);try await wait("stopped removal preview") {stoppedScan.waiting && sm.current?.children.count == 1}
-        precondition(sm.collect([sm.current!.children[0]]));sm.testBeforeRemoval={stoppedDelete.pause()};sm.deleteCollectionPermanently()
+        precondition(sm.collect([sm.current!.children[0]]))
+        try await wait("accepted collection") { !sm.isValidatingCollection };sm.testBeforeRemoval={stoppedDelete.pause()};sm.deleteCollectionPermanently()
         try await wait("stopped removal gated") {stoppedDelete.waiting && sm.isRemoving}
         sm.cancelScan();precondition(sm.isRemoving && sm.isPartialMap && sm.statusMessage?.contains("Deleting collected items") == true)
         stoppedDelete.release();try await wait("stopped removal finishes") {!sm.isRemoving && !fm.fileExists(atPath:stoppedFile.path)}
@@ -514,10 +576,12 @@ final class NthGate: @unchecked Sendable {
         em.scan(epochRoot);try await wait("epoch baseline") {em.root?.id == epochRoot.path && !em.isScanning}
         let epochGate=ResolutionGate();em.testBeforeRefreshSave={epochGate.pause()}
         precondition(em.collect([em.current!.children.first{$0.id==epochOne.path}!]))
+        try await wait("accepted collection") { !em.isValidatingCollection }
         em.deleteCollectionPermanently();try await wait("epoch first deletion") {!em.isRemoving && !fm.fileExists(atPath:epochOne.path)}
         try await wait("epoch first refresh gated") {epochGate.waiting && em.isRefreshing}
         let secondNode=em.current!.children.first{$0.id==epochTwo.path}!
-        precondition(em.collect([secondNode]));em.deleteCollectionPermanently()
+        precondition(em.collect([secondNode]))
+        try await wait("accepted collection") { !em.isValidatingCollection };em.deleteCollectionPermanently()
         try await wait("epoch second deletion") {!em.isRemoving && !fm.fileExists(atPath:epochTwo.path)}
         try await wait("epoch second overlay") {em.current?.children.isEmpty == true}
         precondition(epochGate.waiting);epochGate.release()
@@ -534,11 +598,13 @@ final class NthGate: @unchecked Sendable {
         let fullCache=dir.appendingPathComponent("full-epochs-index"), fullModel=DiskModel(cacheDirectory:fullCache,preferences:prefs)
         fullModel.scan(fullRoot);try await wait("full epoch baseline") {!fullModel.isScanning && fullModel.current?.children.count == 2}
         precondition(fullModel.collect([fullModel.current!.children.first{$0.id == fullOne.path}!]))
+        try await wait("accepted collection") { !fullModel.isValidatingCollection }
         fullModel.deleteCollectionPermanently();try await wait("full epoch first removal") {!fullModel.isRemoving && !fm.fileExists(atPath:fullOne.path)}
         let fullPublishGate=ResolutionGate(), fullRefreshGate=ResolutionGate()
         DiskIndexStore.testBeforePublish={fullPublishGate.pause()};fullModel.testBeforeRefreshSave={fullRefreshGate.pause()}
         fullModel.rescan();try await wait("full epoch save held") {fullPublishGate.waiting}
         precondition(fullModel.collect([fullModel.current!.children.first{$0.id == fullTwo.path}!]))
+        try await wait("accepted collection") { !fullModel.isValidatingCollection }
         fullModel.deleteCollectionPermanently();try await wait("full epoch second removal") {!fullModel.isRemoving && !fm.fileExists(atPath:fullTwo.path)}
         DiskIndexStore.testBeforePublish=nil;fullPublishGate.release()
         try await wait("full epoch later refresh held") {fullRefreshGate.waiting}
@@ -557,6 +623,7 @@ final class NthGate: @unchecked Sendable {
         rm.scan(replacedRoot);try await wait("recreated baseline") {!rm.isScanning && rm.current?.id == replacedRoot.path}
         let replacedGate=ResolutionGate();rm.testBeforeRefreshSave={replacedGate.pause()}
         precondition(rm.collect([rm.current!.children.first{$0.id == removedParent.path}!]))
+        try await wait("accepted collection") { !rm.isValidatingCollection }
         rm.deleteCollectionPermanently();try await wait("recreated removal") {!rm.isRemoving && !fm.fileExists(atPath:removedParent.path)}
         try await wait("recreated refresh held") {replacedGate.waiting}
         try fm.createDirectory(at:replacedChild,withIntermediateDirectories:true)
@@ -572,11 +639,13 @@ final class NthGate: @unchecked Sendable {
         qm.scan(queueA); try await wait("queue A") {qm.root?.id == queueA.path && !qm.isScanning}
         let queueOne=qm.current!.children.first{$0.name == "one"}!, queueTwo=qm.current!.children.first{$0.name == "two"}!
         precondition(qm.collect([queueOne]))
+        try await wait("accepted collection") { !qm.isValidatingCollection }
         let switchGate=ResolutionGate(); qm.testCollectionPrepare={switchGate.pause()}
         precondition(qm.testCollectInBackground([queueTwo])); try await wait("queue switch held") {switchGate.waiting && qm.isValidatingCollection}
         qm.scan(queueB); try await wait("queue B") {qm.root?.id == queueB.path && !qm.isScanning}
         precondition(qm.collection.isEmpty && !qm.isValidatingCollection)
-        precondition(qm.collect([qm.current!.children[0]])); let bIDs=qm.collection.map(\.id)
+        precondition(qm.collect([qm.current!.children[0]]))
+        try await wait("accepted collection") { !qm.isValidatingCollection }; let bIDs=qm.collection.map(\.id)
         qm.scan(queueA); try await wait("queue A returned") {qm.root?.id == queueA.path && !qm.isScanning && qm.isValidatingCollection}
         precondition(qm.collection.map(\.id) == [queueOne.id])
         qm.collection = []

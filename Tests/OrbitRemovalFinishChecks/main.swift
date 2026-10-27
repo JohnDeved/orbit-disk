@@ -21,6 +21,7 @@ final class Gate: @unchecked Sendable {
   model.scan(b);try await wait {model.root?.id==b.path && !model.isScanning}
   model.scan(a);try await wait {model.root?.id==a.path && !model.isScanning}
   guard let item=model.current?.children.first,model.collect([item]) else {throw NSError(domain:"collection setup",code:1)}
+  try await wait { !model.isValidatingCollection }
   model.testBeforeRemoval={gate.pause()}
   model.deleteCollectionPermanently()
   try await wait {gate.waiting}

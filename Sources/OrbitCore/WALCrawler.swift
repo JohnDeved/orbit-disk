@@ -13,6 +13,8 @@ final class DurableCrawler {
     let excludedDirectories: Set<DirectoryIdentity>
     let excludedPaths: Set<Data>
     var forceFallback = false
+    var reusableListing: ((ListingStage.QueuedDirectory) throws -> StageReusableListing?)?
+    var preferredDirectory: (() -> Data?)?
     #if ORBIT_TESTING
     var testFallbackAfterFirstBuffer: (() -> Void)?
     var testBeforeListing: (() -> Void)?
@@ -71,7 +73,7 @@ final class DurableCrawler {
         if try store.pruneOneChunk() { return true }
         if try store.trimOneChunk() { return true }
         if try store.reconcileLinksChunk(cancellation: cancellation) { return true }
-        guard let directory = try store.nextDirectory() else { return false }
+        guard let directory = try store.nextDirectory(preferred: preferredDirectory?()) else { return false }
         guard let path = String(data: directory.path, encoding: .utf8),
               let rootString = String(data: rootPath, encoding: .utf8) else { throw SecureTraversalError.invalidComponent }
         let prefix = rootString == "/" ? "/" : rootString + "/"
@@ -135,9 +137,19 @@ final class DurableCrawler {
         var pending: [FileMetadata] = []
         var listingIssues: [String] = []
         var listingIssueCount = 0
-        func commitPending() throws {
+        func included(_ records: [FileMetadata]) -> [FileMetadata] {
+            records.filter { record in
+                guard record.isDirectory else { return true }
+                var child = directory.path
+                if child.last != 47 { child.append(47) }
+                child.append(contentsOf: record.name.utf8)
+                return !excludedPaths.contains(child) && !excludedDirectories.contains(DirectoryIdentity(device: record.device, inode: record.inode))
+            }
+        }
+        func commitPending(source: StageReuseSource? = nil) throws {
             guard !pending.isEmpty else { return }
-            epoch = try store.append(parent: directory.path, epoch: epoch, records: pending, rootDevice: root.identity.device)
+            let append = { try self.store.append(parent: directory.path, epoch: epoch, records: pending, rootDevice: self.root.identity.device) }
+            epoch = try source.map { try $0.commit(append) } ?? append()
             onRecordCount?(pending.count)
             pending.removeAll(keepingCapacity: true)
             try beforeAccounting?()
@@ -152,24 +164,40 @@ final class DurableCrawler {
                     listingIssueCount += 1
                     if listingIssues.count < 100 { listingIssues.append($0) }
                 }, forceFallback: forceFallback, testFallbackAfterFirstBuffer: testFallback) { records in
-                    pending.append(contentsOf: records.filter { record in
-                        guard record.isDirectory else { return true }
-                        var child = directory.path
-                        if child.last != 47 { child.append(47) }
-                        child.append(contentsOf: record.name.utf8)
-                        return !excludedPaths.contains(child) && !excludedDirectories.contains(DirectoryIdentity(device: record.device, inode: record.inode))
-                    })
+                    pending.append(contentsOf: included(records))
                     if batches == 0 || pending.count >= writeChunkSize { try commitPending() }
                 }
             try commitPending()
         }
+        var reused: StageReusableListing?
         do {
+            if let reusableListing, fullGeneration == 0, try !store.isDirty(parent: directory.path) {
+                reused = try reusableListing(directory)
+            }
+            if let listing = reused {
+                do {
+                    while true {
+                        guard !cancellation.isCancelled, !Task<Never, Never>.isCancelled else { throw CancellationError() }
+                        let page = try listing.page(limit: writeChunkSize)
+                        if page.isEmpty { break }
+                        pending = included(page)
+                        try commitPending(source: listing.source)
+                        if page.count == writeChunkSize {
+                            guard !cancellation.isCancelled, !Task<Never, Never>.isCancelled else { throw CancellationError() }
+                            usleep(2_000)
+                            guard !cancellation.isCancelled, !Task<Never, Never>.isCancelled else { throw CancellationError() }
+                        }
+                    }
+                } catch is StageReuseSource.Failure {
+                    pending.removeAll(keepingCapacity: true); epoch = nil; reused = nil
+                }
+            }
             #if ORBIT_TESTING
             let testFallback = testFallbackAfterFirstBuffer
             #else
             let testFallback: (() -> Void)? = nil
             #endif
-            do { try list(forceFallback: forceFallback, testFallback: testFallback) }
+            do { if reused == nil { try list(forceFallback: forceFallback, testFallback: testFallback) } }
             catch StreamingBulkDirectory.Failure.needsFallback {
                 pending.removeAll(keepingCapacity: true); listingIssues.removeAll(keepingCapacity: true); listingIssueCount = 0
                 epoch = nil
@@ -178,8 +206,11 @@ final class DurableCrawler {
         } catch ListingStage.Reconcile.pruneRequired { return true }
         catch { return try recoverDirectory(error) }
         try root.validate(url: rootURL)
-        let finished = try store.finish(parent: directory.path, epoch: epoch, expectedRevision: revision,
-                                        expectedFullGeneration: fullGeneration, issueCount: listingIssueCount, issues: listingIssues)
+        let finish = { try self.store.finish(parent: directory.path, epoch: epoch, expectedRevision: revision,
+                                            expectedFullGeneration: fullGeneration, issueCount: listingIssueCount, issues: listingIssues) }
+        let finished: Bool
+        do { finished = try reused.map { try $0.source.commit(finish) } ?? finish() }
+        catch is StageReuseSource.Failure { return true }
         if finished { onListingComplete?() }
         return true
     }

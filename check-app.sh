@@ -55,6 +55,7 @@ swiftc -O -swift-version 5 -target "$target" -package-name OrbitDisk -I Sources/
 ./check-saved-search.sh
 ./check-session.sh
 ./check-resumable.sh
+./check-mapping-reuse.sh
 ./check-stage.sh
 ./check-removal-journal.sh
 ./check-stage-removal.sh

@@ -110,7 +110,12 @@ final class Gate: @unchecked Sendable {
             try await wait("fallback started") { testingFallback.isWaiting }
             try await Task.sleep(nanoseconds: 500_000_000)
             precondition(rollback.current?.id == provisional.id, "fallback temporarily changed the browse route")
-            precondition(rollback.canCollect(provisional) == !removed, "fallback collection must reject a vanished folder")
+            precondition(rollback.canCollect(provisional))
+            if removed {
+                precondition(!fm.fileExists(atPath: provisional.id) && rollback.collect([provisional]))
+                try await wait("vanished folder validation") { !rollback.isValidatingCollection && rollback.errorMessage != nil }
+                precondition(!rollback.collection.contains { $0.id == provisional.id }, "A vanished folder must not enter the collection")
+            }
             testingFallback.release()
             if removed {
                 try await wait("rollback to root") { rollback.current?.id == root.path && !rollback.isOpeningFolder }

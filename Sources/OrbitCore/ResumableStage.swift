@@ -16,7 +16,10 @@ public final class ResumableStage: @unchecked Sendable {
         }
     }
     let lease: StageLease
-    public let checkpoint: StageCheckpoint
+    private var checkpointValue: StageCheckpoint
+    public var checkpoint: StageCheckpoint {
+        revisionLock.lock(); defer { revisionLock.unlock() }; return checkpointValue
+    }
     public let hasPriorCheckpoint: Bool
     let expectedSnapshot: SnapshotExpectation
     private let expectedGeneration: String
@@ -29,9 +32,13 @@ public final class ResumableStage: @unchecked Sendable {
     private let revisionLock = NSLock()
     private var revisionValue: UInt64 = 0
     private var activeDirectory: (path: Data, identity: String)?
+    private var preferredDirectory: Data?
     private var lastProgressTime: TimeInterval = 0
     private var progressItems = 0
+    private var reuseProvider: ((URL, StageCheckpoint) throws -> StageReuseCandidate?)?
+    private var reuseSources: [StageReuseSource] = []
     #if ORBIT_TESTING
+    package private(set) var testReusedDirectories = 0
     package var testPreviewSnapshot: IndexSnapshot { previewSnapshot }
     package static var testBeforeStagedRead: (@Sendable () -> Void)?
     package func testUnprojectedNode(path: String) throws -> DiskNode? {
@@ -127,8 +134,61 @@ public final class ResumableStage: @unchecked Sendable {
         try lease.validatePaths()
         let removalReplay = try StageRemovalReplay(cache: cache, crawler: crawler, cancellation: cancellation, fresh: previous == nil)
         let preview = try crawler.store.previewMirror(rootURL: root, checkpoint: checkpoint)
-        self.lease = lease; self.checkpoint = checkpoint; self.hasPriorCheckpoint = previous != nil; self.expectedSnapshot = originalExpectation; self.expectedGeneration = generation; self.crawler = crawler; self.stagingDirectory = stagingDirectory
+        self.lease = lease; self.checkpointValue = checkpoint; self.hasPriorCheckpoint = previous != nil; self.expectedSnapshot = originalExpectation; self.expectedGeneration = generation; self.crawler = crawler; self.stagingDirectory = stagingDirectory
         self.previewSnapshot = preview; self.previewStore = DiskIndexStore(directory: cache); self.removalReplay = removalReplay
+        crawler.preferredDirectory = { [weak self] in
+            guard let self else { return nil }
+            self.revisionLock.lock(); defer { self.revisionLock.unlock() }; return self.preferredDirectory
+        }
+    }
+
+    public func prioritize(path: String?) {
+        let bytes = path.map { Data($0.utf8) }
+        let root = crawler.rootPath
+        let valid = bytes.map { $0 == root || ($0.starts(with: root) && (root == Data([47]) || $0.dropFirst(root.count).first == 47)) } ?? false
+        revisionLock.lock(); preferredDirectory = valid ? bytes : nil; revisionLock.unlock()
+    }
+
+    /// Configure on the writer before advancing. Candidates must share the checkpoint's event stream.
+    public func configureReuse(provider: @escaping (URL, StageCheckpoint) throws -> StageReuseCandidate?) {
+        reuseProvider = provider
+        crawler.reusableListing = { [weak self] directory in try self?.reusableListing(directory) }
+    }
+
+    private func reusableListing(_ directory: ListingStage.QueuedDirectory) throws -> StageReusableListing? {
+        for source in reuseSources where source.contains(directory.path) {
+            if let listing = try source.listing(directory) {
+                #if ORBIT_TESTING
+                testReusedDirectories += 1
+                #endif
+                return listing
+            }
+            return nil
+        }
+        guard let provider = reuseProvider, directory.path != crawler.rootPath,
+              let path = String(data: directory.path, encoding: .utf8) else { return nil }
+        let current = checkpoint
+        let accepted: (StageReuseSource, StageReusableListing, StageCheckpoint)
+        do {
+            guard let candidate = try provider(URL(fileURLWithPath: path, isDirectory: true), current),
+                  Data(candidate.snapshot.rootURL.path.utf8) == directory.path,
+                  Data(candidate.checkpoint.rootPath.utf8) == crawler.rootPath,
+                  candidate.checkpoint.identity == current.identity,
+                  candidate.checkpoint.eventID <= min(current.eventID, candidate.snapshot.eventID) else { return nil }
+            let source = try StageReuseSource(candidate, cache: previewStore.directory, parentRoot: crawler.rootURL,
+                parentIdentity: "\(crawler.root.identity.device):\(crawler.root.identity.inode)", cancellation: crawler.cancellation)
+            guard let listing = try source.listing(directory, allowSmall: true) else { return nil }
+            accepted = (source, listing, candidate.checkpoint)
+        } catch is CancellationError { throw CancellationError() }
+        catch { return nil }
+        // The event floor is durable before the first copied record, including after a crash.
+        try crawler.store.lowerCheckpoint(accepted.2)
+        revisionLock.lock(); checkpointValue = accepted.2; revisionLock.unlock()
+        reuseSources.append(accepted.0)
+        #if ORBIT_TESTING
+        testReusedDirectories += 1
+        #endif
+        return accepted.1
     }
 
     public static func retirePublished(cache: URL, stagingDirectory: URL? = nil, root: URL, id: String, cancellation: ScanCancellation = ScanCancellation()) throws {

@@ -67,6 +67,7 @@ final class BlockingGate: @unchecked Sendable {
             }
             if staged { model.cancelScan(); gate.release(); try await wait("child stopped") { !gate.waiting } }
             guard let node = model.current?.children.first(where: { $0.id == victim.path }), model.collect([node]) else { throw NSError(domain: "child collect", code: 1) }
+            try await wait("child collection") { !model.isValidatingCollection }
             model.deleteCollectionPermanently()
             try await wait("child removal") { !model.isRemoving && !FileManager.default.fileExists(atPath: victim.path) }
             kill(getpid(), SIGKILL)
@@ -87,6 +88,7 @@ final class BlockingGate: @unchecked Sendable {
             model.scan(root)
             try await wait("direct map") { model.current?.id == root.path && !model.isScanning && !model.isRefreshing }
             guard model.collect(model.current!.children) else { throw NSError(domain: "direct collection", code: 1) }
+            try await wait("direct collection") { !model.isValidatingCollection }
             model.deleteCollectionPermanently()
             try await wait("direct large removal") { !model.isRemoving && gate.waiting && model.root == nil }
             gate.release()

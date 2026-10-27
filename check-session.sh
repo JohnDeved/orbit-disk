@@ -23,6 +23,15 @@ swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING 
   -Xlinker -rpath -Xlinker "$build" \
   Sources/OrbitDisk/DiskModel.swift Sources/OrbitDisk/DiskChangeMonitor.swift \
   Sources/OrbitDisk/CollectionCoverage.swift Sources/OrbitDisk/PreparedMapHoverGroup.swift \
+  Sources/OrbitDisk/IndexRefreshPlanner.swift Tests/OrbitQueuedCollectionChecks/main.swift \
+  -o "$build/QueuedCollectionChecks"
+mkdir -p "$fixture/queued-collection"
+"$build/QueuedCollectionChecks" "$fixture/queued-collection"
+swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
+  -I "$build" -I Sources/CSQLite -L "$build" -lOrbitCore \
+  -Xlinker -rpath -Xlinker "$build" \
+  Sources/OrbitDisk/DiskModel.swift Sources/OrbitDisk/DiskChangeMonitor.swift \
+  Sources/OrbitDisk/CollectionCoverage.swift Sources/OrbitDisk/PreparedMapHoverGroup.swift \
   Sources/OrbitDisk/IndexRefreshPlanner.swift Tests/OrbitCollectionSessionChecks/main.swift \
   -o "$build/CollectionSessionChecks"
 mkdir -p "$fixture/collection-session"

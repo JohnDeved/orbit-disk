@@ -18,6 +18,7 @@ final class Gate: @unchecked Sendable {
   model.scan(b);try await wait {model.root?.id==b.path && !model.isScanning}
   model.scan(a);try await wait {model.root?.id==a.path && !model.isScanning}
   guard let item=model.current?.children.first,model.collect([item]) else {throw NSError(domain:"collection setup",code:1)}
+  try await wait { !model.isValidatingCollection }
   return (model,a,b)
  }
  @MainActor static func replacement(_ base:URL) async throws {
@@ -123,7 +124,7 @@ final class Gate: @unchecked Sendable {
   var armed=true, nestedStarted=false, retained=false
   let observer=model.objectWillChange.sink { _ in
    guard armed && !model.isRemoving else {return};armed=false
-   guard model.collect([other]) else {return}
+   model.collection = [other]
    model.testBeforeRemoval={second.pauseOnce()}
    model.deleteCollectionPermanently();nestedStarted=model.isRemoving
    model.testActivateResolved(b);model.testActivateResolved(a)

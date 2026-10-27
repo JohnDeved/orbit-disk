@@ -294,6 +294,7 @@ final class SortGate: @unchecked Sendable {
             model.selectedID = long.id
             compare(prefix+"/long-selection", baseline, try await capture(prefix+"/long-selection"))
             precondition(model.collect([long]), "The generated fixture must allow collection")
+            try await wait("collection validation") { !model.isValidatingCollection && model.collection.contains { $0.id == long.id } }
             compare(prefix+"/collected", baseline, try await capture(prefix+"/collected"))
             for (label, node) in [("folder", folder), ("empty", empty), ("long-folder", longFolder)] {
                 recorder.history = []

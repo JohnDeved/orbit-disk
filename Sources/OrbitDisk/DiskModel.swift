@@ -40,6 +40,12 @@ private struct ColorPreparationState: Sendable {
     let colors: [String: Int]
 }
 
+private struct RememberedFolder {
+    let folder: PreparedFolder
+    let removalEpoch: UInt64
+    var selection: String?
+}
+
 private func collectionTotal(_ items: [DiskNode]) -> Int64 {
     items.reduce(0) { total, item in
         let sum = total.addingReportingOverflow(item.size)
@@ -104,6 +110,16 @@ private func sameLiveRecovery(_ a: RemovalRecovery, _ b: RemovalRecovery) -> Boo
         Data($0.path.utf8) == Data($1.path.utf8) && $0.identity == $1.identity
     }
 }
+private final class CollectionChunkBuffer {
+    var chunks: [[DiskNode]] = []
+    var processed = 0
+    var target = 128
+    var revalidationIndex = 0
+    var revalidationRevision: UUID?
+    var revalidationRemovalEpoch: UInt64?
+    var readyToCommit = false
+}
+
 private final class CollectionValidationJob {
     let id = UUID()
     let rootPath: String
@@ -111,6 +127,14 @@ private final class CollectionValidationJob {
     let rootIdentity: String
     let initialStatusFeedbackRevision: UInt64
     let token = ScanCancellation()
+    var requests: [(nodes: [DiskNode], groupContext: GroupContext?, offset: Int, buffer: CollectionChunkBuffer?)?] = []
+    var nextRequest = 0
+    var didChunk = false
+    var addedCount = 0
+    var addedName: String?
+    var includedCount = 0
+    var rejectionCount = 0
+    var rejectionExamples: [String] = []
     var task: Task<Void, Never>?
     init(root: URL, identity: String, initialStatusFeedbackRevision: UInt64) {
         rootPath = root.path; rootBytes = Data(root.path.utf8); rootIdentity = identity
@@ -126,6 +150,7 @@ private final class MappingSession {
     var preview: DiskScanPreview?
     let progress = SessionProgress()
     var lastRoute: String?
+    var rememberedFolder: RememberedFolder?
     var savedSnapshot: IndexSnapshot?
     var collectionState = CollectionSnapshot.empty
     var collectionValidation: CollectionValidationJob?
@@ -176,36 +201,7 @@ private func containsBytes(_ path: String, root: String) -> Bool {
 
 // These syscalls can wait on a mounted or privacy-protected directory; never run on the main actor.
 private func isReachableWithinSession(root: URL, target: URL, expectedIdentity: String) -> Bool {
-    guard containsBytes(target.path, root: root.path) else { return false }
-    let fd = root.withUnsafeFileSystemRepresentation { Darwin.open($0!, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
-    guard fd >= 0 else { return false }
-    defer { Darwin.close(fd) }
-    var rootInfo = stat(), rootFS = statfs()
-    guard fstat(fd, &rootInfo) == 0, fstatfs(fd, &rootFS) == 0,
-          "\(rootInfo.st_dev):\(rootInfo.st_ino)" == expectedIdentity else { return false }
-    func mountName(_ info: inout statfs) -> String {
-        withUnsafePointer(to: &info.f_mntonname) { String(cString: UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self)) }
-    }
-    let rootMount = mountName(&rootFS)
-    let pathBytes = Array(target.path.utf8), rootBytes = Array(root.path.utf8)
-    let offset = rootBytes == [47] ? 1 : rootBytes.count + 1
-    var parent = fd
-    defer { if parent != fd { Darwin.close(parent) } }
-    if pathBytes != rootBytes {
-        for bytes in pathBytes.dropFirst(offset).split(separator: 47) {
-            guard !Task<Never, Never>.isCancelled else { return false }
-            let name = String(decoding: bytes, as: UTF8.self)
-            let child = name.withCString { openat(parent, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC) }
-            guard child >= 0 else { return false }
-            var info = stat(), filesystem = statfs()
-            let valid = fstat(child, &info) == 0 && info.st_dev == rootInfo.st_dev
-                && fstatfs(child, &filesystem) == 0 && mountName(&filesystem) == rootMount
-            if parent != fd { Darwin.close(parent) }
-            parent = child
-            guard valid else { return false }
-        }
-    }
-    return currentFileIdentity(root) == expectedIdentity
+    (try? MappingCoverage.canReach(root: root, target: target, expectedRootIdentity: expectedIdentity)) == true
 }
 
 private struct PreparedPreview: Sendable {
@@ -323,11 +319,6 @@ final class GroupedMapHoverCache {
     func removeAll() { entries.removeAll(keepingCapacity: true) }
 }
 
-private struct CollectionEligibility {
-    let identity: String?
-    let rejection: String?
-}
-
 private struct CollectionDrag {
     let token: Data
     let rootPath: String
@@ -337,12 +328,16 @@ private struct CollectionDrag {
     let groupContext: GroupContext?
 }
 
+private struct ReservedCollectionDrop {
+    let drag: CollectionDrag
+    let root: DiskNode
+}
+
 private struct GroupContext {
     let rootID: String
     let collected: Set<String>
     let home: String
     let protected: [String]
-    let eligibility: [String: CollectionEligibility]
 }
 
 private func canBeginGroupedCollection(_ node: DiskNode, context: GroupContext) -> Bool {
@@ -350,9 +345,6 @@ private func canBeginGroupedCollection(_ node: DiskNode, context: GroupContext) 
     guard node.isAccessible, !node.isSymbolicLink, node.fileIdentity != nil,
           id != context.rootID, isWithin(id, root: context.rootID),
           !hasCollectedAncestor(id, in: context.collected) else { return false }
-    if let cached = context.eligibility[id], cached.identity == node.fileIdentity {
-        return cached.rejection == nil
-    }
     guard !isWithin(context.home, root: id) else { return false }
     guard !context.protected.contains(where: { isWithin(id, root: $0) }) else { return false }
     let components = node.url.pathComponents
@@ -364,6 +356,13 @@ private func canBeginGroupedCollection(_ node: DiskNode, context: GroupContext) 
 private struct CollectionValidation: Sendable {
     var nodes: [DiskNode] = []
     var rejections: [String] = []
+}
+
+private struct CollectionChunkResult: Sendable {
+    let application: CollectionApplication?
+    let buffered: [DiskNode]
+    let includedCount: Int
+    let rejections: [String]
 }
 
 private struct CollectionApplication: Sendable {
@@ -539,7 +538,6 @@ final class DiskModel: ObservableObject {
                 clearCollectionDrag()
                 detachCollectionValidation()
                 attachCollectionValidation()
-                collectionEligibility.removeAll()
                 clearHover()
             }
         }
@@ -691,15 +689,30 @@ final class DiskModel: ObservableObject {
         guard let token, collectionReviewHasOwner(token) else { return false }
         return token.collectionRevision == collectionRevision
     }
+    func beginCollectionConfirmation(review token: CollectionReviewToken?) -> UUID? {
+        guard !atomicFolderInstall, let token, collectionReviewMatches(token), !isRemoving,
+              !isUpdatingCollection, collectionConfirmation == nil else { return nil }
+        let id = UUID()
+        collectionConfirmation = (id, token)
+        return id
+    }
+    func endCollectionConfirmation(_ id: UUID?) {
+        guard let id, collectionConfirmation?.id == id else { return }
+        collectionConfirmation = nil
+    }
+    private func confirmationHoldsPublication(for session: MappingSession) -> Bool {
+        guard let confirmation = collectionConfirmation, confirmation.owner.sessionID == session.id else { return false }
+        return collectionReviewHasOwner(confirmation.owner)
+    }
     @discardableResult
     func beginCollectionReview() -> CollectionReviewToken? {
-        guard !atomicFolderInstall, !showCollection, canReviewDisplayedCollection, !isRemoving, !isValidatingCollection,
+        guard !atomicFolderInstall, !showCollection, canReviewDisplayedCollection, !isRemoving,
               !isUpdatingCollection else { return nil }
         let sessionID = activeSessionID, revision = collectionRevision, request = resolutionID
         objectWillChange.send()
         guard !atomicFolderInstall, !showCollection, activeSessionID == sessionID, collectionRevision == revision,
               resolutionID == request, canReviewDisplayedCollection, !isRemoving,
-              !isValidatingCollection, !isUpdatingCollection else { return nil }
+              !isUpdatingCollection else { return nil }
         atomicFolderInstall = true
         collectionReviewID = UUID()
         showCollection = true
@@ -707,12 +720,21 @@ final class DiskModel: ObservableObject {
         return collectionReviewToken
     }
     func clearCollection(review token: CollectionReviewToken?) {
-        guard !atomicFolderInstall, collectionReviewMatches(token), !isRemoving, !isValidatingCollection,
+        guard !atomicFolderInstall, collectionReviewMatches(token), !isRemoving,
               !isUpdatingCollection else { return }
         objectWillChange.send()
         guard !atomicFolderInstall, let token, collectionReviewMatches(token), !isRemoving,
-              !isValidatingCollection, !isUpdatingCollection else { return }
+              !isUpdatingCollection else { return }
         atomicFolderInstall = true
+        if let root, let session = sessions[root.id], session.id == activeSessionID {
+            if let job = session.collectionValidation {
+                job.token.cancel(); job.task?.cancel(); session.collectionValidation = nil
+            }
+            reservedCollectionDrops = reservedCollectionDrops.filter { _, reserved in
+                !reserved.drag.rootPath.utf8.elementsEqual(root.id.utf8) || reserved.drag.rootIdentity != session.identity
+            }
+        }
+        detachCollectionValidation()
         collectionState = CollectionSnapshot(items: [], identities: collectionState.identities,
                                              coverage: CollectionCoverage(), revision: UUID())
         if errorMessageRevision == token.errorRevision { errorMessage = nil }
@@ -757,7 +779,11 @@ final class DiskModel: ObservableObject {
     }
     var hoveredListID: String? { willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 } }
     private var collectionReviewID = UUID()
-    var showCollection = false { willSet { if !atomicFolderInstall { objectWillChange.send() } } }
+    private var collectionConfirmation: (id: UUID, owner: CollectionReviewToken)?
+    var showCollection = false {
+        willSet { if !atomicFolderInstall { objectWillChange.send() } }
+        didSet { if !showCollection { collectionConfirmation = nil } }
+    }
     @Published var isRemoving = false
     @Published private(set) var isRemovingAcrossSessions = false
     private var activeRemovalIDs = Set<UUID>()
@@ -831,7 +857,7 @@ final class DiskModel: ObservableObject {
     private var sessions: [String: MappingSession] = [:]
     private var activeSessionID: UUID?
     private var resolutionID = UUID()
-    private var resolutionWorker: Task<(Bool, String?), Never>?
+    private var resolutionWorker: Task<(URL, String?, String?, Bool), Never>?
     private var generation = UUID()
     private var browseGeneration = UUID()
     private var requestedFolderPath: String?
@@ -881,6 +907,7 @@ final class DiskModel: ObservableObject {
     }
     func testContains(_ path: String, root: String) -> Bool { containsBytes(path, root: root) }
     var testCollectionPrepare: @Sendable () async -> Void = {}
+    private(set) var testConfirmationPublicationHoldCount = 0
     #endif
     private var previewPreparationWorker: Task<PreparedPreview?, Error>?
     private var recoveryParentLimit: Int {
@@ -925,8 +952,8 @@ final class DiskModel: ObservableObject {
             collectionState = next
         }
     }
-    private var collectionEligibility: [String: CollectionEligibility] = [:]
     private var collectionDrag: CollectionDrag?
+    private var reservedCollectionDrops: [UUID: ReservedCollectionDrop] = [:]
     private var cancellingCollectionValidation = false
     private var collectionValidationID: UUID?
     private var collectionValidationStatusRevision: UInt64?
@@ -1102,8 +1129,8 @@ final class DiskModel: ObservableObject {
     }
 
     var canAcceptCollectionDrop: Bool {
-        guard displayedRootMatchesActiveSession, let drag = collectionDrag, let root, (!isScanning || isPartialMap), !isRemoving, !isValidatingCollection, !isUpdatingCollection else { return false }
-        return drag.rootPath == root.id && drag.rootIdentity == root.fileIdentity
+        guard displayedRootMatchesActiveSession, let drag = collectionDrag, let root else { return false }
+        return drag.rootPath.utf8.elementsEqual(root.id.utf8) && drag.rootIdentity == root.fileIdentity
     }
     var mapRelatedRowIDs: Set<String> { mapHoverPresentation.relatedRowIDs }
     var mapHoverDescription: String? { mapHoverPresentation.description }
@@ -1297,18 +1324,11 @@ final class DiskModel: ObservableObject {
     }
 
     func canCollect(_ node: DiskNode) -> Bool {
-        guard displayedRootMatchesActiveSession, let root, (!isScanning || isPartialMap), !isRemoving, !isValidatingCollection, node.isAccessible, !node.isSymbolicLink,
-              node.fileIdentity != nil, !isUpdatingCollection, !isCollected(node.id) else { return false }
-        if let eligibility = collectionEligibility[node.id], eligibility.identity == node.fileIdentity {
-            return eligibility.rejection == nil
-        }
-        let rejection = TrashPolicy.rejectionReason(for: node.url, scanRoot: root.url)
-        collectionEligibility[node.id] = CollectionEligibility(identity: node.fileIdentity, rejection: rejection)
-        return rejection == nil
-    }
-
-    private func isCollected(_ path: String) -> Bool {
-        collectionCoverage.state(for: path) == .included
+        guard displayedRootMatchesActiveSession, let root else { return false }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let protected = ["/System", "/Library", "/Applications", "/usr", "/bin", "/sbin", "/etc", home + "/Library"]
+        return canBeginGroupedCollection(node, context: GroupContext(rootID: root.id, collected: collectionState.pathIDs,
+                                                                    home: home, protected: protected))
     }
 
     func restoreLastLocation() {
@@ -1333,7 +1353,7 @@ final class DiskModel: ObservableObject {
         resolutionWorker?.cancel(); resolutionWorker = nil
         let request = UUID(); resolutionID = request
         let session = force ? nil : sessions.values.filter { session in
-            !session.token.isCancelled && containsBytes(requestedURL.path, root: session.url.path) && session.identity != nil
+            containsBytes(requestedURL.path, root: session.url.path) && session.identity != nil
         }.max { $0.url.path.utf8.count < $1.url.path.utf8.count }
         let candidateURL = session?.url, candidateIdentity = session?.identity
         let candidateEpoch = session?.removalEpoch
@@ -1344,19 +1364,27 @@ final class DiskModel: ObservableObject {
         let observer: @Sendable () -> Void = {}
         #endif
         isOpeningFolder = true
-        let check = Task.detached(priority: .userInitiated) { () -> (Bool, String?) in
+        let cache = store.directory, staging = stagingDirectory
+        let check = Task.detached(priority: .userInitiated) { () -> (URL, String?, String?, Bool) in
             observer()
             let identity = currentFileIdentity(requestedURL)
-            guard let candidateURL, let candidateIdentity else { return (false, identity) }
             let replaced = coveringRemovals.contains { removal in
                 guard let live = currentFileIdentity(URL(fileURLWithPath: removal.path)) else { return false }
                 return live != removal.identity
             }
-            return (!replaced && isReachableWithinSession(root: candidateURL, target: requestedURL, expectedIdentity: candidateIdentity), identity)
+            if let candidateURL, let candidateIdentity, !replaced,
+               isReachableWithinSession(root: candidateURL, target: requestedURL, expectedIdentity: candidateIdentity) {
+                return (candidateURL, candidateIdentity, identity, true)
+            }
+            if !force, !Task.isCancelled,
+               let coverage = try? MappingCoverage.find(for: requestedURL, cache: cache, stagingDirectory: staging) {
+                return (coverage.rootURL, coverage.rootIdentity, coverage.requestedIdentity, false)
+            }
+            return (requestedURL, identity, identity, false)
         }
         resolutionWorker = check
         Task { [weak self, weak session] in
-            let (valid, requestedIdentity) = await check.value
+            let (coveredRoot, coveredIdentity, requestedIdentity, usedSession) = await check.value
             guard let self, self.resolutionID == request, !Task.isCancelled else { return }
             self.resolutionWorker = nil
             if let session, session.removalEpoch != candidateEpoch {
@@ -1364,9 +1392,9 @@ final class DiskModel: ObservableObject {
             }
             let knownTarget = self.node(withID: requestedURL.path)
             let targetMatches = knownTarget == nil || knownTarget?.fileIdentity == requestedIdentity
-            let canReuse = valid && targetMatches && session.map { self.sessions[$0.url.path] === $0 && !$0.token.isCancelled } == true
-            let resolvedRoot = canReuse ? session!.url : requestedURL
-            let resolvedIdentity = canReuse ? session!.identity : requestedIdentity
+            let canReuse = targetMatches && (!usedSession || session.map { self.sessions[$0.url.path] === $0 } == true)
+            let resolvedRoot = canReuse ? coveredRoot : requestedURL
+            let resolvedIdentity = canReuse ? coveredIdentity : requestedIdentity
             self.scanResolved(requestedURL, root: resolvedRoot, identity: resolvedIdentity,
                               targetIdentity: requestedIdentity, queryAtRequest: queryAtRequest, force: force)
         }
@@ -1375,6 +1403,7 @@ final class DiskModel: ObservableObject {
     private func scanResolved(_ requestedURL: URL, root url: URL, identity: String?, targetIdentity: String?, queryAtRequest: String, force: Bool) {
         if !force, let saved = snapshot, !isScanning, url.path == saved.rootURL.path,
            sessions[url.path]?.scanFailed != true,
+           sessions[url.path]?.token.isCancelled == false,
            identity != nil, root?.fileIdentity == identity, containsBytes(requestedURL.path, root: saved.rootURL.path) {
             if let node = node(withID: requestedURL.path), node.isDirectory {
                 if node.fileIdentity != targetIdentity { scan(requestedURL, force: true); return }
@@ -1386,6 +1415,7 @@ final class DiskModel: ObservableObject {
         }
         if !force, isPartialMap, let root, url.path == root.id, identity != nil, root.fileIdentity == identity,
            sessions[url.path]?.scanFailed != true,
+           sessions[url.path]?.token.isCancelled == false,
            containsBytes(requestedURL.path, root: root.id), let node = node(withID: requestedURL.path), node.isDirectory {
             if node.fileIdentity != targetIdentity { scan(requestedURL, force: true); return }
             if node.id == current?.id { isOpeningFolder = false; return }
@@ -1399,6 +1429,7 @@ final class DiskModel: ObservableObject {
         if !sameRoot { clearCollectionDrag() }
         if let id = activeSessionID, let active = sessions.values.first(where: { $0.id == id }) {
             active.lastRoute = requestedFolderPath ?? current?.id
+            active.rememberedFolder?.selection = selectedID
             active.collectionState = collectionState
             let starting = startingRemovals.values.contains {
                 $0.path == Data(active.url.path.utf8) && $0.identity == active.identity
@@ -1428,18 +1459,16 @@ final class DiskModel: ObservableObject {
             pendingDirectories.formUnion(session.pendingDirectories); session.pendingDirectories.removeAll()
             pendingCheckpoint = session.pendingCheckpoint; session.pendingCheckpoint = nil
             pendingFullRefresh = session.pendingFullRefresh; session.pendingFullRefresh = false
-            collectionEligibility.removeAll(); showCollection = false
+            showCollection = false
             activeSessionID = session.id
             attachCollectionValidation()
             beginRemovalJournalMonitoring(session)
             scanCancellation = session.token
             let route = requestedURL.path != url.path ? requestedURL.path : (session.lastRoute ?? desiredPath)
+            requestedFolderPath = route
             if session.finished {
                 isScanning = true; isRefreshing = false; updatesPaused = false
-                if let preview = session.preview {
-                    guard beginPreview(preview, rootURL: url, path: route, scanID: scanID, token: session.token) else { return }
-                }
-                scanTitle = "Opening saved map…"; requestedFolderPath = route
+                scanTitle = "Opening saved map…"
                 let store = store, colors = colorPreparationState, identity = session.identity
                 let previousRefresh = session.refreshWorker
                 if previousRefresh != nil {
@@ -1453,7 +1482,9 @@ final class DiskModel: ObservableObject {
                             return (saved, view)
                         }.value
                         guard let self, self.generation == scanID, self.isRefreshing,
-                              session.removalEpoch == epoch, let (saved, view) = baseline else { return }
+                              session.removalEpoch == epoch,
+                              self.requestedFolderPath?.utf8.elementsEqual(route.utf8) == true,
+                              let (saved, view) = baseline else { return }
                         self.snapshot = saved; self.isPartialMap = false
                         guard self.publish(view, snapshot: saved) else { return }
                     }
@@ -1474,24 +1505,34 @@ final class DiskModel: ObservableObject {
                     return (saved, view, true)
                 }
                 observeSession(reopen, scanID: scanID, token: session.token)
+                if let preview = session.preview {
+                    guard beginPreview(preview, rootURL: url, path: route, scanID: scanID, token: session.token) else { return }
+                } else if let saved = session.savedSnapshot {
+                    snapshot = saved; scanPreview = nil; isPartialMap = false
+                    restoreRememberedFolder(session, path: route, snapshot: saved)
+                    guard generation == scanID, activeSessionID == session.id else { return }
+                }
                 return
             }
             guard let worker = session.worker else { return }
             isScanning = session.preview != nil; isRefreshing = session.preview == nil; updatesPaused = false
             scanPath = session.url.path
             if let progress = session.progress.read() { progressCount = progress.itemCount; progressBytes = progress.bytesScanned; scanPath = progress.currentPath }
+            observeSession(worker, scanID: scanID, token: session.token)
             if let preview = session.preview {
                 guard beginPreview(preview, rootURL: url, path: route, scanID: scanID, token: session.token) else { return }
             } else if let saved = session.savedSnapshot {
                 snapshot = saved; isPartialMap = false; requestedFolderPath = route; isOpeningFolder = true
+                restoreRememberedFolder(session, path: route, snapshot: saved)
+                guard generation == scanID, activeSessionID == session.id else { return }
                 let store = store, colors = colorPreparationState, removals = session.removals
                 Task { [weak self] in
                     let view = try? await Task.detached { try indexedFolder(route, store: store, snapshot: saved, colors: colors, cancellation: session.token, removals: removals) }.value
-                    guard let self, self.generation == scanID, self.isRefreshing, !session.token.isCancelled, let view else { return }
+                    guard let self, self.generation == scanID, self.isRefreshing, !session.token.isCancelled,
+                          self.requestedFolderPath?.utf8.elementsEqual(route.utf8) == true, let view else { return }
                     guard self.publish(view, snapshot: saved) else { return }
                 }
             }
-            observeSession(worker, scanID: scanID, token: session.token)
             return
         }
         let previousWorker = prior?.worker
@@ -1537,6 +1578,11 @@ final class DiskModel: ObservableObject {
             session.pendingFullRefresh = prior.pendingFullRefresh
             session.removalVersions = prior.removalVersions; session.removals = prior.removals
             session.removalEpoch = prior.removalEpoch; session.removalStatus = prior.removalStatus
+            session.rememberedFolder = prior.rememberedFolder
+            if !force, let progress = prior.progress.read() {
+                session.progress.set(progress)
+                progressCount = progress.itemCount; progressBytes = progress.bytesScanned; scanPath = progress.currentPath
+            }
             session.removalError = prior.removalError
             session.collectionStatus = prior.collectionStatus
             session.collectionError = prior.collectionError
@@ -1550,7 +1596,7 @@ final class DiskModel: ObservableObject {
         pendingDirectories.formUnion(session.pendingDirectories); session.pendingDirectories.removeAll()
         pendingCheckpoint = session.pendingCheckpoint; session.pendingCheckpoint = nil
         pendingFullRefresh = session.pendingFullRefresh; session.pendingFullRefresh = false
-        collectionEligibility.removeAll(); showCollection = false
+        showCollection = false
         session.scanRemovalVersions = session.removalVersions
         if keepMap { session.savedSnapshot = snapshot; session.lastRoute = desiredPath }
         if let prior, prior.collectionValidation != nil {
@@ -1669,7 +1715,7 @@ final class DiskModel: ObservableObject {
             var existing: (IndexSnapshot, PreparedFolder)?
             if !recovery.requiresFullRefresh, let saved = store.savedSnapshot(for: url) {
                 do {
-                    let view = try indexedFolder(url.path, store: store, snapshot: saved, colors: colors, cancellation: token, removals: recovery.removals)
+                    let view = try indexedFolder(desiredPath, store: store, snapshot: saved, colors: colors, cancellation: token, removals: recovery.removals)
                     if let identity = view.root.fileIdentity, currentFileIdentity(url) == identity { existing = (saved, view) }
                 } catch {
                     if token.isCancelled { throw CancellationError() }
@@ -1681,7 +1727,8 @@ final class DiskModel: ObservableObject {
                     guard model.sessions[url.path] === session else { return }
                     session.savedSnapshot = existing.0
                     session.preview = nil
-                    guard model.activeSessionID == sessionID, !token.isCancelled else { return }
+                    guard model.activeSessionID == sessionID, !token.isCancelled,
+                          model.requestedFolderPath?.utf8.elementsEqual(desiredPath.utf8) == true else { return }
                     model.snapshot = existing.0; model.isPartialMap = false
                     model.isScanning = false; model.isRefreshing = true
                     model.publish(existing.1, snapshot: existing.0)
@@ -1705,6 +1752,12 @@ final class DiskModel: ObservableObject {
                 stage = try ResumableStage(cache: store.directory, stagingDirectory: stagingDirectory, root: url, current: checkpoint, cancellation: token)
             }
             if let stage {
+                if !force {
+                    stage.configureReuse { directory, checkpoint in
+                        guard let saved = store.savedSnapshot(for: directory) else { return nil }
+                        return try DiskChangeMonitor.reuseCandidate(saved, for: checkpoint)
+                    }
+                }
                 #if ORBIT_TESTING
                 stage.configureTestScanner(scanner)
                 #endif
@@ -1753,6 +1806,9 @@ final class DiskModel: ObservableObject {
             session.worker = nil
         }
         observeSession(worker, scanID: scanID, token: token)
+        if let preview, activeSessionID == session.id, generation == scanID, scanPreview !== preview {
+            guard beginPreview(preview, rootURL: url, path: desiredPath, scanID: scanID, token: token) else { return }
+        }
     }
 
     private func observeSession(_ worker: Task<(IndexSnapshot, PreparedFolder, Bool), Error>, scanID: UUID, token: ScanCancellation) {
@@ -1919,9 +1975,24 @@ final class DiskModel: ObservableObject {
     }
 
     @discardableResult
+    private func restoreRememberedFolder(_ session: MappingSession, path: String, snapshot: IndexSnapshot? = nil) -> Bool {
+        guard activeSessionID == session.id, !session.durablePreviewBlocked,
+              let remembered = session.rememberedFolder, remembered.removalEpoch == session.removalEpoch,
+              remembered.folder.folder.id.utf8.elementsEqual(path.utf8),
+              remembered.folder.root.id.utf8.elementsEqual(session.url.path.utf8),
+              remembered.folder.root.fileIdentity == session.identity,
+              requestedTarget.map({ !$0.path.utf8.elementsEqual(path.utf8) || $0.identity == remembered.folder.folder.fileIdentity }) ?? true else {
+            if root != nil, !displayedRootMatchesActiveSession { _ = clearPresentation(clearSelection: true) }
+            return false
+        }
+        return installFolder(remembered.folder, selection: remembered.selection, publishedSnapshot: snapshot)
+    }
+
+    @discardableResult
     private func beginPreview(_ preview: DiskScanPreview, rootURL: URL, path: String,
                               scanID: UUID, token: ScanCancellation) -> Bool {
         guard generation == scanID, !token.isCancelled else { return false }
+        preview.prioritize(path: path)
         guard presentationTransition("beginPreview", {
             if root?.id != rootURL.path || root?.fileIdentity != sessions[rootURL.path]?.identity {
                 root = nil; navigation = []; selectedID = nil
@@ -1934,6 +2005,10 @@ final class DiskModel: ObservableObject {
             requestedFolderPath = path
             lastPreviewRevision = nil; lastPreviewPath = nil
         }) else { return false }
+        if let session = sessions[rootURL.path], session.id == activeSessionID {
+            restoreRememberedFolder(session, path: path)
+            guard generation == scanID, activeSessionID == session.id, !token.isCancelled else { return false }
+        }
         previewTask = Task { [weak self] in
             while !Task.isCancelled, !token.isCancelled {
                 guard let self, self.generation == scanID, self.scanPreview === preview else { return }
@@ -2562,6 +2637,8 @@ final class DiskModel: ObservableObject {
         }
         if let session, session.id == activeSessionID,
            root.map({ Data($0.id.utf8) }) == Data(session.url.path.utf8), root?.fileIdentity == session.identity {
+            session.rememberedFolder = RememberedFolder(folder: view, removalEpoch: session.removalEpoch, selection: selectedID)
+            if let publishedSnapshot { session.savedSnapshot = publishedSnapshot }
             if statusMessage == nil, let status = session.collectionStatus {
                 session.collectionStatus = nil
                 suppressCollectionFeedbackInvalidation = true
@@ -2603,6 +2680,7 @@ final class DiskModel: ObservableObject {
         guard session?.durablePreviewBlocked != true else { return }
         let removals = session?.removals ?? [], removalEpoch = session?.removalEpoch ?? 0
         if isPartialMap, let preview = scanPreview {
+            preview.prioritize(path: path)
             if path != current?.id { clearHover() }
             requestedFolderPath = path
             browseGeneration = UUID()
@@ -2740,7 +2818,7 @@ final class DiskModel: ObservableObject {
     private func removeFromCollection(_ id: String, expectedReview: CollectionReviewToken?) {
         guard !atomicFolderInstall, displayedRootMatchesActiveSession, let root,
               let session = sessions[root.id], let identity = session.identity,
-              !isRemoving, !isValidatingCollection, collectionState.pathIDs.contains(id) else { return }
+              !isRemoving, collectionState.pathIDs.contains(id) else { return }
         let rootID = root.id, rootBytes = Data(root.id.utf8), expectedRevision = collectionRevision
         if !announcingCollectionEdit {
             announcingCollectionEdit = true
@@ -2822,106 +2900,28 @@ final class DiskModel: ObservableObject {
 
     @discardableResult
     func collect(_ nodes: [DiskNode]) -> Bool {
-        guard displayedRootMatchesActiveSession, let root, (!isScanning || isPartialMap), !isRemoving, !isValidatingCollection, !isUpdatingCollection else { return false }
-        guard let identity = root.fileIdentity, currentFileIdentity(root.url) == identity else {
-            statusMessage = "The mapped folder changed. Refresh the map before collecting items."
-            return false
-        }
-        if collection.count > 1_000 {
-            guard !nodes.isEmpty else { return false }
-            return collectInBackground(nodes, root: root, rootIdentity: identity, groupContext: nil)
-        }
-        let prepared = prepareCollection(nodes)
-        guard let validated = validateCollectionNodes(prepared.nodes, root: root.url) else { return false }
-        return applyCollection(validated, includedCount: prepared.includedCount)
-    }
-
-    private func prepareCollection(_ nodes: [DiskNode]) -> (nodes: [DiskNode], includedCount: Int) {
-        let collected = collectionState.pathIDs
-        var candidates: [DiskNode] = []
-        var includedCount = 0
-        var seen = Set<String>()
-        for node in nodes {
-            guard seen.insert(node.id).inserted, !hasCollectedAncestor(node.id, in: collected) else {
-                includedCount += 1
-                continue
-            }
-            candidates.append(node)
-        }
-        return (candidates, includedCount)
-    }
-
-    private func applyCollection(_ validated: CollectionValidation, includedCount: Int, publishStatus: Bool = true) -> Bool {
-        let initialIncludedCount = includedCount
-        let expectedRoot = root
-        let expectedGeneration = generation
-        let candidates = Set(validated.nodes.map(\.id))
-        let collected = collectionState.pathIDs
-        var includedCount = includedCount
-        var added: [DiskNode] = []
-        for node in validated.nodes {
-            if hasCollectedAncestor(node.id, in: collected)
-                || hasCollectedAncestor(node.id, in: candidates, includingSelf: false) {
-                includedCount += 1
-                continue
-            }
-            added.append(node)
-        }
-        if !added.isEmpty {
-            let addedIDs = Set(added.map(\.id))
-            let retained = collection.filter { !hasCollectedAncestor($0.id, in: addedIDs) }
-            let retainedIDs = Set(retained.map(\.id))
-            var identities = collectionIdentities.filter { retainedIDs.contains($0.key) }
-            for node in added { identities[node.id] = node.fileIdentity }
-            let items = retained + added
-            let next = CollectionSnapshot(items: items, identities: identities,
-                                          coverage: CollectionCoverage(paths: items.map(\.id)), revision: UUID())
-            let previousRevision = collectionRevision
-            objectWillChange.send()
-            guard let expectedRoot, let identity = expectedRoot.fileIdentity,
-                  generation == expectedGeneration, root?.id == expectedRoot.id,
-                  root?.fileIdentity == identity, currentFileIdentity(expectedRoot.url) == identity,
-                  (!isScanning || isPartialMap), !isRemoving, !isValidatingCollection else { return false }
-            if collectionRevision != previousRevision {
-                return applyCollection(validated, includedCount: initialIncludedCount, publishStatus: publishStatus)
-            }
-            collectionState = next
-        }
-        var messages: [String] = []
-        if added.count == 1 { messages.append("Added \(added[0].name) to collection.") }
-        else if !added.isEmpty { messages.append("Added \(added.count) items to collection.") }
-        if includedCount > 0 { messages.append("\(includedCount) \(includedCount == 1 ? "item already included" : "items already included").") }
-        if !validated.rejections.isEmpty {
-            messages.append("Skipped \(validated.rejections.count) \(validated.rejections.count == 1 ? "item" : "items").")
-            errorMessage = validated.rejections.prefix(5).joined(separator: "\n")
-                + (validated.rejections.count > 5 ? "\n…and \(validated.rejections.count - 5) more." : "")
-        }
-        if publishStatus, !messages.isEmpty { statusMessage = messages.joined(separator: " ") }
-        return !added.isEmpty
+        guard displayedRootMatchesActiveSession, let root, let identity = root.fileIdentity, !nodes.isEmpty else { return false }
+        return collectInBackground(nodes, root: root, rootIdentity: identity, groupContext: nil)
     }
 
     func beginCollectionDrag(_ nodes: [DiskNode], label: String) -> NSPasteboardItem? {
         let epoch = collectionDragEpoch &+ 1
         clearCollectionDrag()
         guard collectionDragEpoch == epoch else { return nil }
-        guard displayedRootMatchesActiveSession, let root, (!isScanning || isPartialMap), !isRemoving, !isValidatingCollection, !isUpdatingCollection else { return nil }
+        guard displayedRootMatchesActiveSession, let root else { return nil }
         let collected = collectionState.pathIDs
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let protected = ["/System", "/Library", "/Applications", "/usr", "/bin", "/sbin", "/etc", home + "/Library"]
         let rootID = root.id
-        let context = GroupContext(rootID: rootID, collected: collected, home: home, protected: protected, eligibility: collectionEligibility)
+        let context = GroupContext(rootID: rootID, collected: collected, home: home, protected: protected)
         let isLarge = nodes.count > 64
         let eligible = nodes.count == 1 ? nodes.filter(canCollect)
-            : isLarge ? Array(nodes.lazy.filter { canBeginGroupedCollection($0, context: context) }.prefix(1))
+            : isLarge ? Array(nodes.prefix(1))
             : nodes.filter { canBeginGroupedCollection($0, context: context) }
         guard !eligible.isEmpty else {
-            if !nodes.isEmpty && nodes.allSatisfy({ !$0.isScanComplete }) {
-                statusMessage = "Still mapping. Collect this item when it finishes."
-            } else {
-                statusMessage = nodes.allSatisfy { hasCollectedAncestor($0.id, in: collected) }
-                    ? "These items are already included in the collection."
-                    : "These items cannot be collected. Refresh the map if they have changed."
-            }
+            statusMessage = nodes.allSatisfy { hasCollectedAncestor($0.id, in: collected) }
+                ? "These items are already included in the collection."
+                : "These items cannot be collected. Refresh the map if they have changed."
             return nil
         }
         let token = Data(UUID().uuidString.utf8)
@@ -2959,18 +2959,40 @@ final class DiskModel: ObservableObject {
         endCollectionDrag()
     }
 
+    func reserveCollectionDrop() -> UUID? {
+        guard canAcceptCollectionDrop, let drag = collectionDrag, let root,
+              let identity = drag.rootIdentity, root.fileIdentity == identity,
+              let session = sessions[drag.rootPath], session.id == activeSessionID,
+              session.identity == identity, session.url.path.utf8.elementsEqual(drag.rootPath.utf8) else { return nil }
+        let reservation = UUID()
+        reservedCollectionDrops[reservation] = ReservedCollectionDrop(drag: drag, root: root)
+        clearCollectionDrag()
+        return reservation
+    }
+
+    @discardableResult
+    func completeCollectionDrop(_ reservation: UUID, data: Data?) -> Bool {
+        guard let reserved = reservedCollectionDrops.removeValue(forKey: reservation),
+              let data, data == reserved.drag.token, let identity = reserved.drag.rootIdentity,
+              let owner = sessions[reserved.drag.rootPath], owner.identity == identity,
+              owner.url.path.utf8.elementsEqual(reserved.drag.rootPath.utf8) else { return false }
+        let nodes = reserved.drag.omitted.isEmpty ? reserved.drag.nodes : reserved.drag.nodes + reserved.drag.omitted
+        return collectInBackground(nodes, root: reserved.root, rootIdentity: identity,
+                                   groupContext: reserved.drag.groupContext, reservedOwner: owner)
+    }
+
     @discardableResult
     func collectDrag(data: Data) -> Bool {
         guard let drag = collectionDrag, data == drag.token else { return false }
         let canAccept = canAcceptCollectionDrop
         clearCollectionDrag()
         guard canAccept, let root, let expected = drag.rootIdentity,
-              currentFileIdentity(root.url) == expected else {
+              drag.rootPath.utf8.elementsEqual(root.id.utf8), root.fileIdentity == expected,
+              displayedRootMatchesActiveSession else {
             statusMessage = "The map changed. Drag the item again from the current map."
             return false
         }
-        let nodes = drag.nodes + drag.omitted
-        guard nodes.count > 64 || collection.count > 1_000 else { return collect(nodes) }
+        let nodes = drag.omitted.isEmpty ? drag.nodes : drag.nodes + drag.omitted
         return collectInBackground(nodes, root: root, rootIdentity: expected, groupContext: drag.groupContext)
     }
 
@@ -3086,34 +3108,79 @@ final class DiskModel: ObservableObject {
     }
 
     private func collectInBackground(_ nodes: [DiskNode], root: DiskNode, rootIdentity expected: String,
-                                     groupContext: GroupContext?) -> Bool {
-        guard !atomicFolderInstall, !isValidatingCollection, collectionValidationID == nil,
-              let ownerID = activeSessionID, let owner = sessions[root.id], owner.id == ownerID,
-              Data(owner.url.path.utf8) == Data(root.id.utf8), owner.identity == expected,
-              owner.collectionValidation == nil else { return false }
-        let scanID = generation, requestID = resolutionID
+                                     groupContext: GroupContext?, reservedOwner: MappingSession? = nil) -> Bool {
+        guard !atomicFolderInstall, !nodes.isEmpty,
+              let owner = sessions[root.id], reservedOwner.map({ $0 === owner }) ?? (owner.id == activeSessionID),
+              Data(owner.url.path.utf8) == Data(root.id.utf8), owner.identity == expected else { return false }
+        if let job = owner.collectionValidation {
+            guard !job.token.isCancelled else { return false }
+            job.requests.append((nodes, groupContext, 0, nodes.count > 128 ? CollectionChunkBuffer() : nil))
+            return true
+        }
         let previousStatus = statusMessageRevision
         let job = CollectionValidationJob(root: root.url, identity: expected, initialStatusFeedbackRevision: owner.collectionStatusRevision), token = job.token
-        objectWillChange.send()
-        guard !atomicFolderInstall, generation == scanID, activeSessionID == ownerID, resolutionID == requestID,
-              displayedRootMatchesActiveSession, self.root.map({ Data($0.id.utf8) }) == job.rootBytes, self.root?.fileIdentity == expected,
-              sessions[root.id] === owner, owner.collectionValidation == nil, (!isScanning || isPartialMap),
-              !isRemoving, !isValidatingCollection, !isUpdatingCollection, collectionValidationID == nil else { return false }
+        job.requests.append((nodes, groupContext, 0, nodes.count > 128 ? CollectionChunkBuffer() : nil))
         owner.collectionValidation = job
-        atomicFolderInstall = true
-        attachCollectionValidation(previousStatus: previousStatus)
-        atomicFolderInstall = false
+        if owner.id == activeSessionID { attachCollectionValidation(previousStatus: previousStatus) }
         job.task = Task { [weak self, weak job] in
             guard let job else { return }
             while let self, let session = self.session(for: job), !token.isCancelled {
+                if session.isRemoving || self.collectionEdits[job.rootPath] != nil {
+                    do { try await Task.sleep(nanoseconds: 50_000_000) } catch { return }
+                    continue
+                }
+                guard job.nextRequest < job.requests.count, let request = job.requests[job.nextRequest] else { return }
+                let end = request.offset + min(128, request.nodes.count - request.offset)
+                let nodes = Array(request.nodes[request.offset..<end]), groupContext = request.groupContext
+                let buffer = request.buffer
+                let shouldCommit = buffer.map { $0.processed + nodes.count >= $0.target || end == request.nodes.count } ?? true
                 let active = self.activeSessionID == session.id
                 let old = active ? self.collectionState : session.collectionState
                 let collectionSnapshot = old.items, identities = old.identities, collectedSnapshot = old.pathIDs
                 let revision = old.revision
+                let removalEpoch = session.removalEpoch
                 #if ORBIT_TESTING
                 let testCollectionPrepare = self.testCollectionPrepare
                 #endif
-                let worker = Task.detached(priority: .userInitiated) { () -> CollectionApplication? in
+                if shouldCommit, let buffer, !buffer.chunks.isEmpty {
+                    if buffer.revalidationRevision != revision || buffer.revalidationRemovalEpoch != removalEpoch {
+                        buffer.revalidationRevision = revision
+                        buffer.revalidationRemovalEpoch = removalEpoch
+                        buffer.revalidationIndex = 0
+                        buffer.readyToCommit = false
+                    }
+                    if !buffer.readyToCommit {
+                        let index = buffer.revalidationIndex
+                        let priorNodes = buffer.chunks[index]
+                        let recheck = Task.detached(priority: .userInitiated) { () -> CollectionValidation? in
+                            guard !token.isCancelled, currentFileIdentity(root.url) == expected,
+                                  let checked = validateCollectionNodes(priorNodes, root: root.url, cancellation: token) else { return nil }
+                            #if ORBIT_TESTING
+                            await testCollectionPrepare()
+                            #endif
+                            guard !token.isCancelled, currentFileIdentity(root.url) == expected else { return nil }
+                            return checked
+                        }
+                        let checked = await recheck.value
+                        guard let latest = self.session(for: job), !token.isCancelled, !Task.isCancelled else { return }
+                        let stillActive = self.activeSessionID == latest.id
+                        let state = stillActive ? self.collectionState : latest.collectionState
+                        guard active == stillActive, revision == state.revision, latest.removalEpoch == removalEpoch,
+                              !latest.isRemoving, self.collectionEdits[job.rootPath] == nil else { continue }
+                        guard let checked else { self.finishCollectionFailure(job); return }
+                        buffer.chunks[index] = checked.nodes
+                        buffer.revalidationIndex += 1
+                        if buffer.revalidationIndex == buffer.chunks.count { buffer.readyToCommit = true }
+                        job.rejectionCount += checked.rejections.count
+                        job.rejectionExamples.append(contentsOf: checked.rejections.prefix(max(0, 5 - job.rejectionExamples.count)))
+                        job.requests[job.nextRequest] = nil
+                        job.nextRequest += 1
+                        job.requests.append(request)
+                        continue
+                    }
+                }
+                let bufferedChunks = buffer?.chunks ?? []
+                let worker = Task.detached(priority: .userInitiated) { () -> CollectionChunkResult? in
                     if token.isCancelled || currentFileIdentity(root.url) != expected { return nil }
                     var ordered = nodes
                     if let context = groupContext {
@@ -3144,10 +3211,25 @@ final class DiskModel: ObservableObject {
                     #if ORBIT_TESTING
                     await testCollectionPrepare()
                     #endif
-                    guard let result = prepareCollectionApplication(validation, existing: collectionSnapshot, identities: identities, collected: collectedSnapshot,
-                                                        includedCount: includedCount, cancellation: token),
+                    guard !token.isCancelled, currentFileIdentity(root.url) == expected else { return nil }
+                    guard shouldCommit else {
+                        return CollectionChunkResult(application: nil, buffered: validation.nodes,
+                                                     includedCount: includedCount, rejections: validation.rejections)
+                    }
+                    let previous = bufferedChunks.flatMap { $0 }
+                    let rejections = validation.rejections
+                    var combined: [DiskNode] = []
+                    var distinct = Set<String>()
+                    var duplicates = 0
+                    for node in previous + validation.nodes {
+                        if token.isCancelled { return nil }
+                        if distinct.insert(node.id).inserted { combined.append(node) } else { duplicates += 1 }
+                    }
+                    let combinedValidation = CollectionValidation(nodes: combined, rejections: rejections)
+                    guard let result = prepareCollectionApplication(combinedValidation, existing: collectionSnapshot, identities: identities, collected: collectedSnapshot,
+                                                        includedCount: includedCount + duplicates, cancellation: token),
                           currentFileIdentity(root.url) == expected else { return nil }
-                    return result
+                    return CollectionChunkResult(application: result, buffered: [], includedCount: 0, rejections: [])
                 }
                 let prepared = await worker.value
                 guard let latest = self.session(for: job), !token.isCancelled, !Task.isCancelled else { return }
@@ -3160,22 +3242,23 @@ final class DiskModel: ObservableObject {
                     return
                 }
                 #endif
-                guard let prepared, !latest.isRemoving else {
+                guard !latest.isRemoving, self.collectionEdits[job.rootPath] == nil else { continue }
+                guard let step = prepared else {
                     self.finishCollectionFailure(job)
                     return
                 }
-                var messages: [String] = []
-                if prepared.addedCount == 1, let name = prepared.addedName { messages.append("Added \(name) to collection.") }
-                else if prepared.addedCount > 0 { messages.append("Added \(prepared.addedCount) items to collection.") }
-                if prepared.includedCount > 0 { messages.append("\(prepared.includedCount) \(prepared.includedCount == 1 ? "item already included" : "items already included").") }
-                var rejectionMessage: String?
-                if !prepared.rejections.isEmpty {
-                    messages.append("Skipped \(prepared.rejections.count) \(prepared.rejections.count == 1 ? "item" : "items").")
-                    rejectionMessage = prepared.rejections.prefix(5).joined(separator: "\n")
-                        + (prepared.rejections.count > 5 ? "\n…and \(prepared.rejections.count - 5) more." : "")
+                if step.application?.coverage != nil && self.confirmationHoldsPublication(for: latest) {
+                    #if ORBIT_TESTING
+                    self.testConfirmationPublicationHoldCount += 1
+                    #endif
+                    while let owner = self.session(for: job), self.confirmationHoldsPublication(for: owner),
+                          !token.isCancelled, !Task.isCancelled {
+                        do { try await Task.sleep(nanoseconds: 50_000_000) } catch { return }
+                    }
+                    continue
                 }
                 let progressRevision = self.collectionValidationStatusRevision
-                if stillActive { self.objectWillChange.send() }
+                if stillActive && step.application?.coverage != nil { self.objectWillChange.send() }
                 let rootStillMatches = await Task.detached(priority: .userInitiated) {
                     !token.isCancelled && currentFileIdentity(root.url) == expected
                 }.value
@@ -3186,13 +3269,69 @@ final class DiskModel: ObservableObject {
                 }
                 let activeNow = self.activeSessionID == current.id
                 let currentState = activeNow ? self.collectionState : current.collectionState
-                guard activeNow == stillActive, currentState.revision == revision, !current.isRemoving else { continue }
+                guard activeNow == stillActive, currentState.revision == revision, !current.isRemoving,
+                      current.removalEpoch == removalEpoch, self.collectionEdits[job.rootPath] == nil else { continue }
+                if step.application?.coverage != nil && self.confirmationHoldsPublication(for: current) { continue }
+                if !shouldCommit, let buffer {
+                    buffer.chunks.append(step.buffered)
+                    buffer.processed += nodes.count
+                    buffer.readyToCommit = false
+                    job.includedCount += step.includedCount
+                    job.rejectionCount += step.rejections.count
+                    job.rejectionExamples.append(contentsOf: step.rejections.prefix(max(0, 5 - job.rejectionExamples.count)))
+                    job.requests[job.nextRequest] = nil
+                    job.nextRequest += 1
+                    job.didChunk = true
+                    job.requests.append((request.nodes, request.groupContext, end, buffer))
+                    continue
+                }
+                guard let prepared = step.application else { self.finishCollectionFailure(job); return }
                 let next: CollectionSnapshot
                 if let coverage = prepared.coverage {
                     next = CollectionSnapshot(items: prepared.collection, identities: prepared.identities,
                                               coverage: coverage, revision: UUID(), size: prepared.size, pathIDs: prepared.pathIDs)
                 } else { next = currentState }
+                if job.addedCount == 0 { job.addedName = prepared.addedName }
+                job.addedCount += prepared.addedCount
+                job.includedCount += prepared.includedCount
+                job.rejectionCount += prepared.rejections.count
+                job.rejectionExamples.append(contentsOf: prepared.rejections.prefix(max(0, 5 - job.rejectionExamples.count)))
                 current.collectionState = next
+                job.requests[job.nextRequest] = nil
+                job.nextRequest += 1
+                if let buffer {
+                    buffer.chunks.removeAll(keepingCapacity: true)
+                    buffer.processed = 0
+                    buffer.revalidationIndex = 0
+                    buffer.revalidationRevision = nil; buffer.revalidationRemovalEpoch = nil
+                    buffer.readyToCommit = false
+                    buffer.target = min(buffer.target * 2, 8192)
+                }
+                if end < request.nodes.count {
+                    job.didChunk = true
+                    job.requests.append((request.nodes, request.groupContext, end, buffer))
+                }
+                if job.nextRequest < job.requests.count {
+                    if activeNow && prepared.coverage != nil {
+                        let priorAtomic = self.atomicFolderInstall
+                        self.atomicFolderInstall = true
+                        self.collectionState = next
+                        self.atomicFolderInstall = priorAtomic
+                        self.objectWillChange.send()
+                    }
+                    continue
+                }
+                var messages: [String] = []
+                if job.didChunk && job.addedCount > 0 { messages.append("Collection updated.") }
+                else if job.addedCount == 1, let name = job.addedName { messages.append("Added \(name) to collection.") }
+                else if job.addedCount > 0 { messages.append("Added \(job.addedCount) items to collection.") }
+                if job.includedCount > 0 { messages.append("\(job.includedCount) \(job.includedCount == 1 ? "item already included" : "items already included").") }
+                var rejectionMessage: String?
+                if job.rejectionCount > 0 {
+                    messages.append("Skipped \(job.rejectionCount) \(job.rejectionCount == 1 ? "item" : "items").")
+                    rejectionMessage = job.rejectionExamples.joined(separator: "\n")
+                        + (job.rejectionCount > 5 ? "\n…and \(job.rejectionCount - 5) more." : "")
+                }
                 current.collectionValidation = nil
                 if !activeNow || self.collectionValidationID != job.id {
                     if !messages.isEmpty && current.collectionStatusRevision == job.initialStatusFeedbackRevision {
@@ -3245,7 +3384,7 @@ final class DiskModel: ObservableObject {
     }
 
     private func removeCollection(permanently: Bool) {
-        guard displayedRootMatchesActiveSession, let root, !collection.isEmpty, !isRemoving, !isValidatingCollection,
+        guard displayedRootMatchesActiveSession, let root, !collection.isEmpty, !isRemoving,
               let sessionID = activeSessionID, let session = sessions.values.first(where: { $0.id == sessionID }),
               !session.isRemoving, !isUpdatingCollection else { return }
         let items = collection, identities = collectionIdentities

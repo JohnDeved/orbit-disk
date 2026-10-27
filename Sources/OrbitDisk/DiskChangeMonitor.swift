@@ -2,6 +2,9 @@ import Foundation
 import CoreServices
 import IOKit
 import Darwin
+#if canImport(OrbitCore)
+import OrbitCore
+#endif
 
 struct DiskChangeCheckpoint: Codable, Equatable, Sendable {
     let rootPath: String
@@ -53,6 +56,29 @@ final class DiskChangeMonitor {
     nonisolated static func capture(root: URL) throws -> DiskChangeCheckpoint {
         try DiskEventPlan.inspect(root: root).checkpoint
     }
+
+    #if canImport(OrbitCore)
+    nonisolated static func reuseCandidate(_ snapshot: IndexSnapshot, for checkpoint: StageCheckpoint) throws -> StageReuseCandidate? {
+        struct EventStream: Decodable, Equatable {
+            let mode: String
+            let volumes: [DiskEventPlan.Volume]
+        }
+        guard snapshot.skippedCount == 0 else { return nil }
+        let source = try DiskEventPlan.inspect(root: snapshot.rootURL)
+        let parent = try DiskEventPlan.inspect(root: URL(fileURLWithPath: checkpoint.rootPath, isDirectory: true))
+        guard source.supportsReplay, parent.supportsReplay,
+              source.relativePath != nil, parent.relativePath != nil,
+              source.device == parent.device, source.mountPath == parent.mountPath,
+              source.checkpoint.identity == snapshot.eventIdentity,
+              parent.checkpoint.identity == checkpoint.identity,
+              snapshot.eventID <= source.checkpoint.eventID,
+              try JSONDecoder().decode(EventStream.self, from: Data(source.checkpoint.identity.utf8))
+                  == JSONDecoder().decode(EventStream.self, from: Data(parent.checkpoint.identity.utf8)) else { return nil }
+        return StageReuseCandidate(snapshot: snapshot,
+            checkpoint: StageCheckpoint(rootPath: checkpoint.rootPath, identity: checkpoint.identity,
+                                        eventID: min(checkpoint.eventID, snapshot.eventID)))
+    }
+    #endif
 
     init(root: URL, excluding: [URL] = []) throws {
         guard root.isFileURL, root.path.hasPrefix("/"), !root.path.contains("\0") else {
@@ -490,7 +516,7 @@ private struct EventPathCache {
 }
 
 private struct DiskEventPlan: Sendable {
-    struct Volume: Encodable {
+    struct Volume: Codable, Equatable {
         let mountPath: String
         let volumeUUID: String?
         let eventsUUID: String?

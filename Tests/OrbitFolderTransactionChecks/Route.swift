@@ -43,6 +43,7 @@ final class Gate: @unchecked Sendable {
             let victim = one.appendingPathComponent("file1")
             try await wait("mapped victim") { model.current?.children.contains(where: { $0.id == victim.path }) == true }
             precondition(model.collect([model.current!.children.first { $0.id == victim.path }!]))
+            try await wait("route collection") { !model.isValidatingCollection }
             model.deleteCollectionPermanently()
             try await wait("removal during route load") { !model.isRemoving && !FileManager.default.fileExists(atPath: victim.path) }
             routeGate.release()

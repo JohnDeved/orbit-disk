@@ -322,6 +322,23 @@ final class ListingStage {
         return (identity, UInt64(bitPattern: sqlite3_column_int64(statement, 1)))
     }
 
+    func lowerCheckpoint(_ checkpoint: StageCheckpoint) throws {
+        let root = Data(checkpoint.rootPath.utf8)
+        guard let previous = try scanStart(root: root), previous.identity == checkpoint.identity,
+              checkpoint.eventID <= previous.eventID else { throw Failure.sqlite("incompatible reuse checkpoint") }
+        if checkpoint.eventID == previous.eventID { return }
+        try exec("BEGIN IMMEDIATE")
+        do {
+            let update = try prepare("UPDATE scan SET event_id=? WHERE root=?")
+            defer { sqlite3_finalize(update) }
+            sqlite3_bind_int64(update, 1, Int64(bitPattern: checkpoint.eventID)); bind(root, 2, update); try step(update)
+            let metadata = try prepare("UPDATE metadata SET event_id=? WHERE singleton=1")
+            defer { sqlite3_finalize(metadata) }
+            bindText(String(checkpoint.eventID), 1, metadata); try step(metadata)
+            try exec("COMMIT")
+        } catch { try? exec("ROLLBACK"); throw error }
+    }
+
     func preserveScanStart(root: Data, identity: String, eventID: UInt64, expected: SnapshotExpectation? = nil, generation: String? = nil) throws {
         try exec("BEGIN IMMEDIATE")
         do {
@@ -938,10 +955,11 @@ final class ListingStage {
         return QueuedDirectory(path: path, device: Int32(sqlite3_column_int64(statement, 0)), inode: UInt64(bitPattern: sqlite3_column_int64(statement, 1)))
     }
 
-    func nextDirectory() throws -> QueuedDirectory? {
-        func first(_ sql: String) throws -> QueuedDirectory? {
+    func nextDirectory(preferred: Data? = nil) throws -> QueuedDirectory? {
+        func first(_ sql: String, values: [Data] = []) throws -> QueuedDirectory? {
             let statement = try prepare(sql)
             defer { sqlite3_finalize(statement) }
+            for (index, value) in values.enumerated() { bind(value, Int32(index + 1), statement) }
             let result = sqlite3_step(statement)
             if result == SQLITE_DONE { return nil }
             guard result == SQLITE_ROW, let bytes = sqlite3_column_blob(statement, 0) else { throw Failure.sqlite("queue lookup") }
@@ -949,6 +967,21 @@ final class ListingStage {
                 device: Int32(sqlite3_column_int64(statement, 1)), inode: UInt64(bitPattern: sqlite3_column_int64(statement, 2)))
         }
         if let dirty = try first("SELECT directories.path,directories.device,directories.inode FROM dirty JOIN directories ON directories.path=dirty.parent WHERE dirty.pending=1 AND directories.pending=1 ORDER BY dirty.parent LIMIT 1") { return dirty }
+        if let preferred, let root = indexRoot, preferred != root,
+           preferred.starts(with: root), root == Data([47]) || preferred.dropFirst(root.count).first == 47 {
+            var ancestors = [root]
+            for index in preferred.indices where preferred[index] == 47 && index > root.count {
+                ancestors.append(Data(preferred.prefix(upTo: index)))
+            }
+            ancestors.append(preferred)
+            for path in ancestors {
+                if let queued = try first("SELECT path,device,inode FROM directories WHERE path=? AND pending=1", values: [path]) { return queued }
+            }
+            var prefix = preferred
+            if prefix.last != 47 { prefix.append(47) }
+            var upper = prefix; upper[upper.index(before: upper.endIndex)] = 48
+            if let queued = try first("SELECT path,device,inode FROM directories WHERE pending=1 AND path>=? AND path<? ORDER BY path LIMIT 1", values: [prefix, upper]) { return queued }
+        }
         return try first("SELECT path,device,inode FROM directories WHERE pending=1 ORDER BY path LIMIT 1")
     }
 

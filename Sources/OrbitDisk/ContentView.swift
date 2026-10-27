@@ -503,22 +503,22 @@ struct ContentView: View {
         let ready = collectionTargeted && model.canAcceptCollectionDrop
         return HStack(spacing: 16) {
             ZStack {
-                if model.isValidatingCollection || model.isUpdatingCollection { ProgressView().controlSize(.small) }
+                if !dragging && (model.isValidatingCollection || model.isUpdatingCollection) { ProgressView().controlSize(.small) }
                 else {
                     Image(systemName: ready ? "tray.and.arrow.down.fill" : "tray.and.arrow.down")
                         .font(.system(size: 28)).foregroundStyle(OrbitStyle.accent)
                 }
             }.frame(width: 36, height: 36)
             VStack(alignment: .leading, spacing: 5) {
-                Text(model.isValidatingCollection ? "Checking your collection…" : model.isUpdatingCollection ? "Removing from collection…" : ready ? "Release to collect" : dragging ? "Drop here to collect" : model.displayedCollection.isEmpty ? "Drag files and folders here" : "\(model.displayedCollection.count) \(model.displayedCollection.count == 1 ? "item" : "items") in your collection")
+                Text(ready ? "Release to collect" : dragging ? "Drop here to collect" : model.isValidatingCollection ? "Checking your collection…" : model.isUpdatingCollection ? "Removing from collection…" : model.displayedCollection.isEmpty ? "Drag files and folders here" : "\(model.displayedCollection.count) \(model.displayedCollection.count == 1 ? "item" : "items") in your collection")
                     .font(.system(size: 14, weight: .semibold)).lineLimit(1).truncationMode(.middle)
-                Text(model.isUpdatingCollection ? "Files stay in place." : dragging ? model.draggingLabel ?? "" : model.isPartialMap ? (model.isScanning ? "Collect items while mapping continues." : "Collect items from this partial map.") : model.displayedCollection.isEmpty ? "Drag from the map or file list. Review before removing anything." : model.isUpdatingRemovalSizes ? "Updating sizes…" : "\(formatBytes(model.displayedCollectionSize)) · Drag more items here. Files stay in place until reviewed.")
+                Text(dragging ? model.draggingLabel ?? "" : model.isUpdatingCollection ? "Files stay in place." : model.isPartialMap ? (model.isScanning ? "Collect items while mapping continues." : "Collect items from this partial map.") : model.displayedCollection.isEmpty ? "Drag from the map or file list. Review before removing anything." : model.isUpdatingRemovalSizes ? "Updating sizes…" : "\(formatBytes(model.displayedCollectionSize)) · Drag more items here. Files stay in place until reviewed.")
                     .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted).lineLimit(1).truncationMode(.middle)
             }.frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             Button { if let owner = model.beginCollectionReview() { collectionReviewOwner = owner } } label: {
                 Label("Review Collection", systemImage: "tray.full").padding(.vertical, 3)
             }
-            .pointingCursor().disabled(!model.canReviewDisplayedCollection || model.isRemoving || model.isValidatingCollection || model.isUpdatingCollection || dragging).fixedSize()
+            .pointingCursor().disabled(!model.canReviewDisplayedCollection || model.isRemoving || model.isUpdatingCollection || dragging).fixedSize()
         }
         .padding(.horizontal, 20).frame(maxWidth: .infinity).frame(height: 80)
         .background(ready ? OrbitStyle.accent.opacity(0.16) : dragging ? OrbitStyle.accent.opacity(0.06) : .clear)
@@ -529,10 +529,9 @@ struct ContentView: View {
         }
         .contentShape(Rectangle())
         .onDrop(of: [DiskModel.collectionDragType.rawValue], isTargeted: $collectionTargeted) { providers in
-            guard model.canAcceptCollectionDrop, let provider = providers.first else { return false }
+            guard let provider = providers.first, let reservation = model.reserveCollectionDrop() else { return false }
             provider.loadDataRepresentation(forTypeIdentifier: DiskModel.collectionDragType.rawValue) { data, _ in
-                guard let data else { return }
-                Task { @MainActor in _ = model.collectDrag(data: data) }
+                Task { @MainActor in _ = model.completeCollectionDrop(reservation, data: data) }
             }
             return true
         }
@@ -600,6 +599,7 @@ struct CollectionView: View {
     @State private var confirmationItems: [DiskNode] = []
     @State private var confirmationSize: Int64 = 0
     @State private var confirmationID = UUID()
+    @State private var confirmationLease: UUID?
 
     init(model: DiskModel, reviewOwner: CollectionReviewToken? = nil) {
         self.model = model
@@ -616,6 +616,7 @@ struct CollectionView: View {
         let visibleItems = items
         let trashTokenAtRender = trashToken
         let confirmationIDAtRender = confirmationID
+        let leaseAtRender = confirmationLease
         return VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 6) {
@@ -664,17 +665,18 @@ struct CollectionView: View {
                         }
                             .buttonStyle(.bordered).pointingCursor()
                             .help(model.isRemovingFromCollection(item.id) ? "Removing from collection…" : "Remove from collection")
-                            .disabled(!model.collectionReviewMatches(actionToken) || model.isRemoving || model.isValidatingCollection || model.isRemovingFromCollection(item.id))
+                            .disabled(!model.collectionReviewMatches(actionToken) || model.isRemoving || model.isRemovingFromCollection(item.id))
                     }.frame(height: 40).padding(.vertical, 6)
                         .opacity(model.isRemovingFromCollection(item.id) ? 0.5 : 1)
                 }
             }.listStyle(.inset)
             HStack {
-                Button("Clear Collection") { model.clearCollection(review: actionToken) }.pointingCursor().disabled(!model.collectionReviewMatches(actionToken) || model.isRemoving || model.isValidatingCollection || model.isUpdatingCollection)
+                Button("Clear Collection") { model.clearCollection(review: actionToken) }.pointingCursor().disabled(!model.collectionReviewMatches(actionToken) || model.isRemoving || model.isUpdatingCollection)
                 Spacer()
                 if model.isRemoving { ProgressView().controlSize(.small) }
                 Button(role: .destructive) {
-                    guard !visibleItems.isEmpty, model.collectionReviewMatches(actionToken) else { return }
+                    guard !visibleItems.isEmpty, let lease = model.beginCollectionConfirmation(review: actionToken) else { return }
+                    confirmationLease = lease
                     confirmationID = UUID()
                     permanentToken = actionToken; confirmationItems = visibleItems; confirmationSize = model.displayedCollectionSize
                     confirmPermanentDeletion = true
@@ -682,9 +684,10 @@ struct CollectionView: View {
                     Text("Delete Permanently…")
                 }
                     .pointingCursor()
-                    .disabled(visibleItems.isEmpty || !model.collectionReviewMatches(actionToken) || model.isRemoving || model.isValidatingCollection || model.isUpdatingCollection)
+                    .disabled(visibleItems.isEmpty || !model.collectionReviewMatches(actionToken) || model.isRemoving || model.isUpdatingCollection)
                 Button {
-                    guard !visibleItems.isEmpty, model.collectionReviewMatches(actionToken) else { return }
+                    guard !visibleItems.isEmpty, let lease = model.beginCollectionConfirmation(review: actionToken) else { return }
+                    confirmationLease = lease
                     confirmationID = UUID()
                     trashToken = actionToken; confirmationItems = visibleItems; confirmationSize = model.displayedCollectionSize
                     confirmTrash = true
@@ -693,7 +696,7 @@ struct CollectionView: View {
                 }
                     .buttonStyle(.borderedProminent).tint(OrbitStyle.accent).foregroundStyle(OrbitStyle.canvas)
                     .pointingCursor()
-                    .disabled(visibleItems.isEmpty || !model.collectionReviewMatches(actionToken) || model.isRemoving || model.isValidatingCollection || model.isUpdatingCollection)
+                    .disabled(visibleItems.isEmpty || !model.collectionReviewMatches(actionToken) || model.isRemoving || model.isUpdatingCollection)
             }
         }
         .padding(26).frame(width: 720, height: 470)
@@ -701,13 +704,20 @@ struct CollectionView: View {
         .buttonStyle(.bordered).controlSize(.large)
         .sheet(isPresented: $confirmPermanentDeletion) { permanentDeletionConfirmation }
         .alert("Move \(visibleConfirmationItems.count) \(visibleConfirmationItems.count == 1 ? "item" : "items") to Trash?", isPresented: $confirmTrash) {
-            Button("Cancel", role: .cancel) { if confirmationID == confirmationIDAtRender { confirmationID = UUID() } }
+            Button("Cancel", role: .cancel) {
+                guard confirmationID == confirmationIDAtRender else { return }
+                confirmationID = UUID()
+                model.endCollectionConfirmation(leaseAtRender)
+                confirmationLease = nil
+            }
             Button("Move to Trash", role: .destructive) {
                 guard confirmationID == confirmationIDAtRender else { return }
                 confirmationID = UUID()
                 model.moveCollectionToTrash(review: trashTokenAtRender)
+                model.endCollectionConfirmation(leaseAtRender)
+                confirmationLease = nil
             }
-                .disabled(!model.collectionReviewMatches(trashTokenAtRender) || model.isRemoving || model.isValidatingCollection || model.isUpdatingCollection)
+                .disabled(!model.collectionReviewMatches(trashTokenAtRender) || model.isRemoving || model.isUpdatingCollection)
         } message: {
             if confirmationHasIncompleteFolders {
                 Text("Selected folders may not be fully mapped. Moving them to Trash includes everything inside, including files not shown yet. You can restore them from Trash in Finder.")
@@ -717,14 +727,24 @@ struct CollectionView: View {
                                    enabled: !model.isRemoving) {
             guard confirmationID == confirmationIDAtRender else { return }
             confirmationID = UUID()
+            model.endCollectionConfirmation(leaseAtRender)
+            confirmationLease = nil
             if confirmPermanentDeletion { confirmPermanentDeletion = false }
             else { confirmTrash = false }
+        }
+        .onDisappear { model.endCollectionConfirmation(confirmationLease) }
+        .onChange(of: confirmPermanentDeletion || confirmTrash) { _, presented in
+            if !presented {
+                model.endCollectionConfirmation(confirmationLease)
+                confirmationLease = nil
+            }
         }
     }
 
     private var permanentDeletionConfirmation: some View {
         let tokenAtRender = permanentToken
         let confirmationIDAtRender = confirmationID
+        let leaseAtRender = confirmationLease
         return VStack(alignment: .leading, spacing: 18) {
             Text("Delete \(visibleConfirmationItems.count) \(visibleConfirmationItems.count == 1 ? "item" : "items") permanently?")
                 .font(.system(size: 23, weight: .semibold))
@@ -752,6 +772,8 @@ struct CollectionView: View {
                 Button("Cancel") {
                     guard confirmationID == confirmationIDAtRender else { return }
                     confirmationID = UUID(); confirmPermanentDeletion = false
+                    model.endCollectionConfirmation(leaseAtRender)
+                    confirmationLease = nil
                 }
                     .keyboardShortcut(.cancelAction).pointingCursor()
                 Button(role: .destructive) {
@@ -759,11 +781,13 @@ struct CollectionView: View {
                     confirmationID = UUID()
                     confirmPermanentDeletion = false
                     model.deleteCollectionPermanently(review: tokenAtRender)
+                    model.endCollectionConfirmation(leaseAtRender)
+                    confirmationLease = nil
                 } label: {
                     Text("Delete Permanently")
                 }
                 .pointingCursor()
-                .disabled(!model.collectionReviewMatches(tokenAtRender) || model.isRemoving || model.isValidatingCollection || model.isUpdatingCollection)
+                .disabled(!model.collectionReviewMatches(tokenAtRender) || model.isRemoving || model.isUpdatingCollection)
             }
         }
         .padding(26).frame(width: 640, height: 430)

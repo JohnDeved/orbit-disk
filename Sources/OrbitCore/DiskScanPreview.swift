@@ -52,9 +52,15 @@ public final class DiskScanPreview: @unchecked Sendable {
     private var rootID: String?
     private var version: UInt64 = 0
     private var staged: ResumableStage?
+    private var preferredPath: String?
 
     public func attach(stage: ResumableStage) {
-        lock.lock(); staged = stage; version &+= 1; lock.unlock()
+        lock.lock(); defer { lock.unlock() }
+        staged = stage; version &+= 1; stage.prioritize(path: preferredPath)
+    }
+    public func prioritize(path: String?) {
+        lock.lock(); defer { lock.unlock() }
+        preferredPath = path; staged?.prioritize(path: path)
     }
     public func detachStage() {
         lock.lock(); staged = nil; version &+= 1; lock.unlock()

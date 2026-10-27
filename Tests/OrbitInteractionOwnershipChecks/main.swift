@@ -136,6 +136,7 @@ import OrbitCore
             precondition(outer == nil && nested != nil && model.draggingLabel == "nested", "Reentrant drag replaced its newer owner")
             model.endCollectionDrag(nested!)
             precondition(model.collectDrag(data: nested!.data(forType: DiskModel.collectionDragType)!), "Newer drag token was lost")
+            try await wait { !model.isValidatingCollection && model.collection.contains { $0.id == root.children[notification + 1].id } }
         }
 
         guard let oldItem = model.beginCollectionDrag([root.children[0]], label: "old"),
@@ -197,6 +198,7 @@ import OrbitCore
         precondition(!model.collectDrag(data: oldToken) && model.draggingLabel == "current drop")
         model.endCollectionDrag(currentDrop)
         precondition(model.collectDrag(data: currentToken), "Drop arriving after drag source completion was rejected")
+        try await wait { !model.isValidatingCollection && model.collection.contains { $0.id == root.children[1].id } }
         precondition(model.collection.contains { $0.id == root.children[1].id }, "Delayed drop collected the wrong item")
 
         guard let oldRootItem = model.beginCollectionDrag([root.children[0]], label: "old root") else { fatalError("old root drag failed") }
@@ -205,11 +207,13 @@ import OrbitCore
         try Data([5]).write(to: otherRoot.appendingPathComponent("other-file"))
         model.scan(otherRoot)
         try await wait { model.root?.id == otherRoot.path && !model.isScanning }
+        let newRootItemNodeID = model.root!.children[0].id
         guard let newRootItem = model.beginCollectionDrag([model.root!.children[0]], label: "new root") else { fatalError("new root drag failed") }
         model.endCollectionDrag(oldRootItem)
         precondition(model.draggingLabel == "new root", "Old root's drag completion cleared new root's drag")
         model.endCollectionDrag(newRootItem)
         precondition(model.collectDrag(data: newRootItem.data(forType: DiskModel.collectionDragType)!), "New root drop failed")
+        try await wait { !model.isValidatingCollection && model.collection.contains { $0.id == newRootItemNodeID } }
 
         let oldOwner = model.beginMapInteraction()
         model.cancelScan()

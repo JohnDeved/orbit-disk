@@ -65,12 +65,14 @@ final class Gate: @unchecked Sendable {
             guard !fired else {return}; fired=true; m.testActivateResolved(b)
         }
         m.testDetachValidation(); observer.cancel()
-        try await wait("B active while A shown") { fired && reopen.waiting && m.testActiveSessionRoot() == b.path && m.root?.id == a.path }
+        try await wait("B cached map restored during reopen") { fired && reopen.waiting && m.testActiveSessionRoot() == b.path && m.root?.id == b.path }
+        precondition(m.isValidatingCollection && m.displayedCollection.isEmpty,
+                     "The restored B map must attach B's pending validation without A's collection")
         bGate.release()
         try await wait("B commit before root publication") {m.collection.map(\.id) == [bItem.id]}
-        precondition(m.root?.id == a.path && m.displayedCollection.isEmpty && m.displayedCollectionSize == 0
-                     && m.collectionCoverage.isEmpty && !m.canReviewDisplayedCollection,
-                     "A displayed map must not expose B's collection, count, size, highlights, or review action")
+        precondition(m.root?.id == b.path && m.displayedCollection.map(\.id) == [bItem.id]
+                     && m.displayedCollectionSize == bItem.size && m.canReviewDisplayedCollection,
+                     "The restored B map must expose only B's committed collection while reopening")
         reopen.release()
         try await wait("B displayed") {m.root?.id == b.path && !m.isScanning}
         precondition(m.collection.map(\.id) == [bItem.id] && m.displayedCollection.map(\.id) == [bItem.id]
@@ -114,8 +116,13 @@ final class Gate: @unchecked Sendable {
         let launchObserver=m.objectWillChange.sink { _ in
             guard !launchObserved else {return}; launchObserved=true; m.testSetCollectionEdit(b,pending:true)
         }
-        precondition(!m.testCollectInBackground([fresh2Item]), "validation started despite reentrant row edit")
-        launchObserver.cancel(); precondition(launchObserved); m.testSetCollectionEdit(b,pending:false)
+        precondition(m.testCollectInBackground([fresh2Item]), "A reentrant row edit must leave the accepted addition queued")
+        launchObserver.cancel()
+        precondition(launchObserved && m.testHasPendingCollection(b) && !m.collection.contains { $0.id == fresh2Item.id })
+        m.testSetCollectionEdit(b,pending:false)
+        try await wait("queued addition after row edit") {!m.isValidatingCollection && m.collection.contains { $0.id == fresh2Item.id }}
+        m.removeFromCollection(fresh2Item.id)
+        precondition(!m.collection.contains { $0.id == fresh2Item.id })
         let sameStatusGate=Gate(); m.testCollectionPrepare={await sameStatusGate.pause()}
         precondition(m.testCollectInBackground([fresh2Item])); try await wait("same status held") {sameStatusGate.waiting}
         precondition(m.statusMessage == "Checking items for collection…")
@@ -171,6 +178,7 @@ final class Gate: @unchecked Sendable {
         other.scan(ownerB); try await wait("review owner B") {other.root?.id == ownerB.path && !other.isScanning}
         let ownerBItem=other.current!.children[0]
         precondition(other.collect([ownerBItem]))
+        try await wait("review B collection ready") {!other.isValidatingCollection && other.collection.map(\.id) == [ownerBItem.id]}
         other.beginCollectionReview()
         let currentOwner=other.collectionReviewToken!
         precondition(!other.collectionReviewHasOwner(oldOwner) && other.collectionReviewMatches(currentOwner))

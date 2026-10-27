@@ -77,6 +77,8 @@ public struct DiskIndexStore: Sendable {
     public func savedSnapshot(for root: URL) -> IndexSnapshot? {
         let rootPath = Self.path(root)
         let file = databaseURL(for: root)
+        var presence = stat()
+        guard lstat(file.path, &presence) == 0 else { return nil }
         do {
             let db = try IndexDatabase(file, writable: false)
             let snapshot = try readSnapshot(db, file: file)

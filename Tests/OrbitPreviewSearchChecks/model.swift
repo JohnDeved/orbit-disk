@@ -31,7 +31,9 @@ final class OrderRecorder: @unchecked Sendable {
         try await wait("partial search") { !model.isSearching && model.searchResults.contains { $0.id == early.path } }
         precondition(model.isPartialMap && model.query == "CAFE")
         let first = model.searchResults.first { $0.id == early.path }!
-        precondition(model.collect([first])); model.deleteCollectionPermanently()
+        precondition(model.collect([first]))
+        try await wait("preview search collection") { !model.isValidatingCollection }
+        model.deleteCollectionPermanently()
         try await wait("delete during search") { !model.isRemoving && !FileManager.default.fileExists(atPath: early.path) }
         try await wait("search projection") { !model.searchResults.contains { $0.id == early.path } }
         precondition(model.query == "CAFE" && gate.waiting)

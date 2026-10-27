@@ -25,6 +25,7 @@ final class Gate: @unchecked Sendable {
     let file=root.appendingPathComponent("match-000")
     let wanted=model.current!.children.filter {$0.id == file.path || $0.id == folder.path}
     precondition(wanted.count == 2 && model.collect(wanted))
+    try await wait("saved search collection") { !model.isValidatingCollection }
     let gate=Gate();model.testBeforeRefreshSave={gate.pause()}
     model.deleteCollectionPermanently();try await wait("deletion") {!model.isRemoving && !fm.fileExists(atPath:file.path) && !fm.fileExists(atPath:folder.path)}
     try await wait("saved refresh held") {gate.waiting}
@@ -39,6 +40,7 @@ final class Gate: @unchecked Sendable {
     switchModel.scan(switchRoot);try await wait("switch initial") {!switchModel.isScanning && switchModel.current?.children.count == 1}
     switchModel.query="victim";try await wait("switch search") {!switchModel.isSearching && switchModel.searchResults.count == 1}
     precondition(switchModel.collect([switchModel.current!.children[0]]))
+    try await wait("switch collection") { !switchModel.isValidatingCollection }
     var armed=false, switched=false
     let removalObserver=switchModel.$isRemoving.dropFirst().sink { removing in if !removing && !switched { armed=true } }
     let observer=switchModel.objectWillChange.sink {

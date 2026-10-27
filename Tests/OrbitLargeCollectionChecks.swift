@@ -67,10 +67,12 @@ final class Gate: @unchecked Sendable {
                 if armed { armed = false; model.cancelScan() }
             }
         }
-        precondition(!model.collect([first]))
+        precondition(model.collect([first]))
         observer.cancel()
-        precondition(!armed && !model.isValidatingCollection && model.collection.count == existing.count,
-                     "Reentrant cancellation during launch must not leave validation stuck")
+        try await wait { !model.isValidatingCollection }
+        precondition(!armed && model.collection.count == existing.count + 1 && model.collection.contains { $0.id == first.id },
+                     "Reentrant scan pause during launch must preserve the accepted addition")
+        model.collection = existing
         let nextRoot = base.appendingPathComponent("other")
         try FileManager.default.createDirectory(at: nextRoot, withIntermediateDirectories: true)
         var switchArmed = true
@@ -79,12 +81,13 @@ final class Gate: @unchecked Sendable {
                 if switchArmed { switchArmed = false; model.scan(nextRoot) }
             }
         }
-        precondition(!model.collect([first]))
+        precondition(model.collect([first]))
         switchObserver.cancel()
         try await wait { model.root?.id == nextRoot.path && !model.isScanning }
         precondition(!switchArmed && !model.isValidatingCollection,
-                     "Reentrant root switch during launch must not start stale validation")
-        model.scan(root); try await wait { model.root?.id == root.path && !model.isScanning }
+                     "Reentrant root switch during launch must not attach the old root's validation to the new root")
+        model.scan(root); try await wait { model.root?.id == root.path && !model.isScanning && !model.isValidatingCollection
+                                          && model.collection.contains { $0.id == first.id } }
         model.collection = existing
         model.errorMessage = nil
         gate.arm()
@@ -208,9 +211,10 @@ final class Gate: @unchecked Sendable {
         gate.release()
         try await wait { !cancelReentryArmed && !model.isValidatingCollection }
         cancelReentry.cancel()
-        precondition(model.errorMessage == nil && model.collection.count == existing.count + 1
-                     && model.collection.contains { $0.id == first.id } && !(model.statusMessage?.contains("Checking") ?? false),
-                     "Reentrant scan pause must preserve the accepted job without leaving stale validation state")
+        precondition(model.errorMessage == nil && model.collection.count == existing.count + 2
+                     && model.collection.contains { $0.id == first.id } && model.collection.contains { $0.id == second.id }
+                     && model.collectionSize == 1205 && !(model.statusMessage?.contains("Checking") ?? false),
+                     "Reentrant scan pause must preserve the active request and the next accepted addition")
         model.collection = existing
         gate.arm()
         precondition(model.collect([first]))
