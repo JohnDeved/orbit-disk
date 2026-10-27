@@ -44,7 +44,14 @@ public final class ResumableStage: @unchecked Sendable {
     private var searchPreparationTime: TimeInterval = 0
     private var reuseProvider: ((URL, StageCheckpoint) throws -> StageReuseCandidate?)?
     private var reuseSources: [StageReuseSource] = []
+    private var consideredAsyncDiscovery = false
     #if ORBIT_TESTING
+    package var testDisableAsyncDiscovery = false
+    package var testDiscoveryStatus: (finished: Bool, finishedAt: TimeInterval?, pendingBytes: Int, peakPendingBytes: Int, deferredDirectories: Int)? {
+        guard let inventory = crawler.asyncInventory else { return nil }
+        return (inventory.discoveryFinished, inventory.discoveryFinishedAt, inventory.pendingBytes, inventory.peakPendingBytes,
+                inventory.deferredDirectoryCount)
+    }
     package private(set) var testReusedDirectories = 0
     package var testPreviewSnapshot: IndexSnapshot { previewSnapshot }
     package static var testBeforeStagedRead: (@Sendable () -> Void)?
@@ -147,6 +154,10 @@ public final class ResumableStage: @unchecked Sendable {
             guard let self else { return nil }
             self.revisionLock.lock(); defer { self.revisionLock.unlock() }; return self.preferredDirectory
         }
+        removalReplay.beforeFullReconciliation = { [weak self] in
+            self?.crawler.cancelAsyncDiscovery()
+            self?.bumpRevision()
+        }
     }
 
     public func prioritize(path: String?) {
@@ -156,7 +167,7 @@ public final class ResumableStage: @unchecked Sendable {
         revisionLock.lock(); preferredDirectory = valid ? bytes : nil; revisionLock.unlock()
     }
 
-    deinit { cancelSearchPreparation() }
+    deinit { crawler.cancelAsyncDiscovery(); cancelSearchPreparation() }
 
     public var isSearchPrepared: Bool { previewStore.isStagedSearchPrepared(snapshot: previewSnapshot) }
 
@@ -297,8 +308,14 @@ public final class ResumableStage: @unchecked Sendable {
         Self.testBeforeStagedRead?()
         #endif
         let (previewRevision, active) = capturePreviewState()
-        let result = try previewStore.stagedView(path: path, snapshot: previewSnapshot, revision: previewRevision, activeDirectory: active,
-                                                  removals: removals + state.overlay, cancellation: cancellation)
+        let result: ScanPreviewView?
+        if let pending = crawler.asyncInventory?.capture() {
+            result = try previewStore.stagedView(path: path, snapshot: previewSnapshot, revision: previewRevision, pending: pending,
+                activeDirectory: active, removals: removals + state.overlay, cancellation: cancellation)
+        } else {
+            result = try previewStore.stagedView(path: path, snapshot: previewSnapshot, revision: previewRevision, activeDirectory: active,
+                removals: removals + state.overlay, cancellation: cancellation)
+        }
         let after = removalReplay.viewState()
         guard !after.blocked, after.generation == state.generation else { throw CancellationError() }
         return result
@@ -307,7 +324,12 @@ public final class ResumableStage: @unchecked Sendable {
     public func confirmsMissingDirectory(_ path: String) -> Bool {
         let state = removalReplay.viewState()
         guard !state.blocked else { return false }
-        let result = (try? previewStore.stagedConfirmsMissingDirectory(path, snapshot: previewSnapshot)) ?? false
+        let result: Bool
+        if let pending = crawler.asyncInventory?.capture() {
+            result = (try? previewStore.stagedConfirmsMissingDirectory(path, snapshot: previewSnapshot, pending: pending)) ?? false
+        } else {
+            result = (try? previewStore.stagedConfirmsMissingDirectory(path, snapshot: previewSnapshot)) ?? false
+        }
         let after = removalReplay.viewState()
         return !after.blocked && after.generation == state.generation && result
     }
@@ -320,8 +342,14 @@ public final class ResumableStage: @unchecked Sendable {
         Self.testBeforeStagedRead?()
         #endif
         let (previewRevision, active) = capturePreviewState()
-        let result = try previewStore.stagedSearch(query: query, snapshot: previewSnapshot, revision: previewRevision, activeDirectory: active,
-                                                   removals: removals + state.overlay, cancellation: cancellation, limit: limit)
+        let result: (nodes: [DiskNode], count: Int, revision: UInt64, removalsChanged: Bool)
+        if let pending = crawler.asyncInventory?.capture() {
+            result = try previewStore.stagedSearch(query: query, snapshot: previewSnapshot, revision: previewRevision, pending: pending,
+                activeDirectory: active, removals: removals + state.overlay, cancellation: cancellation, limit: limit)
+        } else {
+            result = try previewStore.stagedSearch(query: query, snapshot: previewSnapshot, revision: previewRevision, activeDirectory: active,
+                removals: removals + state.overlay, cancellation: cancellation, limit: limit)
+        }
         let after = removalReplay.viewState()
         guard !after.blocked, after.generation == state.generation else { throw CancellationError() }
         return result
@@ -332,6 +360,22 @@ public final class ResumableStage: @unchecked Sendable {
         try crawler.store.prepareQueueIndexes(cancellation: crawler.cancellation)
         let replayGeneration = removalReplay.viewState().generation
         try removalReplay.refreshIfNeeded()
+        if !consideredAsyncDiscovery {
+            consideredAsyncDiscovery = true
+            let state = removalReplay.viewState()
+            var eligible = !hasPriorCheckpoint && !state.blocked && state.overlay.isEmpty
+            #if ORBIT_TESTING
+            eligible = eligible && !testDisableAsyncDiscovery
+            #endif
+            if eligible && crawler.asyncInventory == nil {
+                let store = previewStore
+                let deferDirectory: ((Data) -> Bool)? = reuseProvider == nil ? nil : { path in
+                    guard let value = String(data: path, encoding: .utf8) else { return true }
+                    return store.hasSavedSnapshotFile(for: URL(fileURLWithPath: value, isDirectory: true))
+                }
+                _ = try crawler.startAsyncDiscovery(deferDirectory: deferDirectory, onAccepted: { [weak self] in self?.bumpRevision() })
+            }
+        }
         let advanced = try crawler.step(onRecordCount: { [self] count in progressItems += count }, onBatch: { [self] path, _ in
             bumpRevision()
             prepareSearchIndex(itemCount: progressItems)
@@ -350,7 +394,9 @@ public final class ResumableStage: @unchecked Sendable {
             guard lastProgressTime == 0 || now - lastProgressTime >= 0.1 else { return }
             lastProgressTime = now
             let totals = try crawler.store.folderTotals(path: Data(crawler.rootURL.path.utf8))
-            progress(ScanProgress(itemCount: max(progressItems, Int(totals?.count ?? 0)), bytesScanned: totals?.logical ?? 0,
+            let discovered = crawler.asyncInventory
+            progress(ScanProgress(itemCount: max(progressItems, Int(totals?.count ?? 0), discovered?.discoveredRecordCount ?? 0),
+                                  bytesScanned: max(totals?.logical ?? 0, discovered?.discoveredLogicalSize ?? 0),
                                   currentPath: String(decoding: path, as: UTF8.self)))
             try removalReplay.refreshIfNeeded()
         }, onListingComplete: {

@@ -26,6 +26,7 @@ case "$1" in
     ./check-session.sh
     ;;
   mapping)
+    ./check-async-mapping.sh
     ./check-resumable.sh
     ./check-mapping-reuse.sh
     ;;

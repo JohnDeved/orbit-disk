@@ -36,6 +36,8 @@ final class Gate: @unchecked Sendable {
         let cache=base.appendingPathComponent("normal")
         testingBatch.arm(fail:false)
         let model=DiskModel(cacheDirectory: cache,preferences:preferences)
+        // These gates control filesystem discovery as well as durable writes.
+        model.testConfigureStage = { $0.testDisableAsyncDiscovery = true }
         model.testScanner = DiskScanner(testBatch: { try testingBatch.wait() }, testFallback: { try testingFallback.wait() })
         model.scan(root)
         try await wait("provisional root") { testingBatch.isWaiting && model.current?.children.isEmpty == false }
@@ -76,6 +78,7 @@ final class Gate: @unchecked Sendable {
             testingBatch.arm(fail: false)
             let reentrantCache = base.appendingPathComponent(refresh ? "refresh-reentrant" : "stop-reentrant")
             let reentrant = DiskModel(cacheDirectory: reentrantCache, preferences: preferences)
+            reentrant.testConfigureStage = { $0.testDisableAsyncDiscovery = true }
             reentrant.testScanner = DiskScanner(testBatch: { try testingBatch.wait() })
             reentrant.scan(root)
             try await wait("reentrant partial map") { testingBatch.isWaiting && reentrant.current?.children.isEmpty == false }
@@ -103,6 +106,7 @@ final class Gate: @unchecked Sendable {
             testingBatch.arm(fail:true)
             testingFallback.arm(fail:false)
             let rollback=DiskModel(cacheDirectory: rollbackCache,preferences:preferences)
+            rollback.testConfigureStage = { $0.testDisableAsyncDiscovery = true }
             rollback.testScanner = DiskScanner(testBatch: { try testingBatch.wait() }, testFallback: { try testingFallback.wait() })
             rollback.scan(root)
             try await wait("rollback preview") { testingBatch.isWaiting && rollback.current?.children.isEmpty == false }
@@ -138,6 +142,7 @@ final class Gate: @unchecked Sendable {
         for i in 0..<2_500 { try Data([UInt8(i % 251)]).write(to: fileRoot.appendingPathComponent("file-\(i)")) }
         testingBatch.arm(fail: false)
         let files = DiskModel(cacheDirectory: base.appendingPathComponent("files-cache"), preferences: preferences)
+        files.testConfigureStage = { $0.testDisableAsyncDiscovery = true }
         files.testScanner = DiskScanner(testBatch: { try testingBatch.wait() })
         files.scan(fileRoot)
         try await wait("provisional files") { testingBatch.isWaiting && files.current?.children.isEmpty == false }

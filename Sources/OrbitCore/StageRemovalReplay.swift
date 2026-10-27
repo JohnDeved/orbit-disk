@@ -18,6 +18,8 @@ final class StageRemovalReplay {
     private var liveBarrier: Int64?
     private var nextProbe: TimeInterval = 0
     private let overlayLimit = 10_000
+    private var deferredAsyncReplay = false
+    var beforeFullReconciliation: (() -> Void)?
     #if ORBIT_TESTING
     static var testAfterFreshCapture: (@Sendable () -> Void)?
     static var testAfterReplayHead: (@Sendable (Int64?) -> Void)?
@@ -143,6 +145,9 @@ final class StageRemovalReplay {
             }
         }
         try crawler.root.validate(url: crawler.rootURL)
+        if full || overflow { beforeFullReconciliation?() }
+        // A removed file's parent may still exist only in the discovery queue.
+        deferredAsyncReplay = crawler.hasActiveAsyncDiscovery && initialSequence < end.sequence
         if pendingLive != nil {
             // The owner may still change the filesystem; defer dirtying until it finishes.
         } else if full { try crawler.store.markFullRefresh() }
@@ -171,6 +176,12 @@ final class StageRemovalReplay {
     func settleIfPossible() throws -> Bool {
         guard let target else { throw Retry.journalChanged }
         if liveBarrier != nil { return false }
+        if crawler.hasActiveAsyncDiscovery { return false }
+        if deferredAsyncReplay {
+            deferredAsyncReplay = false
+            try prepare()
+            return false
+        }
         if !needsSettle { return true }
         if try crawler.store.hasReplayDirtyWork() { return false }
         if try fullReconciliation && crawler.store.hasPendingDirectories() { return false }

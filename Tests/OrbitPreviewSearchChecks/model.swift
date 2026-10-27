@@ -45,6 +45,8 @@ final class OrderRecorder: @unchecked Sendable {
         for i in 0..<2_000 { try Data([1]).write(to: wide.appendingPathComponent(String(format: "entry-%04d", i))) }
         let batchGate = Gate(), progressGate = Gate()
         let wideModel = DiskModel(cacheDirectory: base.appendingPathComponent("wide-index"), preferences: prefs)
+        // Hold discovery at the writer gate to exercise results arriving in later batches.
+        wideModel.testConfigureStage = { $0.testDisableAsyncDiscovery = true }
         wideModel.testScanner = DiskScanner(testBatch: { batchGate.pause() }, testAfterListing: { progressGate.pause() })
         wideModel.scan(wide); try await wait("wide first batch") { batchGate.waiting && !(wideModel.current?.children.isEmpty ?? true) }
         let visible = Set(wideModel.current!.children.map(\.name))

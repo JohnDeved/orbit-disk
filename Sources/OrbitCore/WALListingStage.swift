@@ -3,6 +3,11 @@ import Foundation
 import Darwin
 
 // Stores the published node schema alongside the private scan queue.
+struct AsyncInventoryCommit {
+    let generation: String
+    let sequence: Int64
+}
+
 final class ListingStage {
     private var db: OpaquePointer?
     private var indexRoot: Data?
@@ -47,6 +52,7 @@ final class ListingStage {
         do {
             try exec("CREATE TABLE IF NOT EXISTS sealed (singleton INTEGER PRIMARY KEY CHECK(singleton=1),snapshot_id TEXT NOT NULL,published INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS stage_issues (path BLOB PRIMARY KEY,message TEXT NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS listing_issues (parent BLOB PRIMARY KEY,count INTEGER NOT NULL,messages TEXT NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS blocked_directories (path BLOB PRIMARY KEY) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS dirty_links (dev INTEGER NOT NULL,inode INTEGER NOT NULL,PRIMARY KEY(dev,inode)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS link_candidates (dev INTEGER NOT NULL,inode INTEGER NOT NULL,node_id INTEGER NOT NULL,PRIMARY KEY(dev,inode,node_id)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS link_rebuild (dev INTEGER NOT NULL,inode INTEGER NOT NULL,PRIMARY KEY(dev,inode)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS owners (dev INTEGER NOT NULL,inode INTEGER NOT NULL,node_id INTEGER NOT NULL,PRIMARY KEY(dev,inode)) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS epochs (parent BLOB PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS dirty (parent BLOB PRIMARY KEY, revision INTEGER NOT NULL, pending INTEGER NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS scan (root BLOB PRIMARY KEY, identity BLOB NOT NULL, event_id INTEGER NOT NULL, expected_snapshot TEXT NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS directories (path BLOB PRIMARY KEY, device INTEGER NOT NULL, inode INTEGER NOT NULL, pending INTEGER NOT NULL, full_generation INTEGER NOT NULL DEFAULT 0, logical INTEGER NOT NULL DEFAULT 0, allocated INTEGER NOT NULL DEFAULT 0, files INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS full_refresh (singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation INTEGER NOT NULL, pending INTEGER NOT NULL); INSERT OR IGNORE INTO full_refresh VALUES(1,0,0); CREATE TABLE IF NOT EXISTS prune (path BLOB PRIMARY KEY, parent BLOB NOT NULL, name BLOB NOT NULL) WITHOUT ROWID; CREATE TABLE IF NOT EXISTS trim (parent BLOB PRIMARY KEY, epoch INTEGER NOT NULL, revision INTEGER NOT NULL, full_generation INTEGER NOT NULL) WITHOUT ROWID;")
             try exec("CREATE TABLE IF NOT EXISTS scan_generation (root BLOB PRIMARY KEY, generation TEXT NOT NULL) WITHOUT ROWID")
+            try exec("CREATE TABLE IF NOT EXISTS orbit_async_progress(singleton INTEGER PRIMARY KEY CHECK(singleton=1),generation TEXT NOT NULL,sequence INTEGER NOT NULL)")
             try installMirror()
             try exec("COMMIT")
         } catch {
@@ -482,8 +488,42 @@ final class ListingStage {
 
     enum Reconcile: Error { case pruneRequired }
 
+    private struct FreshListingCompletion {
+        let revision: Int64
+        let generation: Int64
+        let issueCount: Int
+        let issues: [String]
+    }
+
+    func canCompleteFreshListing(parent: Data) throws -> Bool {
+        let statement = try prepare("SELECT NOT EXISTS(SELECT 1 FROM epochs WHERE parent=?1) AND NOT EXISTS(SELECT 1 FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(?1 AS TEXT))) AND EXISTS(SELECT 1 FROM directories WHERE path=?1 AND pending=1)")
+        defer { sqlite3_finalize(statement) }
+        bind(parent, 1, statement)
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw Failure.sqlite("fresh listing query") }
+        return sqlite3_column_int(statement, 0) != 0
+    }
+
+    func completeFreshListing(parent: Data, records: [FileMetadata], rootDevice: Int32,
+                              expectedRevision: Int64, expectedFullGeneration: Int64,
+                              issueCount: Int = 0, issues: [String] = [], asyncCommit: AsyncInventoryCommit? = nil) throws -> Bool {
+        guard expectedRevision == 0, expectedFullGeneration == 0, records.count <= 1024,
+              records.reduce(0, { $0 + MemoryLayout<FileMetadata>.stride + $1.name.utf8.count }) <= 256 * 1024,
+              try canCompleteFreshListing(parent: parent) else { return false }
+        let completion = FreshListingCompletion(revision: expectedRevision, generation: expectedFullGeneration,
+                                                issueCount: issueCount, issues: issues)
+        return try appendBatch(parent: parent, epoch: nil, records: records, rootDevice: rootDevice, completion: completion, asyncCommit: asyncCommit) != nil
+    }
+
     @discardableResult
-    func append(parent: Data, epoch: Int64?, records: [FileMetadata], rootDevice: Int32? = nil) throws -> Int64 {
+    func append(parent: Data, epoch: Int64?, records: [FileMetadata], rootDevice: Int32? = nil, asyncCommit: AsyncInventoryCommit? = nil) throws -> Int64 {
+        guard let epoch = try appendBatch(parent: parent, epoch: epoch, records: records, rootDevice: rootDevice, completion: nil, asyncCommit: asyncCommit) else {
+            throw Failure.sqlite("listing batch rejected")
+        }
+        return epoch
+    }
+
+    private func appendBatch(parent: Data, epoch: Int64?, records: [FileMetadata], rootDevice: Int32?,
+                             completion: FreshListingCompletion?, asyncCommit: AsyncInventoryCommit?) throws -> Int64? {
         if let rootDevice {
             var prefix = parent
             if prefix.last != 47 { prefix.append(47) }
@@ -513,9 +553,18 @@ final class ListingStage {
         }
         try exec("BEGIN IMMEDIATE")
         do {
+            if let completion {
+                let full = try fullRefreshState()
+                guard try dirtyRevision(parent: parent) == completion.revision,
+                      full.generation == completion.generation, !full.pending,
+                      try canCompleteFreshListing(parent: parent) else {
+                    try exec("ROLLBACK")
+                    return nil
+                }
+            }
             let batchEpoch = try epoch ?? nextEpoch(parent: parent)
             #if ORBIT_TESTING
-            if epoch == nil { Self.testListingCommit?("batch-epoch") }
+            if epoch == nil { Self.testListingCommit?(completion != nil && records.isEmpty ? "empty-epoch" : "batch-epoch") }
             #endif
             let parentCheck = try prepare("SELECT p.id FROM directory_paths p JOIN nodes n ON n.id=p.id AND n.is_dir=1 WHERE p.path=CAST(? AS TEXT)")
             defer { sqlite3_finalize(parentCheck) }
@@ -653,43 +702,73 @@ final class ListingStage {
                 }
             }
             if rootDevice != nil { try adjustAncestors(parent: parent, logical: logicalDelta, allocated: allocatedDelta, files: fileDelta) }
+            if let completion {
+                try recordListingIssues(parent: parent, count: completion.issueCount, issues: completion.issues)
+                let completed = try prepare("UPDATE directories SET pending=0 WHERE path=?")
+                defer { sqlite3_finalize(completed) }
+                bind(parent, 1, completed); try step(completed)
+            }
+            try persistAsyncCommit(asyncCommit)
             try exec("COMMIT")
             #if ORBIT_TESTING
-            if epoch == nil { Self.testListingCommit?("batch-committed") }
+            if epoch == nil { Self.testListingCommit?(completion != nil && records.isEmpty ? "empty-committed" : "batch-committed") }
             #endif
             return batchEpoch
         } catch { try? exec("ROLLBACK"); throw error }
     }
 
+    func acknowledgeAsync(_ commit: AsyncInventoryCommit) throws {
+        try exec("BEGIN IMMEDIATE")
+        do { try persistAsyncCommit(commit); try exec("COMMIT") }
+        catch { try? exec("ROLLBACK"); throw error }
+    }
+
+    private func persistAsyncCommit(_ commit: AsyncInventoryCommit?) throws {
+        guard let commit else { return }
+        let statement = try prepare("INSERT INTO orbit_async_progress VALUES(1,?,?) ON CONFLICT(singleton) DO UPDATE SET generation=excluded.generation,sequence=excluded.sequence")
+        defer { sqlite3_finalize(statement) }
+        bindText(commit.generation, 1, statement); sqlite3_bind_int64(statement, 2, commit.sequence)
+        try step(statement)
+    }
+
+    private func recordListingIssues(parent: Data, count: Int, issues: [String]) throws {
+        let clear = try prepare("DELETE FROM listing_issues WHERE parent=?")
+        defer { sqlite3_finalize(clear) }
+        bind(parent, 1, clear); try step(clear)
+        if count > 0 {
+            let insert = try prepare("INSERT INTO listing_issues(parent,count,messages) VALUES(?,?,?)")
+            defer { sqlite3_finalize(insert) }
+            bind(parent, 1, insert); sqlite3_bind_int64(insert, 2, Int64(count))
+            bindText(String(decoding: try JSONEncoder().encode(Array(issues.prefix(100))), as: UTF8.self), 3, insert)
+            try step(insert)
+        }
+    }
+
     // A completed enumeration schedules bounded trimming; acknowledgements happen after trimming.
-    func finish(parent: Data, epoch: Int64?, expectedRevision: Int64, expectedFullGeneration: Int64? = nil, issueCount: Int = 0, issues: [String] = []) throws -> Bool {
+    func finish(parent: Data, epoch: Int64?, expectedRevision: Int64, expectedFullGeneration: Int64? = nil, issueCount: Int = 0, issues: [String] = [], asyncCommit: AsyncInventoryCommit? = nil) throws -> Bool {
         try exec("BEGIN IMMEDIATE")
         do {
             let full = try fullRefreshState()
             guard try dirtyRevision(parent: parent) == expectedRevision,
                   expectedFullGeneration == nil || (full.generation == expectedFullGeneration && !full.pending) else {
-                try exec("ROLLBACK")
+                if let asyncCommit {
+                    // The observations are consumed, but a dirty listing must still be re-read.
+                    try persistAsyncCommit(asyncCommit)
+                    try exec("COMMIT")
+                } else { try exec("ROLLBACK") }
                 return false
             }
             let completedEpoch = try epoch ?? nextEpoch(parent: parent)
             #if ORBIT_TESTING
             if epoch == nil { Self.testListingCommit?("empty-epoch") }
             #endif
-            let clearIssues = try prepare("DELETE FROM listing_issues WHERE parent=?")
-            defer { sqlite3_finalize(clearIssues) }
-            bind(parent, 1, clearIssues); try step(clearIssues)
-            if issueCount > 0 {
-                let recordIssues = try prepare("INSERT INTO listing_issues(parent,count,messages) VALUES(?,?,?)")
-                defer { sqlite3_finalize(recordIssues) }
-                bind(parent, 1, recordIssues); sqlite3_bind_int64(recordIssues, 2, Int64(issueCount))
-                bindText(String(decoding: try JSONEncoder().encode(Array(issues.prefix(100))), as: UTF8.self), 3, recordIssues)
-                try step(recordIssues)
-            }
+            try recordListingIssues(parent: parent, count: issueCount, issues: issues)
             let statement = try prepare("INSERT OR REPLACE INTO trim(parent,epoch,revision,full_generation) VALUES(?,?,?,?)")
             defer { sqlite3_finalize(statement) }
             bind(parent, 1, statement); sqlite3_bind_int64(statement, 2, completedEpoch)
             sqlite3_bind_int64(statement, 3, expectedRevision); sqlite3_bind_int64(statement, 4, expectedFullGeneration ?? -1)
             try step(statement)
+            try persistAsyncCommit(asyncCommit)
             try exec("COMMIT")
             #if ORBIT_TESTING
             if epoch == nil { Self.testListingCommit?("empty-committed") }

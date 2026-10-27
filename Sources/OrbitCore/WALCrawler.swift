@@ -15,6 +15,16 @@ final class DurableCrawler {
     var forceFallback = false
     var reusableListing: ((ListingStage.QueuedDirectory) throws -> StageReusableListing?)?
     var preferredDirectory: (() -> Data?)?
+    private let asyncLock = NSLock()
+    private var asyncProducer: AsyncListingProducer?
+    private var asyncActive = false
+    private var asyncListing: (path: Data, epoch: Int64?, batches: Int, skipped: Bool)?
+    private var asyncWriterCursor: SecureDirectoryCursor?
+    var asyncInventory: PendingInventoryMailbox? {
+        asyncLock.lock(); defer { asyncLock.unlock() }
+        guard let mailbox = asyncProducer?.mailbox, !mailbox.isCancelled else { return nil }
+        return mailbox
+    }
     #if ORBIT_TESTING
     var testFallbackAfterFirstBuffer: (() -> Void)?
     var testBeforeListing: (() -> Void)?
@@ -42,7 +52,133 @@ final class DurableCrawler {
         try store.initializeMirrorRoot(url: self.rootURL, identity: root.identity)
     }
 
-    deinit { store.close() }
+    deinit { cancelAsyncDiscovery(); store.close() }
+
+    @discardableResult
+    func startAsyncDiscovery(deferDirectory: ((Data) -> Bool)? = nil, byteLimit: Int = 128 * 1024 * 1024,
+                             frontierLimit: Int = 4096, onAccepted: @escaping () -> Void = {}) throws -> Bool {
+        guard !forceFallback, !cancellation.isCancelled,
+              try store.canCompleteFreshListing(parent: rootPath),
+              try store.dirtyRevision(parent: rootPath) == 0,
+              try store.fullRefreshState().generation == 0 else { return false }
+        #if ORBIT_TESTING
+        if testBeforeListing != nil || testFallbackAfterFirstBuffer != nil { return false }
+        #endif
+        let producer = try AsyncListingProducer(rootURL: rootURL, rootIdentity: root.identity,
+            cancellation: cancellation, excludedDirectories: excludedDirectories, excludedPaths: excludedPaths,
+            deferDirectory: deferDirectory, preferredDirectory: preferredDirectory, byteLimit: byteLimit, frontierLimit: frontierLimit, onAccepted: onAccepted)
+        asyncLock.lock()
+        guard asyncProducer == nil else { asyncLock.unlock(); return false }
+        asyncProducer = producer; asyncActive = true
+        asyncLock.unlock()
+        producer.start()
+        return true
+    }
+
+    func cancelAsyncDiscovery() {
+        asyncLock.lock(); asyncActive = false; let producer = asyncProducer; asyncLock.unlock()
+        producer?.cancel()
+    }
+
+    var hasActiveAsyncDiscovery: Bool {
+        asyncLock.lock(); defer { asyncLock.unlock() }; return asyncActive
+    }
+
+    // One writer step consumes one transaction group; callbacks may invalidate the remaining queue.
+    func stepAsync(beforeAccounting: (() throws -> Void)? = nil, onRecordCount: ((Int) -> Void)? = nil,
+                   onBatch: ((Data, Int) throws -> Void)? = nil, onListingComplete: (() -> Void)? = nil,
+                   onListingStart: ((Data, String) -> Void)? = nil, onListingEnd: (() -> Void)? = nil) throws -> Bool {
+        // Cancellation may originate on another thread; cursor teardown stays on the writer.
+        defer { if !hasActiveAsyncDiscovery { asyncWriterCursor = nil } }
+        do {
+            return try consumeAsync(beforeAccounting: beforeAccounting, onRecordCount: onRecordCount,
+                onBatch: onBatch, onListingComplete: onListingComplete,
+                onListingStart: onListingStart, onListingEnd: onListingEnd)
+        } catch { cancelAsyncDiscovery(); throw error }
+    }
+
+    private func consumeAsync(beforeAccounting: (() throws -> Void)?, onRecordCount: ((Int) -> Void)?,
+                              onBatch: ((Data, Int) throws -> Void)?, onListingComplete: (() -> Void)?,
+                              onListingStart: ((Data, String) -> Void)?, onListingEnd: (() -> Void)?) throws -> Bool {
+        guard !cancellation.isCancelled else { cancelAsyncDiscovery(); throw CancellationError() }
+        guard hasActiveAsyncDiscovery, let mailbox = asyncInventory else { return false }
+        let pending = mailbox.next(maxRecords: asyncListing == nil ? 128 : writeChunkSize)
+        guard let first = pending.first, let last = pending.last else {
+            if mailbox.isDrained || mailbox.isCancelled {
+                asyncLock.lock(); asyncActive = false; asyncLock.unlock()
+                asyncListing = nil
+                return false
+            }
+            return true
+        }
+        try root.validate(url: rootURL)
+        onListingStart?(first.parentPath, "\(first.parentIdentity.device):\(first.parentIdentity.inode)")
+        defer { onListingEnd?() }
+        guard try store.fullRefreshState().generation == 0 else { cancelAsyncDiscovery(); return true }
+        if asyncListing == nil {
+            var skipped = false
+            if let directory = try store.directory(path: first.parentPath),
+               directory.device == first.parentIdentity.device, directory.inode == first.parentIdentity.inode {
+                do {
+                    if asyncWriterCursor == nil { asyncWriterCursor = try SecureDirectoryCursor(root: root, rootURL: rootURL) }
+                    let descriptor = try asyncWriterCursor!.openDirectory(first.components)
+                    close(descriptor)
+                }
+                catch { skipped = true }
+            } else { skipped = true }
+            asyncListing = (first.parentPath, nil, 0, skipped)
+        }
+        guard var listing = asyncListing, listing.path == first.parentPath else {
+            cancelAsyncDiscovery(); return true
+        }
+        let records = pending.flatMap(\.records)
+        let commit = AsyncInventoryCommit(generation: mailbox.generation, sequence: last.sequence)
+        var completed = false
+        let ended = last.completion != nil || last.failure != nil
+        do {
+            if listing.skipped {
+                try store.acknowledgeAsync(commit)
+            } else {
+                if let completion = last.completion, listing.epoch == nil, records.count < 128 {
+                    completed = try store.completeFreshListing(parent: first.parentPath, records: records,
+                        rootDevice: root.identity.device, expectedRevision: 0, expectedFullGeneration: 0,
+                        issueCount: completion.issueCount, issues: completion.issues, asyncCommit: commit)
+                }
+                if !completed {
+                    if !records.isEmpty || (last.completion == nil && last.failure == nil) {
+                        listing.epoch = try store.append(parent: first.parentPath, epoch: listing.epoch,
+                            records: records, rootDevice: root.identity.device, asyncCommit: commit)
+                    }
+                    if let completion = last.completion {
+                        completed = try store.finish(parent: first.parentPath, epoch: listing.epoch,
+                            expectedRevision: 0, expectedFullGeneration: 0, issueCount: completion.issueCount,
+                            issues: completion.issues, asyncCommit: commit)
+                    } else if last.failure != nil && records.isEmpty {
+                        try store.acknowledgeAsync(commit)
+                    }
+                }
+            }
+        } catch ListingStage.Reconcile.pruneRequired {
+            listing.skipped = true
+            try store.acknowledgeAsync(commit)
+        } catch { cancelAsyncDiscovery(); throw error }
+        listing.batches += 1
+        asyncListing = ended ? nil : listing
+        onRecordCount?(records.count)
+        do {
+            try beforeAccounting?()
+            while try store.reconcileLinksChunk(cancellation: cancellation) { }
+        } catch { cancelAsyncDiscovery(); throw error }
+        mailbox.acknowledge(through: last.sequence)
+        do { try onBatch?(first.parentPath, listing.batches) }
+        catch StreamingBulkDirectory.Failure.needsFallback {
+            cancelAsyncDiscovery()
+            if completed { try store.markDirty(parent: first.parentPath) }
+            return true
+        } catch { cancelAsyncDiscovery(); throw error }
+        if completed { onListingComplete?() }
+        return true
+    }
 
     func markChanged(directory: String) throws {
         var path = Data(directory.utf8)
@@ -67,7 +203,14 @@ final class DurableCrawler {
               onRecordCount: ((Int) -> Void)? = nil, onBatch: ((Data, Int) throws -> Void)? = nil,
               onListingComplete: (() -> Void)? = nil,
               onListingStart: ((Data, String) -> Void)? = nil, onListingEnd: (() -> Void)? = nil) throws -> Bool {
-        guard !cancellation.isCancelled else { throw CancellationError() }
+        guard !cancellation.isCancelled else { asyncWriterCursor = nil; cancelAsyncDiscovery(); throw CancellationError() }
+        if hasActiveAsyncDiscovery {
+            if maxBatches != nil { cancelAsyncDiscovery() }
+            else if try stepAsync(beforeAccounting: beforeAccounting, onRecordCount: onRecordCount, onBatch: onBatch,
+                                 onListingComplete: onListingComplete, onListingStart: onListingStart,
+                                 onListingEnd: onListingEnd) { return true }
+        }
+        asyncWriterCursor = nil
         try root.validate(url: rootURL)
         if try store.markFullRefreshChunk() { return true }
         if try store.pruneOneChunk() { return true }
@@ -129,7 +272,7 @@ final class DurableCrawler {
         #if ORBIT_TESTING
         testBeforeListing?()
         #endif
-        let revision = try store.dirtyRevision(parent: directory.path)
+        var revision = try store.dirtyRevision(parent: directory.path)
         let fullGeneration = try store.fullRefreshState().generation
         // Commit the new epoch with its first batch, or with the trim marker for an empty listing.
         var epoch: Int64?
@@ -138,6 +281,12 @@ final class DurableCrawler {
         var listingIssues: [String] = []
         var listingIssueCount = 0
         var lastCommit = ProcessInfo.processInfo.systemUptime
+        var bufferingFreshListing = false
+        if maxBatches == nil && revision == 0 && fullGeneration == 0,
+           directory.path != rootPath, preferredDirectory?() != directory.path {
+            bufferingFreshListing = try store.canCompleteFreshListing(parent: directory.path)
+        }
+        var completedFreshListing = false
         func included(_ records: [FileMetadata]) -> [FileMetadata] {
             records.filter { record in
                 guard record.isDirectory else { return true }
@@ -147,12 +296,8 @@ final class DurableCrawler {
                 return !excludedPaths.contains(child) && !excludedDirectories.contains(DirectoryIdentity(device: record.device, inode: record.inode))
             }
         }
-        func commitPending(source: StageReuseSource? = nil) throws {
-            guard !pending.isEmpty else { return }
-            let append = { try self.store.append(parent: directory.path, epoch: epoch, records: pending, rootDevice: self.root.identity.device) }
-            epoch = try source.map { try $0.commit(append) } ?? append()
-            onRecordCount?(pending.count)
-            pending.removeAll(keepingCapacity: true)
+        func accountCommittedBatch(_ count: Int) throws {
+            onRecordCount?(count)
             try beforeAccounting?()
             while try store.reconcileLinksChunk(cancellation: cancellation) { }
             batches += 1
@@ -160,17 +305,48 @@ final class DurableCrawler {
             if let maxBatches, batches >= maxBatches { throw Interrupt.afterBatch }
             lastCommit = ProcessInfo.processInfo.systemUptime
         }
+        func commitPending(source: StageReuseSource? = nil, limit: Int? = nil) throws {
+            guard !pending.isEmpty else { return }
+            let records = limit.map { Array(pending.prefix($0)) } ?? pending
+            let append = { try self.store.append(parent: directory.path, epoch: epoch, records: records, rootDevice: self.root.identity.device) }
+            epoch = try source.map { try $0.commit(append) } ?? append()
+            if records.count == pending.count { pending.removeAll(keepingCapacity: true) }
+            else { pending.removeFirst(records.count) }
+            try accountCommittedBatch(records.count)
+        }
         func list(forceFallback: Bool, testFallback: (() -> Void)?) throws {
             try StreamingBulkDirectory.stream(descriptor, url: URL(fileURLWithPath: path, isDirectory: true),
                 cancellation: cancellation, progress: { _, _ in }, issue: {
                     listingIssueCount += 1
                     if listingIssues.count < 100 { listingIssues.append($0) }
                 }, forceFallback: forceFallback, testFallbackAfterFirstBuffer: testFallback) { records in
-                    pending.append(contentsOf: included(records))
+                    let accepted = included(records)
+                    pending.append(contentsOf: accepted)
+                    if bufferingFreshListing {
+                        let isPreferred = preferredDirectory?() == directory.path
+                        // A short batch is emitted at EOF; a full batch must be visible before the next filesystem read.
+                        if records.count < 128 && pending.count < 128 && !isPreferred { return }
+                        bufferingFreshListing = false
+                        try commitPending(limit: 128)
+                    }
                     if batches == 0 || pending.count >= writeChunkSize || ProcessInfo.processInfo.systemUptime - lastCommit >= 0.05 {
                         try commitPending()
                     }
                 }
+            if bufferingFreshListing {
+                try root.validate(url: rootURL)
+                if try store.completeFreshListing(parent: directory.path, records: pending, rootDevice: root.identity.device,
+                                                  expectedRevision: revision, expectedFullGeneration: fullGeneration,
+                                                  issueCount: listingIssueCount, issues: listingIssues) {
+                    completedFreshListing = true
+                    bufferingFreshListing = false
+                    let count = pending.count
+                    pending.removeAll(keepingCapacity: true)
+                    if count > 0 { try accountCommittedBatch(count) }
+                    return
+                }
+                bufferingFreshListing = false
+            }
             try commitPending()
         }
         var reused: StageReusableListing?
@@ -179,6 +355,7 @@ final class DurableCrawler {
                 reused = try reusableListing(directory)
             }
             if let listing = reused {
+                bufferingFreshListing = false
                 do {
                     while true {
                         guard !cancellation.isCancelled, !Task<Never, Never>.isCancelled else { throw CancellationError() }
@@ -205,12 +382,22 @@ final class DurableCrawler {
             do { if reused == nil { try list(forceFallback: forceFallback, testFallback: testFallback) } }
             catch StreamingBulkDirectory.Failure.needsFallback {
                 pending.removeAll(keepingCapacity: true); listingIssues.removeAll(keepingCapacity: true); listingIssueCount = 0
+                if completedFreshListing {
+                    try store.markDirty(parent: directory.path)
+                    revision = try store.dirtyRevision(parent: directory.path)
+                    completedFreshListing = false
+                }
                 epoch = nil
+                lastCommit = ProcessInfo.processInfo.systemUptime
                 try list(forceFallback: true, testFallback: nil)
             }
         } catch ListingStage.Reconcile.pruneRequired { return true }
         catch { return try recoverDirectory(error) }
         try root.validate(url: rootURL)
+        if completedFreshListing {
+            onListingComplete?()
+            return true
+        }
         let finish = { try self.store.finish(parent: directory.path, epoch: epoch, expectedRevision: revision,
                                             expectedFullGeneration: fullGeneration, issueCount: listingIssueCount, issues: listingIssues) }
         let finished: Bool

@@ -2,6 +2,13 @@ import Darwin
 import Foundation
 
 package enum StreamingBulkDirectory {
+    // One worker can reuse the native buffer across listings; concurrent workers need separate buffers.
+    package final class Buffer {
+        fileprivate let capacity = 256 * 1024
+        fileprivate let storage = UnsafeMutableRawPointer.allocate(byteCount: 256 * 1024, alignment: 8)
+        deinit { storage.deallocate() }
+    }
+
     enum Failure: Error { case needsFallback }
     static let common = ATTR_CMN_RETURNED_ATTRS | UInt32(ATTR_CMN_ERROR | ATTR_CMN_NAME |
                                ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE | ATTR_CMN_FILEID)
@@ -11,6 +18,7 @@ package enum StreamingBulkDirectory {
                      progress: (Int, Int64) -> Void, issue: (String) -> Void,
                      forceFallback: Bool = false,
                      testFallbackAfterFirstBuffer: (() -> Void)? = nil,
+                     buffer reusableBuffer: Buffer? = nil,
                      batch: ([FileMetadata]) throws -> Void) throws {
         if forceFallback {
             try fallback(descriptor, url: url, cancellation: cancellation, progress: progress, issue: issue, batch: batch)
@@ -19,9 +27,10 @@ package enum StreamingBulkDirectory {
         var attributes = attrlist(bitmapcount: UInt16(ATTR_BIT_MAP_COUNT), reserved: 0,
                                   commonattr: common, volattr: 0, dirattr: UInt32(ATTR_DIR_MOUNTSTATUS),
                                   fileattr: file, forkattr: 0)
-        let capacity = 256 * 1024
-        let buffer = UnsafeMutableRawPointer.allocate(byteCount: capacity, alignment: 8)
-        defer { buffer.deallocate() }
+        let ownedBuffer = reusableBuffer ?? Buffer()
+        defer { withExtendedLifetime(ownedBuffer) {} }
+        let capacity = ownedBuffer.capacity
+        let buffer = ownedBuffer.storage
         var entries: [FileMetadata] = []
         var bytes: Int64 = 0
         var itemCount = 0

@@ -51,6 +51,7 @@ public struct DiskIndexStore: Sendable {
     package static var testSearchIndexByteLimit: Int?
     package static var testSearchSQLiteProgress: (@Sendable () -> Void)?
     package static var testEqualSizeSearchSkip: (@Sendable () -> Void)?
+    package static var testAfterPendingWatermark: (@Sendable () -> Void)?
     package static var testBeforePublish: (@Sendable () -> Void)?
     package static var testBeforeRecoveryPublish: (@Sendable () -> Void)?
     package static var testDuringRefreshAncestors: (@Sendable () -> Void)?
@@ -103,6 +104,11 @@ public struct DiskIndexStore: Sendable {
                   let node = try readNode(rootPath, db: db), node.isDirectory else { return nil }
             return snapshot
         } catch { return nil }
+    }
+
+    func hasSavedSnapshotFile(for root: URL) -> Bool {
+        var presence = stat()
+        return lstat(databaseURL(for: root).path, &presence) == 0
     }
 
     public func removalCursor(snapshot: IndexSnapshot, cancellation: ScanCancellation = ScanCancellation()) throws -> RemovalCursor? {
@@ -349,28 +355,49 @@ public struct DiskIndexStore: Sendable {
     }
 
     public func stagedConfirmsMissingDirectory(_ path: String, snapshot: IndexSnapshot) throws -> Bool {
+        try stagedConfirmsMissingDirectory(path, snapshot: snapshot, pending: nil)
+    }
+
+    func stagedConfirmsMissingDirectory(_ path: String, snapshot: IndexSnapshot, pending: PendingInventorySnapshot?) throws -> Bool {
         let db = try open(snapshot)
         try db.execute("BEGIN")
         defer { try? db.execute("ROLLBACK") }
+        let inventory = try pendingInventory(pending, db: db, cancellation: nil)
+        defer { withExtendedLifetime(inventory) {} }
+        func finish(_ result: Bool) throws -> Bool {
+            if let pending, !pending.isCurrent() { throw CancellationError() }
+            return result
+        }
         let query = try db.statement("SELECT n.is_dir,COALESCE(d.pending,0) FROM nodes n LEFT JOIN directory_paths own ON own.id=n.id LEFT JOIN directories d ON d.path=CAST(own.path AS BLOB) WHERE n.id=\(Self.lookupIDSQL)")
         var current = Self.path(URL(fileURLWithPath: path))
         var first = true
         while true {
+            try inventory?.validate()
+            if let node = inventory?.node(current, durable: nil) {
+                return try finish(first ? !node.isDirectory : (!node.isDirectory || node.scanState == .complete))
+            }
             try query.bind(Self.lookupValues(current))
             if try query.step() {
                 let directory = query.integer(0) != 0, pending = query.integer(1) != 0
-                return first ? !directory : (!directory || !pending)
+                try inventory?.validate()
+                return try finish(first ? !directory : (!directory || !pending))
             }
             try query.reset()
-            if current == snapshot.rootURL.path || current == "/" { return false }
+            if current == snapshot.rootURL.path || current == "/" { return try finish(false) }
             let parent = URL(fileURLWithPath: current).deletingLastPathComponent().path
-            if parent == current { return false }
+            if parent == current { return try finish(false) }
             current = parent; first = false
         }
     }
 
     public func stagedSearch(query: String, snapshot: IndexSnapshot, revision: UInt64,
                              activeDirectory: (path: Data, identity: String)? = nil, removals: [ScanRemoval], cancellation: ScanCancellation, limit: Int = 300) throws -> (nodes: [DiskNode], count: Int, revision: UInt64, removalsChanged: Bool) {
+        try stagedSearch(query: query, snapshot: snapshot, revision: revision, pending: nil,
+                         activeDirectory: activeDirectory, removals: removals, cancellation: cancellation, limit: limit)
+    }
+
+    func stagedSearch(query: String, snapshot: IndexSnapshot, revision: UInt64, pending: PendingInventorySnapshot?,
+                      activeDirectory: (path: Data, identity: String)? = nil, removals: [ScanRemoval], cancellation: ScanCancellation, limit: Int = 300) throws -> (nodes: [DiskNode], count: Int, revision: UInt64, removalsChanged: Bool) {
         try Task.checkCancellation()
         let needle = Self.fold(query.trimmingCharacters(in: .whitespacesAndNewlines))
         guard !needle.isEmpty else { return ([], 0, revision, false) }
@@ -382,7 +409,8 @@ public struct DiskIndexStore: Sendable {
         db.checkTaskCancellation()
         try db.execute("BEGIN")
         defer { try? db.execute("ROLLBACK") }
-        let sources = try stagedRemovalSources(removals, db: db, cancellation: cancellation)
+        let inventory = try pendingInventory(pending, db: db, cancellation: cancellation)
+        let sources = try stagedRemovalSources(removals, db: db, inventory: inventory, cancellation: cancellation)
         let projection = try DiskRemovalProjection(removals: removals, source: sources, cancellation: cancellation)
         var namePredicate = "instr(n.search_name,?)>0"
         var parameters: [IndexValue] = [.text(needle)]
@@ -394,7 +422,7 @@ public struct DiskIndexStore: Sendable {
         }
         let resultLimit = max(0, min(limit, 10_000))
         var verifiedCount: Int?
-        if removals.isEmpty, prefix != nil, candidates?.ids == nil {
+        if inventory == nil, removals.isEmpty, prefix != nil, candidates?.ids == nil {
             func edge(_ order: String) throws -> Int64? {
                 let row = try db.statement("SELECT n.size FROM (SELECT size,search_name,parent FROM nodes INDEXED BY nodes_by_size ORDER BY size \(order) LIMIT 4096) n WHERE n.parent IS NOT NULL AND \(namePredicate) LIMIT 1")
                 try row.bind(parameters)
@@ -411,7 +439,10 @@ public struct DiskIndexStore: Sendable {
                 }
                 let count = Int(totals.integer(0))
                 try Task.checkCancellation(); try check(cancellation)
-                if resultLimit == 0 { return ([], count, revision, false) }
+                if resultLimit == 0 {
+                    if let pending, !pending.isCurrent() { throw CancellationError() }
+                    return ([], count, revision, false)
+                }
                 if totals.integer(5) == 1 { verifiedCount = count }
             }
         }
@@ -438,7 +469,7 @@ public struct DiskIndexStore: Sendable {
                 result[0] = node; var parent = 0
                 while true { let left = parent * 2 + 1; if left >= result.count { break }; let right = left + 1; let child = right < result.count && worse(result[right], result[left]) ? right : left; if !worse(result[child], result[parent]) { break }; result.swapAt(child, parent); parent = child }
             }
-            if removals.isEmpty && result.count == resultLimit { worstID = result[0].id }
+            if inventory == nil, removals.isEmpty && result.count == resultLimit { worstID = result[0].id }
         }
         while try statement.step() {
             if scanned & 255 == 0 { try Task.checkCancellation(); try check(cancellation) }; scanned += 1
@@ -446,7 +477,7 @@ public struct DiskIndexStore: Sendable {
                   statement.integer(6) >= 0, statement.integer(7) >= 0, statement.integer(8) >= 0 else {
                 throw DiskIndexError.invalid("A staged disk index entry is damaged.")
             }
-            if removals.isEmpty {
+            if inventory == nil, removals.isEmpty {
                 if verifiedCount == nil { count += 1 }
                 if resultLimit == 0 { continue }
                 if result.count == resultLimit && statement.integer(5) < result[0].size {
@@ -456,7 +487,7 @@ public struct DiskIndexStore: Sendable {
             }
             let directory = statement.integer(2) != 0
             let url = URL(fileURLWithPath: path, isDirectory: directory)
-            if removals.isEmpty, result.count == resultLimit, resultLimit > 0,
+            if inventory == nil, removals.isEmpty, result.count == resultLimit, resultLimit > 0,
                statement.integer(5) == result[0].size,
                !url.path.utf8.lexicographicallyPrecedes(worstID.utf8) {
                 #if ORBIT_TESTING
@@ -473,22 +504,35 @@ public struct DiskIndexStore: Sendable {
                 isDirectory: directory, isSymbolicLink: statement.integer(3) != 0, size: statement.integer(5),
                 allocatedSize: statement.integer(6), fileCount: Int(statement.integer(7)), isAccessible: statement.integer(4) != 0,
                 rawAllocatedSize: statement.integer(8), fileIdentity: identity, scanState: state)
-            if removals.isEmpty { retain(raw) }
-            else if let node = try projection.apply(raw, cancellation: cancellation) { count += 1; retain(node) }
+            let combined = inventory?.adjustDurable(raw, path: path) ?? raw
+            if inventory == nil, removals.isEmpty { retain(combined) }
+            else if let node = try projection.apply(combined, cancellation: cancellation) { count += 1; retain(node) }
+        }
+        try inventory?.forEachMatching(needle, check: { try Task.checkCancellation(); try check(cancellation) }) { raw in
+            if let node = try projection.apply(raw, cancellation: cancellation) { count += 1; retain(node) }
         }
         result.sort { worse($1, $0) }
         try Task.checkCancellation()
         try check(cancellation)
+        try inventory?.validate()
+        if let pending, !pending.isCurrent() { throw CancellationError() }
         return (result, count, revision, false)
     }
 
     // All rows in the returned partial view come from one read transaction.
     public func stagedView(path: String?, snapshot: IndexSnapshot, revision: UInt64,
                            activeDirectory: (path: Data, identity: String)? = nil, removals: [ScanRemoval] = [], cancellation: ScanCancellation? = nil) throws -> ScanPreviewView? {
+        try stagedView(path: path, snapshot: snapshot, revision: revision, pending: nil,
+                       activeDirectory: activeDirectory, removals: removals, cancellation: cancellation)
+    }
+
+    func stagedView(path: String?, snapshot: IndexSnapshot, revision: UInt64, pending: PendingInventorySnapshot?,
+                    activeDirectory: (path: Data, identity: String)? = nil, removals: [ScanRemoval] = [], cancellation: ScanCancellation? = nil) throws -> ScanPreviewView? {
         try check(cancellation)
         let db = try open(snapshot, cancellation: cancellation)
         try db.execute("BEGIN")
         defer { try? db.execute("ROLLBACK") }
+        let inventory = try pendingInventory(pending, db: db, cancellation: cancellation)
         let columns = Self.nodeColumns + ",COALESCE(d.pending,0),CASE WHEN e.value IS NULL THEN 0 ELSE 1 END,COALESCE(pd.pending,0)"
         let from = Self.stagedFrom()
         func rows(_ query: IndexStatement) throws -> [DiskNode] {
@@ -517,7 +561,7 @@ public struct DiskIndexStore: Sendable {
             try one.bind(Self.lookupValues(path))
             let found = try rows(one).first
             try one.reset()
-            return found
+            return inventory?.node(path, durable: found) ?? found
         }
         let rootPath = snapshot.rootURL.path
         let target = path.map { Self.path(URL(fileURLWithPath: $0)) } ?? rootPath
@@ -527,10 +571,12 @@ public struct DiskIndexStore: Sendable {
               let root = try node(rootPath), let rawFolder = try node(target), rawFolder.isDirectory else { return nil }
         let childrenQuery = try db.statement("SELECT \(columns)\(from) WHERE n.parent=(SELECT id FROM directory_paths WHERE path=?) ORDER BY n.size DESC,n.name LIMIT ?")
         func children(_ parent: String, limit: Int) throws -> [DiskNode] {
-            try childrenQuery.bind([.text(parent), .integer(Int64(limit))])
+            let durableLimit = inventory?.changesChildrenOrder(parent) == true ? Int.max : limit
+            try childrenQuery.bind([.text(parent), .integer(Int64(durableLimit))])
             let found = try rows(childrenQuery)
             try childrenQuery.reset()
-            return found
+            return try inventory?.children(parent, durable: found, limit: limit,
+                check: { try Task.checkCancellation(); try check(cancellation) }) ?? found
         }
         var budget = 2_000
         func hydrate(_ entry: DiskNode, depth: Int) throws -> DiskNode {
@@ -556,17 +602,19 @@ public struct DiskIndexStore: Sendable {
             ancestors.append(item); current = parent
         }
         let token = cancellation ?? ScanCancellation()
-        let source = try stagedRemovalSources(removals, db: db, cancellation: token)
+        let source = try stagedRemovalSources(removals, db: db, inventory: inventory, cancellation: token)
         let projection = try DiskRemovalProjection(removals: removals, source: source, cancellation: token)
         guard let projectedFolder = try projection.apply(folder, cancellation: token), let projectedRoot = try projection.apply(root, cancellation: token) else { return nil }
         let projectedAncestors = try ancestors.reversed().compactMap { try projection.apply($0, cancellation: token) }
         guard projectedAncestors.count == ancestors.count else { return nil }
         try check(cancellation)
+        try inventory?.validate()
+        if let pending, !pending.isCurrent() { throw CancellationError() }
         return ScanPreviewView(root: targetBytes == rootBytes ? projectedFolder : projectedRoot, folder: projectedFolder, ancestors: projectedAncestors,
                                revision: revision, isListing: rawFolder.scanState != .complete)
     }
 
-    private func stagedRemovalSources(_ removals: [ScanRemoval], db: IndexDatabase,
+    private func stagedRemovalSources(_ removals: [ScanRemoval], db: IndexDatabase, inventory: PendingInventoryRead? = nil,
                                       cancellation: ScanCancellation) throws -> [DiskNode] {
         guard !removals.isEmpty else { return [] }
         let query = try db.statement("SELECT \(Self.nodeColumns)\(Self.nodeFrom) WHERE n.id=\(Self.lookupIDSQL)")
@@ -575,12 +623,38 @@ public struct DiskIndexStore: Sendable {
         for removal in removals {
             try check(cancellation)
             try query.bind(Self.lookupValues(removal.path))
-            let node = try readNodes(query, cancellation: cancellation).first
+            let durable = try readNodes(query, cancellation: cancellation).first
             try query.reset()
+            let node = inventory?.node(removal.path, durable: durable) ?? durable
             if let node, node.fileIdentity == removal.identity,
                seen.insert(Data(removal.path.utf8)).inserted { nodes.append(node) }
         }
         return nodes
+    }
+
+    private func pendingInventory(_ snapshot: PendingInventorySnapshot?, db: IndexDatabase,
+                                  cancellation: ScanCancellation?) throws -> PendingInventoryRead? {
+        guard let snapshot else { return nil }
+        guard snapshot.isCurrent() else { throw CancellationError() }
+        var sequence: Int64 = 0
+        if try db.integer("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='orbit_async_progress'") != 0 {
+            let row = try db.statement("SELECT generation,sequence FROM orbit_async_progress WHERE singleton=1")
+            if try row.step(), row.text(0) == snapshot.generation {
+                guard row.integer(1) >= 0 else { throw DiskIndexError.invalid("The live mapping checkpoint is damaged.") }
+                sequence = row.integer(1)
+            }
+        }
+        #if ORBIT_TESTING
+        Self.testAfterPendingWatermark?()
+        #endif
+        let links = try db.statement("SELECT \(Self.nodeColumns)\(Self.nodeFrom) WHERE n.is_dir=0 AND n.dev=? AND n.inode=?")
+        let inventory = try PendingInventoryRead(snapshot: snapshot, committedSequence: sequence, durableLinks: { identity in
+            try links.bind([.integer(Int64(identity.device)), .integer(Int64(bitPattern: identity.inode))])
+            let rows = try readNodes(links, cancellation: cancellation)
+            try links.reset()
+            return rows
+        }, check: { try Task.checkCancellation(); try check(cancellation) })
+        return inventory.isEmpty ? nil : inventory
     }
 
     public func loadFolder(path: String, snapshot: IndexSnapshot, cancellation: ScanCancellation? = nil) throws -> DiskNode {
@@ -845,8 +919,14 @@ public struct DiskIndexStore: Sendable {
     }
 
     private func databaseURL(for root: URL) -> URL {
-        let digest = SHA256.hash(data: Data(Self.path(root).utf8)).map { String(format: "%02x", $0) }.joined()
-        return directory.appendingPathComponent(digest + ".sqlite")
+        let digest = SHA256.hash(data: Data(Self.path(root).utf8))
+        let digits = Array("0123456789abcdef".utf8)
+        var name = [UInt8](repeating: 0, count: 64)
+        for (offset, byte) in digest.enumerated() {
+            name[offset * 2] = digits[Int(byte >> 4)]
+            name[offset * 2 + 1] = digits[Int(byte & 15)]
+        }
+        return directory.appendingPathComponent(String(decoding: name, as: UTF8.self) + ".sqlite")
     }
 
     private static func path(_ url: URL) -> String { url.standardizedFileURL.path }
