@@ -1,0 +1,42 @@
+name: Checks
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  check:
+    name: ${{ matrix.name }}
+    runs-on: macos-26
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: core
+            name: Scanner, index, and updater
+          - suite: native
+            name: App model and native interaction
+          - suite: search
+            name: Preview and search
+          - suite: sessions
+            name: Mapping sessions and collection queue
+          - suite: mapping
+            name: Mapping recovery and reuse
+          - suite: staging
+            name: Durable staging and journal
+          - suite: removal
+            name: Removal and folder transactions
+          - suite: rendering
+            name: Graph rendering and layouts
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Show build toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: Run ${{ matrix.name }} checks
+        run: ./scripts/check-ci.sh '${{ matrix.suite }}'

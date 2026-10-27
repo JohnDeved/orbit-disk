@@ -1,6 +1,10 @@
 #!/bin/zsh
 set -euo pipefail
 cd "${0:A:h}"
+if (( $# > 1 )) || [[ -n "${1:-}" && "${1:-}" != --native-only ]]; then
+  print -u2 'Usage: ./check-app.sh [--native-only]'
+  exit 2
+fi
 swift build -c release --target OrbitCore -Xswiftc -DORBIT_TESTING
 build_path=$(swift build -c release --show-bin-path)
 package_name=$(python3 scripts/swift-package-name.py "$build_path/description.json")
@@ -49,18 +53,20 @@ swiftc -O -swift-version 5 -target "$target" -package-name OrbitDisk -I Sources/
   Tests/OrbitPreviewCancellationChecks/main.swift -o "$build_path/OrbitPreviewCancellationChecks"
 "$build_path/OrbitPreviewCancellationChecks"
 
-./check-preview-batches.sh
-./check-preview-search.sh
-./check-stage-search-fast.sh
-./check-saved-search.sh
-./check-session.sh
-./check-resumable.sh
-./check-mapping-reuse.sh
-./check-stage.sh
-./check-removal-journal.sh
-./check-stage-removal.sh
-./check-durable-removal.sh
-./check-folder-transaction.sh
+if [[ "${1:-}" != --native-only ]]; then
+  ./check-preview-batches.sh
+  ./check-preview-search.sh
+  ./check-stage-search-fast.sh
+  ./check-saved-search.sh
+  ./check-session.sh
+  ./check-resumable.sh
+  ./check-mapping-reuse.sh
+  ./check-stage.sh
+  ./check-removal-journal.sh
+  ./check-stage-removal.sh
+  ./check-durable-removal.sh
+  ./check-folder-transaction.sh
+fi
 
 swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING \
   Sources/OrbitDisk/DiskChangeMonitor.swift Tests/OrbitMonitorChecks.swift \

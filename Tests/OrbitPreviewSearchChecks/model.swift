@@ -62,13 +62,14 @@ final class OrderRecorder: @unchecked Sendable {
         precondition(wideModel.query == missing && progressGate.waiting)
         var armed = false, immediateStateCorrect = false
         let priorRows = wideModel.searchResults.map { Array($0.id.utf8) }
+        let reentrantQuery = wideModel.query == "entry-0000" ? "entry-0002" : "entry-0000"
         let observer = wideModel.objectWillChange.sink {
-            if armed && wideModel.query == "entry-0000" {
+            if armed && wideModel.query == reentrantQuery {
                 armed = false; wideModel.query = "entry-0001"
                 immediateStateCorrect = wideModel.isSearching && wideModel.searchResults.map { Array($0.id.utf8) } == priorRows
             }
         }
-        wideModel.query = "entry-0000"; armed = true
+        wideModel.query = reentrantQuery; armed = true
         try await wait("reentrant search change") { wideModel.query == "entry-0001" && !wideModel.isSearching && wideModel.searchResults.contains { $0.name == "entry-0001" } }
         precondition(immediateStateCorrect)
         withExtendedLifetime(observer) {}
