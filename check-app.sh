@@ -19,7 +19,7 @@ temp_root=${TMPDIR:-/tmp}
 fixture=$(mktemp -d "${temp_root%/}/OrbitAppChecks.XXXXXX")
 trap 'rm -rf "$fixture"' EXIT
 "$build_path/OrbitAppChecks" "$fixture"
-swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name "$package_name" \
+swiftc -assert-config Debug -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name "$package_name" \
   -I "$build_path/Modules" -I Sources/CSQLite \
   Sources/OrbitDisk/DiskModel.swift Sources/OrbitDisk/DiskChangeMonitor.swift \
   Sources/OrbitDisk/CollectionCoverage.swift Sources/OrbitDisk/PreparedMapHoverGroup.swift \
@@ -27,7 +27,7 @@ swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING 
   "$build_path/OrbitCore.build/"*.swift.o -o "$build_path/OrbitLargeCollectionChecks"
 mkdir -p "$fixture/large-collection"
 "$build_path/OrbitLargeCollectionChecks" "$fixture/large-collection"
-swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name "$package_name" \
+swiftc -assert-config Debug -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name "$package_name" \
   -I "$build_path/Modules" -I Sources/CSQLite \
   Sources/OrbitDisk/DiskModel.swift Sources/OrbitDisk/DiskChangeMonitor.swift \
   Sources/OrbitDisk/CollectionCoverage.swift Sources/OrbitDisk/PreparedMapHoverGroup.swift \
@@ -35,7 +35,7 @@ swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING 
   "$build_path/OrbitCore.build/"*.swift.o -o "$build_path/OrbitCollectionRemovalChecks"
 mkdir -p "$fixture/collection-removal"
 "$build_path/OrbitCollectionRemovalChecks" "$fixture/collection-removal"
-swiftc -O -swift-version 5 -target "$target" \
+swiftc -assert-config Debug -O -swift-version 5 -target "$target" \
   -I "$build_path/Modules" -I Sources/CSQLite \
   Sources/OrbitDisk/SunburstView.swift Sources/OrbitDisk/MapInteractionView.swift \
   Sources/OrbitDisk/ListRowInteractionView.swift \
@@ -43,12 +43,12 @@ swiftc -O -swift-version 5 -target "$target" \
   Sources/OrbitDisk/PointingCursor.swift Tests/OrbitInteractionChecks/main.swift \
   "$build_path/OrbitCore.build/"*.swift.o -o "$build_path/OrbitInteractionChecks"
 "$build_path/OrbitInteractionChecks"
-swiftc -parse-as-library -O -swift-version 5 -target "$target" \
+swiftc -assert-config Debug -parse-as-library -O -swift-version 5 -target "$target" \
   Sources/OrbitDisk/ListHoverTracking.swift Tests/OrbitListHoverChecks.swift \
   -o "$build_path/OrbitListHoverChecks"
 "$build_path/OrbitListHoverChecks"
 
-swiftc -O -swift-version 5 -target "$target" -package-name OrbitDisk -I Sources/CSQLite \
+swiftc -assert-config Debug -O -swift-version 5 -target "$target" -package-name OrbitDisk -I Sources/CSQLite \
   Sources/OrbitCore/*.swift \
   Tests/OrbitPreviewCancellationChecks/main.swift -o "$build_path/OrbitPreviewCancellationChecks"
 "$build_path/OrbitPreviewCancellationChecks"
@@ -68,7 +68,7 @@ if [[ "${1:-}" != --native-only ]]; then
   ./check-folder-transaction.sh
 fi
 
-swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING \
+swiftc -assert-config Debug -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING \
   Sources/OrbitDisk/DiskChangeMonitor.swift Tests/OrbitMonitorChecks.swift \
   -o "$build_path/OrbitMonitorChecks"
 "$build_path/OrbitMonitorChecks"

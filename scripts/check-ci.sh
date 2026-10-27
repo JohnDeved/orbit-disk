@@ -7,6 +7,7 @@ if (( $# != 1 )); then
 fi
 case "$1" in
   core)
+    swift package resolve
     python3 scripts/test-release.py
     python3 Tests/test_update_copy.py
     swift run -c release OrbitCoreChecks

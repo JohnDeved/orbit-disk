@@ -45,11 +45,11 @@ os.link(root / "file-0000", root / "file-hardlink")
 (root / "file-folder" / "file-child").write_bytes(b"abc")
 PY
 target="$(uname -m)-apple-macosx14.0"
-swiftc -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
+swiftc -assert-config Debug -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
   -emit-library -emit-module -module-name OrbitCore -I Sources/CSQLite \
   Sources/OrbitCore/*.swift -o "$build/libOrbitCore.dylib"
 for suite in cancel concurrent damage parity normalized equal-cancel; do
-  swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
+  swiftc -assert-config Debug -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
     -I "$build" -I Sources/CSQLite -L "$build" -lOrbitCore -Xlinker -rpath -Xlinker "$build" \
     "Tests/OrbitStageSearchFastChecks/$suite.swift" -o "$build/$suite"
   case "$suite" in

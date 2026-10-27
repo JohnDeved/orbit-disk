@@ -7,14 +7,14 @@ trap 'rm -rf "$fixture"' EXIT
 build="$fixture/build"
 mkdir -p "$build"
 target="$(uname -m)-apple-macosx14.0"
-swiftc -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
+swiftc -assert-config Debug -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
   -emit-library -emit-module -module-name OrbitCore -I Sources/CSQLite \
   Sources/OrbitCore/*.swift -o "$build/libOrbitCore.dylib"
-swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
+swiftc -assert-config Debug -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
   -I "$build" -I Sources/CSQLite -L "$build" -lOrbitCore \
   -Xlinker -rpath -Xlinker "$build" Tests/OrbitPreviewSearchChecks/core.swift -o "$build/CoreChecks"
 "$build/CoreChecks" "$fixture"
-swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
+swiftc -assert-config Debug -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
   -I "$build" -I Sources/CSQLite -L "$build" -lOrbitCore \
   -Xlinker -rpath -Xlinker "$build" \
   Sources/OrbitDisk/DiskModel.swift Sources/OrbitDisk/DiskChangeMonitor.swift \
@@ -22,7 +22,7 @@ swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING 
   Sources/OrbitDisk/IndexRefreshPlanner.swift Tests/OrbitPreviewSearchChecks/model.swift -o "$build/ModelChecks"
 "$build/ModelChecks" "$fixture"
 mkdir -p "$fixture/interruption"
-swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
+swiftc -assert-config Debug -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
   -I "$build" -I Sources/CSQLite -L "$build" -lOrbitCore \
   -Xlinker -rpath -Xlinker "$build" \
   Sources/OrbitDisk/DiskModel.swift Sources/OrbitDisk/DiskChangeMonitor.swift \
@@ -30,7 +30,7 @@ swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING 
   Sources/OrbitDisk/IndexRefreshPlanner.swift Tests/OrbitSearchInterruptionChecks.swift -o "$build/InterruptionChecks"
 "$build/InterruptionChecks" "$fixture/interruption"
 mkdir -p "$fixture/lifetime"
-swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
+swiftc -assert-config Debug -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
   -I "$build" -I Sources/CSQLite -L "$build" -lOrbitCore \
   -Xlinker -rpath -Xlinker "$build" \
   Sources/OrbitDisk/DiskModel.swift Sources/OrbitDisk/DiskChangeMonitor.swift \

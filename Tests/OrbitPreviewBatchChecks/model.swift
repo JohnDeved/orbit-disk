@@ -24,6 +24,7 @@ final class Gate: @unchecked Sendable {
         while !condition() { if Date()>deadline { fatalError("timeout: \(description)") }; try await Task.sleep(nanoseconds: 3_000_000) }
     }
     @MainActor static func main() async throws {
+        setbuf(stdout, nil)
         let base=URL(fileURLWithPath: CommandLine.arguments[1],isDirectory:true).standardizedFileURL
         let root=base.appendingPathComponent("model-files", isDirectory:true)
         let fm=FileManager.default

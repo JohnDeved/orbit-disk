@@ -5,7 +5,7 @@ swift build -c release --target OrbitCore
 build_path=$(swift build -c release --show-bin-path)
 package_name=$(python3 scripts/swift-package-name.py "$build_path/description.json")
 framework_path="$PWD/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64"
-swiftc -parse-as-library -O -swift-version 5 -package-name "$package_name" \
+swiftc -assert-config Debug -parse-as-library -O -swift-version 5 -package-name "$package_name" \
   -target "$(uname -m)-apple-macosx14.0" \
   -I "$build_path/Modules" -I Sources/CSQLite -F "$framework_path" \
   -Xlinker -rpath -Xlinker "$framework_path" \

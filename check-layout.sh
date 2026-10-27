@@ -5,7 +5,7 @@ checks_path="$PWD/.build/layout-checks"
 build_path="$checks_path/core"
 mkdir -p "$build_path"
 target="$(uname -m)-apple-macosx14.0"
-swiftc -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
+swiftc -assert-config Debug -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
   -emit-library -emit-module -module-name OrbitCore -I Sources/CSQLite \
   Sources/OrbitCore/*.swift -o "$build_path/libOrbitCore.dylib"
 python3 Tests/OrbitLayoutChecks/make-probes.py "$checks_path/ContentView.swift"
@@ -14,7 +14,7 @@ app_sources=(${app_sources:#*/ContentView.swift})
 app_sources=(${app_sources:#*/FileRowView.swift})
 app_sources=(${app_sources:#*/OrbitDiskApp.swift})
 app_sources=(${app_sources:#*/AppUpdater.swift})
-swiftc -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
+swiftc -assert-config Debug -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
   -module-cache-path "$PWD/.build/module-cache" \
   -I "$build_path" -I Sources/CSQLite -L "$build_path" -lOrbitCore \
   -Xlinker -rpath -Xlinker "$build_path" \
