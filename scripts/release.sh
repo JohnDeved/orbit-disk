@@ -54,14 +54,19 @@ if $prepare_only; then
   printf 'Verified release assets: %s\n' "$output"
   exit 0
 fi
+: > "$staging/release-notes.md"
+if [[ -f "docs/releases/$tag.md" ]]; then
+  cat "docs/releases/$tag.md" >> "$staging/release-notes.md"
+  printf '\n\n' >> "$staging/release-notes.md"
+fi
 if [[ "$signing_mode" == adhoc ]]; then
-  cat > "$staging/release-notes.md" <<'NOTES'
+  cat >> "$staging/release-notes.md" <<'NOTES'
 For macOS 14 or later, on Apple silicon and Intel Macs.
 
 This build is not signed with an Apple Developer ID certificate or notarized by Apple. macOS may block the first launch; initial approval in System Settings > Privacy & Security is required. Future in-app updates are verified with Orbit Disk's Sparkle signing key.
 NOTES
 else
-  cat > "$staging/release-notes.md" <<'NOTES'
+  cat >> "$staging/release-notes.md" <<'NOTES'
 For macOS 14 or later, on Apple silicon and Intel Macs. The app is signed with Developer ID and notarized by Apple; the disk image itself is not signed or notarized. In-app updates are verified with Orbit Disk's Sparkle signing key.
 NOTES
 fi

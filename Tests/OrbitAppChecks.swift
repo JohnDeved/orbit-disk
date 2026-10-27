@@ -735,8 +735,13 @@ final class CollectionGate: @unchecked Sendable {
         try Data([4, 5]).write(to: root.appendingPathComponent("new.bin"))
 
         let cached = DiskModel(cacheDirectory: cache, preferences: preferences)
+        let reconciliationGate = PreviewGate()
+        defer { reconciliationGate.release() }
+        cached.testBeforeScannerStart = { reconciliationGate.pauseOnce() }
         cached.scan(root)
-        try await wait("cached root before journal validation") { cached.root != nil && !cached.isScanning }
+        try await wait("cached root before journal validation") {
+            reconciliationGate.isWaiting && cached.root != nil && !cached.isScanning
+        }
         precondition(cached.isSavedMap && cached.root?.size == 3,
                      "An identity-matching cached root should display before background journal reconciliation")
         let originalID = root.appendingPathComponent("indexed.bin").path
@@ -750,6 +755,7 @@ final class CollectionGate: @unchecked Sendable {
         cached.hoveredMapNodes = [cached.current!.children[0]]
         cached.statusMessage = "The existing map remains usable."
         precondition(cached.mapRevision == revision, "Hover, selection, and status must not invalidate prepared map data")
+        reconciliationGate.release()
         try await wait("incompatible journal refresh") {
             !cached.isRefreshing && !cached.isOpeningFolder && !cached.isSavedMap && cached.root?.size == 5
         }

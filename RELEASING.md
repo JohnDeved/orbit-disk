@@ -14,8 +14,9 @@ Both workflows use the `macos-26` runner and explicitly select Xcode 26.6 throug
 ## Version and tag
 
 1. Change `CFBundleShortVersionString` in `Config/Info.plist` to the new version and increase the integer `CFBundleVersion`. Both must be newer than previous release tags. For example, after version `0.9.0`, build `12`, use version `0.9.1`, build `13`.
-2. Run the checks below, review the changes, and commit them. The release script requires a clean working tree.
-3. Create an annotated tag matching the version and push it with the commit:
+2. Write the changes since the previous release in `docs/releases/vX.Y.Z.md`. The release script includes these notes and appends the platform and signing details automatically.
+3. Run the checks below, review the changes, and commit them. The release script requires a clean working tree.
+4. Create an annotated tag matching the version and push it with the commit:
 
 ```sh
 git tag -a v0.9.1 -m 'Orbit Disk 0.9.1'
