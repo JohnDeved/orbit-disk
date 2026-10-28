@@ -30,10 +30,13 @@ public final class ResumableStage: @unchecked Sendable {
     private let removalReplay: StageRemovalReplay
     private var removalReplayPrepared = false
     private let revisionLock = NSLock()
+    private let changes = ScanChangeNotifications()
+    public var updates: AsyncStream<Void> { changes.stream() }
     private var revisionValue: UInt64 = 0
     private var activeDirectory: (path: Data, identity: String)?
     private var preferredDirectory: Data?
     private var lastProgressTime: TimeInterval = 0
+    private var lastDiscoveryProgressTime: TimeInterval = 0
     private var progressItems = 0
     private let searchPreparationLock = NSLock()
     private var searchPreparationTask: Task<Void, Never>?
@@ -158,6 +161,7 @@ public final class ResumableStage: @unchecked Sendable {
             self?.crawler.cancelAsyncDiscovery()
             self?.bumpRevision()
         }
+        crawler.liveInventory.onChange = { [weak self] in self?.bumpRevision() }
     }
 
     public func prioritize(path: String?) {
@@ -171,13 +175,17 @@ public final class ResumableStage: @unchecked Sendable {
 
     public var isSearchPrepared: Bool { previewStore.isStagedSearchPrepared(snapshot: previewSnapshot) }
 
+    package static func searchPreparationDue(itemCount: Int, previousCount: Int) -> Bool {
+        // Doubling bounds total prefix rebuild work; newer rows remain searchable in the SQL tail.
+        itemCount >= 8_192 && previousCount <= itemCount / 2
+    }
+
     private func prepareSearchIndex(itemCount: Int? = nil) {
         searchPreparationLock.lock(); defer { searchPreparationLock.unlock() }
         let now = ProcessInfo.processInfo.systemUptime
         guard !searchPreparationSuspended, searchPreparationCancellation == nil, now - searchPreparationTime >= 1 else { return }
         if let itemCount {
-            guard itemCount >= 8_192,
-                  searchPreparationCount == 0 || itemCount >= searchPreparationCount + min(searchPreparationCount, 65_536) else { return }
+            guard Self.searchPreparationDue(itemCount: itemCount, previousCount: searchPreparationCount) else { return }
             searchPreparationCount = itemCount
         }
         searchPreparationTime = now
@@ -282,12 +290,17 @@ public final class ResumableStage: @unchecked Sendable {
     }
 
     public var revision: UInt64 { revisionLock.lock(); defer { revisionLock.unlock() }; return revisionValue }
-    private func bumpRevision() { revisionLock.lock(); revisionValue &+= 1; revisionLock.unlock() }
+    private func bumpRevision() {
+        revisionLock.lock(); revisionValue &+= 1; revisionLock.unlock()
+        changes.send()
+    }
     private func capturePreviewState() -> (UInt64, (path: Data, identity: String)?) {
         revisionLock.lock(); defer { revisionLock.unlock() }; return (revisionValue, activeDirectory)
     }
     private func setActiveDirectory(_ value: (path: Data, identity: String)?) {
+        guard crawler.asyncInventory == nil else { return }
         revisionLock.lock(); activeDirectory = value; revisionValue &+= 1; revisionLock.unlock()
+        changes.send()
     }
 
     public func removalReplayReadiness() -> (cursor: RemovalCursor?, blocked: Bool, generation: UInt64) {
@@ -309,9 +322,10 @@ public final class ResumableStage: @unchecked Sendable {
         #endif
         let (previewRevision, active) = capturePreviewState()
         let result: ScanPreviewView?
-        if let pending = crawler.asyncInventory?.capture() {
-            result = try previewStore.stagedView(path: path, snapshot: previewSnapshot, revision: previewRevision, pending: pending,
-                activeDirectory: active, removals: removals + state.overlay, cancellation: cancellation)
+        if crawler.asyncInventory != nil {
+            let memory = try crawler.liveInventory.view(path: path, removals: removals + state.overlay, cancellation: cancellation)
+            result = memory.map { ScanPreviewView(root: $0.root, folder: $0.folder, ancestors: $0.ancestors,
+                                                 revision: previewRevision, isListing: $0.isListing) }
         } else {
             result = try previewStore.stagedView(path: path, snapshot: previewSnapshot, revision: previewRevision, activeDirectory: active,
                 removals: removals + state.overlay, cancellation: cancellation)
@@ -325,8 +339,8 @@ public final class ResumableStage: @unchecked Sendable {
         let state = removalReplay.viewState()
         guard !state.blocked else { return false }
         let result: Bool
-        if let pending = crawler.asyncInventory?.capture() {
-            result = (try? previewStore.stagedConfirmsMissingDirectory(path, snapshot: previewSnapshot, pending: pending)) ?? false
+        if crawler.asyncInventory != nil {
+            result = crawler.liveInventory.confirmsMissingDirectory(path)
         } else {
             result = (try? previewStore.stagedConfirmsMissingDirectory(path, snapshot: previewSnapshot)) ?? false
         }
@@ -337,15 +351,16 @@ public final class ResumableStage: @unchecked Sendable {
     public func search(query: String, cancellation: ScanCancellation, removals: [ScanRemoval], limit: Int) throws -> (nodes: [DiskNode], count: Int, revision: UInt64, removalsChanged: Bool) {
         let state = removalReplay.viewState()
         guard !state.blocked else { throw StageRemovalReplay.Retry.cannotExpose }
-        if !isSearchPrepared { prepareSearchIndex() }
+        if crawler.asyncInventory == nil, !isSearchPrepared { prepareSearchIndex() }
         #if ORBIT_TESTING
         Self.testBeforeStagedRead?()
         #endif
         let (previewRevision, active) = capturePreviewState()
         let result: (nodes: [DiskNode], count: Int, revision: UInt64, removalsChanged: Bool)
-        if let pending = crawler.asyncInventory?.capture() {
-            result = try previewStore.stagedSearch(query: query, snapshot: previewSnapshot, revision: previewRevision, pending: pending,
-                activeDirectory: active, removals: removals + state.overlay, cancellation: cancellation, limit: limit)
+        if crawler.asyncInventory != nil {
+            let memory = try crawler.liveInventory.search(query: query, removals: removals + state.overlay,
+                                                         cancellation: cancellation, limit: limit)
+            result = (memory.nodes, memory.count, previewRevision, memory.removalsChanged)
         } else {
             result = try previewStore.stagedSearch(query: query, snapshot: previewSnapshot, revision: previewRevision, activeDirectory: active,
                 removals: removals + state.overlay, cancellation: cancellation, limit: limit)
@@ -355,30 +370,47 @@ public final class ResumableStage: @unchecked Sendable {
         return result
     }
 
-    public func advance(progress: @escaping @Sendable (ScanProgress) -> Void) throws -> Bool {
+    public func startDiscovery(progress: @escaping @Sendable (ScanProgress) -> Void) throws {
         if !removalReplayPrepared { try prepareRemovalReplay() }
-        try crawler.store.prepareQueueIndexes(cancellation: crawler.cancellation)
-        let replayGeneration = removalReplay.viewState().generation
-        try removalReplay.refreshIfNeeded()
         if !consideredAsyncDiscovery {
             consideredAsyncDiscovery = true
             let state = removalReplay.viewState()
-            var eligible = !hasPriorCheckpoint && !state.blocked && state.overlay.isEmpty
+            var eligible = !state.blocked
             #if ORBIT_TESTING
             eligible = eligible && !testDisableAsyncDiscovery
             #endif
             if eligible && crawler.asyncInventory == nil {
-                let store = previewStore
-                let deferDirectory: ((Data) -> Bool)? = reuseProvider == nil ? nil : { path in
-                    guard let value = String(data: path, encoding: .utf8) else { return true }
-                    return store.hasSavedSnapshotFile(for: URL(fileURLWithPath: value, isDirectory: true))
+                let reuse = reuseProvider.map {
+                    DiscoveryReuse(provider: $0, cache: previewStore.directory, root: crawler.rootURL,
+                        identity: crawler.root.identity, checkpoint: checkpoint, cancellation: crawler.cancellation)
                 }
-                _ = try crawler.startAsyncDiscovery(deferDirectory: deferDirectory, onAccepted: { [weak self] in self?.bumpRevision() })
+                _ = try crawler.startAsyncDiscovery(reuse: reuse, onAccepted: { [weak self] in
+                    guard let self, let inventory = self.crawler.asyncInventory else { return }
+                    if inventory.discoveryFinished { self.bumpRevision() }
+                    let now = ProcessInfo.processInfo.systemUptime
+                    self.revisionLock.lock()
+                    let publish = now - self.lastDiscoveryProgressTime >= 0.1 || inventory.discoveryFinished
+                    if publish { self.lastDiscoveryProgressTime = now }
+                    self.revisionLock.unlock()
+                    if publish {
+                        progress(ScanProgress(itemCount: inventory.discoveredRecordCount,
+                            bytesScanned: inventory.discoveredLogicalSize, currentPath: self.crawler.rootURL.path))
+                    }
+                })
             }
         }
+    }
+
+    public func advance(progress: @escaping @Sendable (ScanProgress) -> Void) throws -> Bool {
+        try startDiscovery(progress: progress)
+        try crawler.store.prepareQueueIndexes(cancellation: crawler.cancellation)
+        let replayGeneration = removalReplay.viewState().generation
+        try removalReplay.refreshIfNeeded()
         let advanced = try crawler.step(onRecordCount: { [self] count in progressItems += count }, onBatch: { [self] path, _ in
-            bumpRevision()
-            prepareSearchIndex(itemCount: progressItems)
+            if crawler.asyncInventory == nil {
+                bumpRevision()
+                prepareSearchIndex(itemCount: progressItems)
+            }
             #if ORBIT_TESTING
             if !testBatchDisabled, progressItems >= 512, let batch = testScanner?.testBatch {
                 do { try batch() }
@@ -411,7 +443,7 @@ public final class ResumableStage: @unchecked Sendable {
         try removalReplay.refreshIfNeeded()
         let stable = try removalReplay.settleIfPossible()
         if !advanced && !stable { usleep(50_000) }
-        if advanced || removalReplay.viewState().generation != replayGeneration { bumpRevision() }
+        if (advanced && crawler.asyncInventory == nil) || removalReplay.viewState().generation != replayGeneration { bumpRevision() }
         return advanced || !stable
     }
 

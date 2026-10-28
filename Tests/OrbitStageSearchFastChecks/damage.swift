@@ -5,6 +5,7 @@ import CSQLite
  static func main() throws {
  let base=URL(fileURLWithPath:CommandLine.arguments[1]),root=base.appendingPathComponent("root"),cache=base.appendingPathComponent(UUID().uuidString)
  let stage=try ResumableStage(cache:cache,root:root,current:StageCheckpoint(rootPath:root.path,identity:"bench",eventID:0))
+ stage.testDisableAsyncDiscovery = true
  while try stage.advance(progress:{_ in}) {}
  let directory=cache.appendingPathExtension("staging").appendingPathComponent(".orbit-stages")
  let file=try FileManager.default.contentsOfDirectory(at:directory,includingPropertiesForKeys:nil).first{ $0.pathExtension == "sqlite" }!

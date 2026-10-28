@@ -12,6 +12,7 @@ final class DurableCrawler {
     let writeChunkSize: Int
     let excludedDirectories: Set<DirectoryIdentity>
     let excludedPaths: Set<Data>
+    let liveInventory: LiveMappingInventory
     var forceFallback = false
     var reusableListing: ((ListingStage.QueuedDirectory) throws -> StageReusableListing?)?
     var preferredDirectory: (() -> Data?)?
@@ -37,6 +38,7 @@ final class DurableCrawler {
         self.rootURL = rootURL.standardizedFileURL
         self.rootPath = Data(self.rootURL.path.utf8)
         self.root = try SecureRoot(url: self.rootURL)
+        self.liveInventory = LiveMappingInventory(root: self.rootURL, identity: self.root.identity, cancellation: cancellation)
         self.store = try ListingStage(path: database, mirror: mirror)
         self.cancellation = cancellation
         self.writeChunkSize = max(128, writeChunkSize)
@@ -55,18 +57,17 @@ final class DurableCrawler {
     deinit { cancelAsyncDiscovery(); store.close() }
 
     @discardableResult
-    func startAsyncDiscovery(deferDirectory: ((Data) -> Bool)? = nil, byteLimit: Int = 128 * 1024 * 1024,
-                             frontierLimit: Int = 4096, onAccepted: @escaping () -> Void = {}) throws -> Bool {
-        guard !forceFallback, !cancellation.isCancelled,
-              try store.canCompleteFreshListing(parent: rootPath),
-              try store.dirtyRevision(parent: rootPath) == 0,
-              try store.fullRefreshState().generation == 0 else { return false }
+    func startAsyncDiscovery(deferDirectory: ((Data) -> Bool)? = nil, reuse: DiscoveryReuse? = nil, workerCount: Int = 4,
+                             onAccepted: @escaping () -> Void = {}) throws -> Bool {
+        guard !cancellation.isCancelled else { return false }
         #if ORBIT_TESTING
         if testBeforeListing != nil || testFallbackAfterFirstBuffer != nil { return false }
         #endif
         let producer = try AsyncListingProducer(rootURL: rootURL, rootIdentity: root.identity,
             cancellation: cancellation, excludedDirectories: excludedDirectories, excludedPaths: excludedPaths,
-            deferDirectory: deferDirectory, preferredDirectory: preferredDirectory, byteLimit: byteLimit, frontierLimit: frontierLimit, onAccepted: onAccepted)
+            deferDirectory: deferDirectory, preferredDirectory: preferredDirectory, live: liveInventory,
+            seedPath: store.databasePath, startingGeneration: store.fullRefreshState().generation, reuse: reuse, forceFallback: forceFallback,
+            workerCount: workerCount, onAccepted: onAccepted)
         asyncLock.lock()
         guard asyncProducer == nil else { asyncLock.unlock(); return false }
         asyncProducer = producer; asyncActive = true
@@ -114,7 +115,7 @@ final class DurableCrawler {
         try root.validate(url: rootURL)
         onListingStart?(first.parentPath, "\(first.parentIdentity.device):\(first.parentIdentity.inode)")
         defer { onListingEnd?() }
-        guard try store.fullRefreshState().generation == 0 else { cancelAsyncDiscovery(); return true }
+        guard try store.fullRefreshState().generation == first.expectedFullGeneration else { cancelAsyncDiscovery(); return true }
         if asyncListing == nil {
             var skipped = false
             if let directory = try store.directory(path: first.parentPath),
@@ -141,7 +142,7 @@ final class DurableCrawler {
             } else {
                 if let completion = last.completion, listing.epoch == nil, records.count < 128 {
                     completed = try store.completeFreshListing(parent: first.parentPath, records: records,
-                        rootDevice: root.identity.device, expectedRevision: 0, expectedFullGeneration: 0,
+                        rootDevice: root.identity.device, expectedRevision: first.expectedRevision, expectedFullGeneration: first.expectedFullGeneration,
                         issueCount: completion.issueCount, issues: completion.issues, asyncCommit: commit)
                 }
                 if !completed {
@@ -151,7 +152,7 @@ final class DurableCrawler {
                     }
                     if let completion = last.completion {
                         completed = try store.finish(parent: first.parentPath, epoch: listing.epoch,
-                            expectedRevision: 0, expectedFullGeneration: 0, issueCount: completion.issueCount,
+                            expectedRevision: first.expectedRevision, expectedFullGeneration: first.expectedFullGeneration, issueCount: completion.issueCount,
                             issues: completion.issues, asyncCommit: commit)
                     } else if last.failure != nil && records.isEmpty {
                         try store.acknowledgeAsync(commit)
@@ -253,11 +254,13 @@ final class DurableCrawler {
                 failure = code
             } else { throw error }
             if failure == EACCES || failure == EPERM {
+                liveInventory.unavailable(directory.path, identity: DirectoryIdentity(device: directory.device, inode: directory.inode), missing: false)
                 let message = ScanError.filesystem(path, failure!).localizedDescription
                 try store.blockDirectory(path: directory.path, parent: parent, name: name, message: message)
                 return true
             }
             if replaced || failure == ENOENT || failure == ENOTDIR || failure == ELOOP {
+                liveInventory.unavailable(directory.path, identity: DirectoryIdentity(device: directory.device, inode: directory.inode), missing: true)
                 try store.invalidateDirectory(path: directory.path, parent: parent, name: name)
                 return true
             }
@@ -315,12 +318,16 @@ final class DurableCrawler {
             try accountCommittedBatch(records.count)
         }
         func list(forceFallback: Bool, testFallback: (() -> Void)?) throws {
+            let observedIdentity = DirectoryIdentity(device: directory.device, inode: directory.inode)
+            liveInventory.begin(directory.path, identity: observedIdentity)
             try StreamingBulkDirectory.stream(descriptor, url: URL(fileURLWithPath: path, isDirectory: true),
                 cancellation: cancellation, progress: { _, _ in }, issue: {
                     listingIssueCount += 1
                     if listingIssues.count < 100 { listingIssues.append($0) }
                 }, forceFallback: forceFallback, testFallbackAfterFirstBuffer: testFallback) { records in
                     let accepted = included(records)
+                    liveInventory.append(PendingInventoryBatch(sequence: 1, parentPath: directory.path,
+                        parentIdentity: observedIdentity, components: components, records: accepted, completion: nil, failure: nil))
                     pending.append(contentsOf: accepted)
                     if bufferingFreshListing {
                         let isPreferred = preferredDirectory?() == directory.path
@@ -333,6 +340,9 @@ final class DurableCrawler {
                         try commitPending()
                     }
                 }
+            liveInventory.append(PendingInventoryBatch(sequence: 1, parentPath: directory.path,
+                parentIdentity: observedIdentity, components: components, records: [],
+                completion: PendingListingCompletion(issueCount: listingIssueCount, issues: listingIssues), failure: nil))
             if bufferingFreshListing {
                 try root.validate(url: rootURL)
                 if try store.completeFreshListing(parent: directory.path, records: pending, rootDevice: root.identity.device,

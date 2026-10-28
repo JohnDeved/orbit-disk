@@ -27,12 +27,12 @@ final class StageReuseSource {
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     init(_ candidate: StageReuseCandidate, cache: URL, parentRoot: URL, parentIdentity: String,
-         cancellation: ScanCancellation) throws {
+         cancellation: ScanCancellation, waitForLocks: Bool = true) throws {
         let snapshot = candidate.snapshot
         self.snapshot = snapshot; checkpoint = candidate.checkpoint
         path = Data(snapshot.rootURL.path.utf8)
         self.cancellation = cancellation; self.parentRoot = parentRoot
-        journal = try RemovalJournal(cache: cache)
+        journal = try RemovalJournal(cache: cache, waitForLocks: waitForLocks)
         guard snapshot.skippedCount == 0,
               Data(snapshot.rootURL.path.utf8) != Data(parentRoot.path.utf8),
               try MappingCoverage.canReach(root: parentRoot, target: snapshot.rootURL,
@@ -53,7 +53,7 @@ final class StageReuseSource {
         do {
             guard lstat(snapshot.databaseURL.path, &after) == 0, before.st_dev == after.st_dev,
                   before.st_ino == after.st_ino else { throw Failure.unsuitable }
-            sqlite3_busy_timeout(opened, 50)
+            sqlite3_busy_timeout(opened, waitForLocks ? 50 : 0)
             sqlite3_progress_handler(opened, 1_000, { context in
                 guard let context else { return 1 }
                 return Unmanaged<ScanCancellation>.fromOpaque(context).takeUnretainedValue().isCancelled || Task<Never, Never>.isCancelled ? 1 : 0
@@ -162,21 +162,26 @@ final class StageReusableListing {
         while records.count < limit {
             let status = sqlite3_step(rows)
             if status == SQLITE_DONE { finished = true; return records }
-            guard status == SQLITE_ROW, let name = StageReuseSource.text(rows, 0),
-                  !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.utf8.contains(0),
-                  let searchName = StageReuseSource.text(rows, 10),
-                  searchName.utf8.elementsEqual(name.folding(options: [.caseInsensitive, .diacriticInsensitive],
-                      locale: Locale(identifier: "en_US_POSIX")).utf8),
-                  let identity = InventorySchema.identity(rows, device: 6, inode: 7),
-                  let parsed = InventorySchema.parseIdentity(identity),
-                  sqlite3_column_int(rows, 3) == 1, sqlite3_column_int64(rows, 4) >= 0,
-                  sqlite3_column_int64(rows, 5) >= 0,
-                  let links = UInt32(exactly: sqlite3_column_int64(rows, 9)) else { throw StageReuseSource.Failure.unsuitable }
-            let isDirectory = sqlite3_column_int(rows, 1) != 0
-            records.append(FileMetadata(name: name, device: parsed.device, inode: parsed.inode, isDirectory: isDirectory,
-                isSymbolicLink: sqlite3_column_int(rows, 2) != 0, isMountPoint: sqlite3_column_int(rows, 8) != 0, linkCount: links,
-                size: isDirectory ? 0 : sqlite3_column_int64(rows, 4), allocatedSize: isDirectory ? 0 : sqlite3_column_int64(rows, 5)))
+            guard status == SQLITE_ROW else { throw StageReuseSource.Failure.unsuitable }
+            records.append(try Self.record(rows))
         }
         return records
+    }
+
+    static func record(_ rows: OpaquePointer) throws -> FileMetadata {
+        guard let name = StageReuseSource.text(rows, 0),
+              !name.isEmpty, name != ".", name != "..", !name.contains("/"), !name.utf8.contains(0),
+              let searchName = StageReuseSource.text(rows, 10),
+              searchName.utf8.elementsEqual(name.folding(options: [.caseInsensitive, .diacriticInsensitive],
+                  locale: Locale(identifier: "en_US_POSIX")).utf8),
+              let identity = InventorySchema.identity(rows, device: 6, inode: 7),
+              let parsed = InventorySchema.parseIdentity(identity),
+              sqlite3_column_int(rows, 3) == 1, sqlite3_column_int64(rows, 4) >= 0,
+              sqlite3_column_int64(rows, 5) >= 0,
+              let links = UInt32(exactly: sqlite3_column_int64(rows, 9)) else { throw StageReuseSource.Failure.unsuitable }
+        let isDirectory = sqlite3_column_int(rows, 1) != 0
+        return FileMetadata(name: name, device: parsed.device, inode: parsed.inode, isDirectory: isDirectory,
+            isSymbolicLink: sqlite3_column_int(rows, 2) != 0, isMountPoint: sqlite3_column_int(rows, 8) != 0, linkCount: links,
+            size: isDirectory ? 0 : sqlite3_column_int64(rows, 4), allocatedSize: isDirectory ? 0 : sqlite3_column_int64(rows, 5))
     }
 }

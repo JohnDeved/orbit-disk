@@ -92,13 +92,13 @@ public struct DiskIndexStore: Sendable {
         return try SnapshotExpectation.capture(directory: directory, root: root)
     }
 
-    public func savedSnapshot(for root: URL) -> IndexSnapshot? {
+    public func savedSnapshot(for root: URL, waitForLocks: Bool = true) -> IndexSnapshot? {
         let rootPath = Self.path(root)
         let file = databaseURL(for: root)
         var presence = stat()
         guard lstat(file.path, &presence) == 0 else { return nil }
         do {
-            let db = try IndexDatabase(file, writable: false)
+            let db = try IndexDatabase(file, writable: false, waitForLocks: waitForLocks)
             let snapshot = try readSnapshot(db, file: file)
             guard snapshot.rootURL.path == rootPath,
                   let node = try readNode(rootPath, db: db), node.isDirectory else { return nil }
@@ -975,7 +975,13 @@ public struct DiskIndexStore: Sendable {
             current = parent
         }
     }
+    #if ORBIT_TESTING
+    package static var testBeforeDatabaseOpen: (@Sendable () throws -> Void)?
+    #endif
     private func open(_ snapshot: IndexSnapshot, cancellation: ScanCancellation? = nil) throws -> IndexDatabase {
+        #if ORBIT_TESTING
+        try Self.testBeforeDatabaseOpen?()
+        #endif
         let db = try IndexDatabase(snapshot.databaseURL, writable: false, cancellation: cancellation)
         try validate(snapshot, db: db)
         return db
@@ -1139,7 +1145,7 @@ private final class IndexDatabase {
         guard status == SQLITE_OK else { throw DiskIndexError.database("Could not prepare hard-link ordering.") }
     }
 
-    init(_ url: URL, writable: Bool, cancellation: ScanCancellation? = nil) throws {
+    init(_ url: URL, writable: Bool, cancellation: ScanCancellation? = nil, waitForLocks: Bool = true) throws {
         self.cancellation = cancellation
         let flags = (writable ? SQLITE_OPEN_READWRITE : SQLITE_OPEN_READONLY) | SQLITE_OPEN_NOMUTEX
         let status = sqlite3_open_v2(url.path, &handle, flags, nil)
@@ -1149,7 +1155,7 @@ private final class IndexDatabase {
             handle = nil
             throw DiskIndexError.database(message)
         }
-        sqlite3_busy_timeout(handle, 2_000)
+        sqlite3_busy_timeout(handle, waitForLocks ? 2_000 : 0)
         if let cancellation {
             sqlite3_progress_handler(handle, 1_000, { pointer in
                 guard let pointer else { return 0 }

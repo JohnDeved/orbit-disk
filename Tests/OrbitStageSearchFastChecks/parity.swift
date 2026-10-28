@@ -1,7 +1,19 @@
 import Foundation
 import OrbitCore
 @main struct Main {
+ static func searchPreparationWorkStaysLinear() {
+  var previous=0, scanned=0, preparations=0
+  for count in stride(from:1024,through:8_388_608,by:1024) {
+   if ResumableStage.searchPreparationDue(itemCount:count,previousCount:previous) {
+    previous=count;scanned+=count;preparations+=1
+   }
+   precondition(scanned <= count*2,"Search preparation repeatedly rescanned a growing inventory")
+  }
+  precondition(previous >= 4_194_304 && preparations > 1,"Search acceleration stopped growing with the inventory")
+  precondition(!ResumableStage.searchPreparationDue(itemCount:Int.max,previousCount:Int.max/2+1))
+ }
  static func main() throws {
+  searchPreparationWorkStaysLinear()
   let base=URL(fileURLWithPath:CommandLine.arguments[1]), root=base.appendingPathComponent("root"), cache=base.appendingPathComponent(UUID().uuidString)
   let stage=try ResumableStage(cache:cache,root:root,current:StageCheckpoint(rootPath:root.path,identity:"test",eventID:0))
   let store=DiskIndexStore(directory:cache), snapshot=stage.testPreviewSnapshot

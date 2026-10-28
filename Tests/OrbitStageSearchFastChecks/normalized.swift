@@ -37,6 +37,7 @@ private struct Signature: Equatable {
         let cache = base.appendingPathComponent(UUID().uuidString)
         let stage = try ResumableStage(cache: cache, root: root,
             current: StageCheckpoint(rootPath: root.path, identity: "test", eventID: 0))
+        stage.testDisableAsyncDiscovery = true
         while try stage.advance(progress: { _ in }) {}
         var db: OpaquePointer?
         precondition(sqlite3_open_v2(stage.testPreviewSnapshot.databaseURL.path, &db, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK)

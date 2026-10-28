@@ -171,19 +171,21 @@ private final class MappingSession {
     var pendingFullRefresh = false
     var removalParents = Set<String>()
     var removalVersions: [String: UInt64] = [:]
-    var scanRemovalVersions: [String: UInt64] = [:]
     var removals: [ScanRemoval] = []
     var removalEpoch: UInt64 = 0
     var durableRecoveryCursor: RemovalCursor?
     var durableRecoveryTarget: RemovalCursor?
+    func includeRemovalTarget(_ cursor: RemovalCursor) {
+        if let current = durableRecoveryTarget, current.identity == cursor.identity, current.sequence > cursor.sequence { return }
+        durableRecoveryTarget = cursor
+    }
     var durableRecoveryPending = false
+    var durableRecoveryConflict = false
     var durablePreviewBlocked = false
     var removalStatus: String? { didSet { if removalStatus != oldValue { invalidateCollectionStatus() } } }
     var removalError: String? { didSet { if removalError != oldValue { invalidateCollectionError() } } }
     var finished = false
     var scanFailed = false
-    var freshPublished = false
-    var scanCanRetireRemovals = false
     var refreshWorker: Task<IndexSnapshot, Error>?
     var refreshWorkerID: UUID?
     var worker: Task<(IndexSnapshot, PreparedFolder, Bool), Error>?
@@ -878,6 +880,7 @@ final class DiskModel: ObservableObject {
     var testBeforeRemoval: @Sendable () -> Void = {}
     var testBeforeRemovalMerge: @Sendable () -> Void = {}
     var testBeforeRefreshSave: @Sendable () -> Void = {}
+    var testAfterPublishedRemovalCursorRead: @Sendable () -> Void = {}
     var testMonitorUnavailable = false
     func testStopMonitor() { monitorTask?.cancel(); monitorTask = nil; monitor?.stop(); monitor = nil }
     func testStopJournalMonitor() { removalJournalTask?.cancel(); removalJournalTask = nil }
@@ -1117,6 +1120,9 @@ final class DiskModel: ObservableObject {
     var isUpdatingRemovalSizes: Bool {
         guard let session = sessions.values.first(where: { $0.id == activeSessionID }) else { return false }
         return isRemoving || session.isRemoving || session.durableRecoveryPending || !session.removals.isEmpty
+    }
+    func isUpdatingRemovalSize(of node: DiskNode) -> Bool {
+        node.isDirectory && isUpdatingRemovalSizes
     }
     private var colorPreparationState: ColorPreparationState? {
         guard let current else { return nil }
@@ -1635,7 +1641,6 @@ final class DiskModel: ObservableObject {
         pendingCheckpoint = session.pendingCheckpoint; session.pendingCheckpoint = nil
         pendingFullRefresh = session.pendingFullRefresh; session.pendingFullRefresh = false
         showCollection = false
-        session.scanRemovalVersions = session.removalVersions
         if keepMap { session.savedSnapshot = snapshot; session.lastRoute = desiredPath }
         if let prior, prior.collectionValidation != nil {
             prior.collectionValidation?.token.cancel()
@@ -1663,7 +1668,7 @@ final class DiskModel: ObservableObject {
             if let saved = store.savedSnapshot(for: url) { savedCursor = try store.removalCursor(snapshot: saved, cancellation: token) }
             else { savedCursor = nil }
             let journal = try RemovalJournal(cache: store.directory)
-            var recovery: RemovalRecovery = try {
+            func recoverJournal() throws -> RemovalRecovery {
                 do { return try journal.recover(root: url, cursor: savedCursor, cancellation: token) }
                 catch RemovalRecoveryError.journalChanged {
                     let fresh = try journal.recover(root: url, cursor: nil, cancellation: token)
@@ -1671,7 +1676,9 @@ final class DiskModel: ObservableObject {
                                            affectedParents: fresh.affectedParents, overlayOverflow: fresh.overlayOverflow,
                                            hasLiveOperation: fresh.hasLiveOperation, requiresFullRefresh: true)
                 }
-            }()
+            }
+            var recoveryEpoch = await MainActor.run { session.removalEpoch }
+            var recovery = try recoverJournal()
             if recovery.overlayOverflow, !recovery.requiresFullRefresh, let saved = store.savedSnapshot(for: url) {
                 var workingSaved = try store.recoveryWorkingCopy(of: saved, cancellation: token)
                 let workingFile = workingSaved
@@ -1717,7 +1724,18 @@ final class DiskModel: ObservableObject {
                 }
             }
             while true {
-                let prior = await MainActor.run { (session.removals, session.removalEpoch) }
+                let prior = await MainActor.run { (session.removals, session.removalEpoch, session.durableRecoveryTarget) }
+                let conflictingJournal = prior.2.map { $0.identity != recovery.cursor.identity } ?? false
+                if prior.1 != recoveryEpoch || (conflictingJournal && !recovery.requiresFullRefresh) {
+                    recovery = try recoverJournal()
+                    recoveryEpoch = prior.1
+                    if let target = prior.2, target.identity != recovery.cursor.identity {
+                        recovery = RemovalRecovery(cursor: recovery.cursor, removals: recovery.removals,
+                            affectedParents: recovery.affectedParents, overlayOverflow: recovery.overlayOverflow,
+                            hasLiveOperation: recovery.hasLiveOperation, requiresFullRefresh: true)
+                    }
+                    continue
+                }
                 let merged = mergingRemovals(prior.0, recovery.removals)
                 let installed = await MainActor.run { [recovery, savedCursor] () -> Bool in
                     guard model.sessions[url.path] === session, !token.isCancelled else { return true }
@@ -1729,7 +1747,8 @@ final class DiskModel: ObservableObject {
                         let sequence = savedCursor?.identity == recovery.cursor.identity ? (savedCursor?.sequence ?? 0) : 0
                         session.durableRecoveryCursor = RemovalCursor(identity: recovery.cursor.identity, sequence: sequence)
                     } else { session.durableRecoveryCursor = recovery.cursor }
-                    session.durableRecoveryTarget = recovery.cursor
+                    session.includeRemovalTarget(recovery.cursor)
+                    if recovery.requiresFullRefresh { session.durableRecoveryConflict = false }
                     if model.activeSessionID == session.id { model.beginRemovalJournalMonitoring(session) }
                     guard !recovery.removals.isEmpty || recovery.requiresFullRefresh else { return true }
                     session.removalEpoch &+= 1
@@ -1792,7 +1811,7 @@ final class DiskModel: ObservableObject {
             if let stage {
                 if !force {
                     stage.configureReuse { directory, checkpoint in
-                        guard let saved = store.savedSnapshot(for: directory) else { return nil }
+                        guard let saved = store.savedSnapshot(for: directory, waitForLocks: false) else { return nil }
                         return try DiskChangeMonitor.reuseCandidate(saved, for: checkpoint)
                     }
                 }
@@ -1800,10 +1819,18 @@ final class DiskModel: ObservableObject {
                 stage.configureTestScanner(scanner)
                 #endif
                 stageConfigurer(stage)
-                try stage.prepareRemovalReplay()
+                let reportProgress: @Sendable (ScanProgress) -> Void = { progress in
+                    progressCell.set(progress)
+                    Task { @MainActor [weak model] in
+                        guard let model, model.activeSessionID == sessionID, !token.isCancelled else { return }
+                        model.progressCount = progress.itemCount
+                        model.progressBytes = progress.bytesScanned
+                        model.scanPath = progress.currentPath
+                    }
+                }
+                try stage.startDiscovery(progress: reportProgress)
                 preview?.attach(stage: stage)
                 await MainActor.run {
-                    if model.sessions[url.path] === session { session.scanCanRetireRemovals = !stage.hasPriorCheckpoint }
                     guard model.activeSessionID == sessionID, !token.isCancelled else { return }
                     model.scanTitle = "Mapping your files…"
                     if let preview, session.preview != nil, model.scanPreview !== preview {
@@ -1813,13 +1840,7 @@ final class DiskModel: ObservableObject {
                 stageAttachObserver()
                 while try stage.advance(progress: { progress in
                     observer(progress)
-                    progressCell.set(progress)
-                    Task { @MainActor [weak model] in
-                        guard let model, model.activeSessionID == sessionID, !token.isCancelled else { return }
-                        model.progressCount = progress.itemCount
-                        model.progressBytes = progress.bytesScanned
-                        model.scanPath = progress.currentPath
-                    }
+                    reportProgress(progress)
                 }) { stageStepObserver(stage) }
                 if let preview { await model.readPreview(preview, scanID: await model.generation, token: token, force: true) }
                 let saved = try stage.publish(elapsed: ProcessInfo.processInfo.systemUptime - started)
@@ -1838,7 +1859,6 @@ final class DiskModel: ObservableObject {
             guard let result = try? await worker.value, let self, let session,
                   self.sessions[url.path] === session, !token.isCancelled else { return }
             session.savedSnapshot = result.0
-            session.freshPublished = !result.2
             session.finished = true
             if session.removals.isEmpty && !session.isRemoving { session.preview = nil }
             session.worker = nil
@@ -1854,25 +1874,29 @@ final class DiskModel: ObservableObject {
             do {
                 let (saved, view, reused) = try await worker.value
                 guard let self, self.generation == scanID, !token.isCancelled else { return }
-                if let session = self.sessions.values.first(where: { $0.id == self.activeSessionID }),
-                   session.scanCanRetireRemovals && (!reused || session.freshPublished) {
-                    for (path, version) in session.scanRemovalVersions where session.removalVersions[path] == version {
-                        session.removalVersions.removeValue(forKey: path); session.removalParents.remove(path)
-                        session.removals.removeAll { URL(fileURLWithPath: $0.path).deletingLastPathComponent().path == path }
-                    }
-                    session.scanRemovalVersions.removeAll(); session.freshPublished = false
-                }
-                let store = self.store
-                let publishedCursor = try? await Task.detached(priority: .utility) {
-                    try store.removalCursor(snapshot: saved, cancellation: token)
-                }.value
-                guard self.generation == scanID, !token.isCancelled else { return }
                 let owner = self.activeSessionID
                 let session = self.sessions.values.first { $0.id == owner }
+                let cursorReadEpoch = session?.removalEpoch ?? 0
+                let store = self.store
+                #if ORBIT_TESTING
+                let cursorReadObserver = self.testAfterPublishedRemovalCursorRead
+                #endif
+                let publishedCursor = try? await Task.detached(priority: .utility) {
+                    let cursor = try store.removalCursor(snapshot: saved, cancellation: token)
+                    #if ORBIT_TESTING
+                    cursorReadObserver()
+                    #endif
+                    return cursor
+                }.value
+                guard self.generation == scanID, self.activeSessionID == owner, !token.isCancelled else { return }
+                if let session, let publishedCursor {
+                    self.retireRemovalState(through: publishedCursor, session: session, epoch: cursorReadEpoch, scanID: scanID)
+                }
+                guard self.generation == scanID, self.activeSessionID == owner, !token.isCancelled else { return }
                 let observedEpoch = session?.removalEpoch ?? 0
                 let target = session?.durableRecoveryTarget
-                let covered = target == nil || (publishedCursor?.identity == target?.identity &&
-                                                (publishedCursor?.sequence ?? -1) >= (target?.sequence ?? 0))
+                let covered = session?.durableRecoveryConflict != true && (target == nil ||
+                    (publishedCursor?.identity == target?.identity && (publishedCursor?.sequence ?? -1) >= (target?.sequence ?? 0)))
                 if session?.durablePreviewBlocked == true && !covered {
                     self.snapshot = saved; self.isScanning = false; self.isRefreshing = false
                     self.pendingDirectories.formUnion(session?.removalParents ?? [])
@@ -1915,6 +1939,25 @@ final class DiskModel: ObservableObject {
                 if self.updatesPausedRevision == pausedRevision { self.updatesPaused = self.snapshot != nil || self.isPartialMap }
                 if self.isPartialMap && self.statusMessageRevision == statusRevision { self.statusMessage = "Partial map kept. Restart mapping to finish." }
             }
+        }
+    }
+
+    private func retireRemovalState(through cursor: RemovalCursor, session: MappingSession, epoch: UInt64, scanID: UUID) {
+        func canRetire() -> Bool {
+            guard generation == scanID, activeSessionID == session.id, sessions[session.url.path] === session,
+                  session.removalEpoch == epoch, !session.isRemoving, !session.durableRecoveryConflict,
+                  let target = session.durableRecoveryTarget else { return false }
+            return cursor.identity == target.identity && cursor.sequence >= target.sequence
+        }
+        guard canRetire() else { return }
+        objectWillChange.send()
+        guard canRetire() else { return }
+        session.removals.removeAll(); session.removalParents.removeAll(); session.removalVersions.removeAll()
+        session.durableRecoveryPending = false; session.durablePreviewBlocked = false
+        if session.durableRecoveryCursor?.identity != cursor.identity || (session.durableRecoveryCursor?.sequence ?? -1) < cursor.sequence {
+            session.durableRecoveryCursor = cursor
+            session.includeRemovalTarget(cursor)
+            beginRemovalJournalMonitoring(session)
         }
     }
 
@@ -2048,18 +2091,10 @@ final class DiskModel: ObservableObject {
             guard generation == scanID, activeSessionID == session.id, !token.isCancelled else { return false }
         }
         previewTask = Task { [weak self] in
-            while !Task.isCancelled, !token.isCancelled {
+            for await _ in preview.updates {
+                guard !Task.isCancelled, !token.isCancelled else { return }
                 guard let self, self.generation == scanID, self.scanPreview === preview else { return }
                 await self.readPreview(preview, scanID: scanID, token: token)
-                let delay: UInt64
-                if self.lastPreviewRevision == nil || (self.lastPreviewIsListing && self.current?.children.isEmpty != false) {
-                    delay = 30_000_000
-                } else if self.lastPreviewIsListing {
-                    delay = 100_000_000
-                } else {
-                    delay = 350_000_000
-                }
-                do { try await Task.sleep(nanoseconds: delay) } catch { return }
             }
         }
         return true
@@ -2304,7 +2339,7 @@ final class DiskModel: ObservableObject {
                               session.durableRecoveryCursor == cursor else { return }
                         if session.removalEpoch != epoch { continue }
                         if !recovery.hasLiveOperation { session.durableRecoveryCursor = recovery.cursor }
-                        session.durableRecoveryTarget = recovery.cursor
+                        session.includeRemovalTarget(recovery.cursor)
                         session.removalEpoch &+= 1
                         lastLive = recovery.hasLiveOperation ? (recovery, session.removalEpoch) : nil
                         self.deferredPreview = nil
@@ -2339,7 +2374,7 @@ final class DiskModel: ObservableObject {
                         self.scheduleRefresh()
                     } else {
                         if !recovery.hasLiveOperation { session.durableRecoveryCursor = recovery.cursor }
-                        session.durableRecoveryTarget = recovery.cursor
+                        session.includeRemovalTarget(recovery.cursor)
                     }
                     try await Task.sleep(nanoseconds: 1_000_000_000)
                 } catch {
@@ -3493,7 +3528,7 @@ final class DiskModel: ObservableObject {
                     }
                     operation = try RemovalJournal(cache: journalCache).begin(root: rootURL, rootIdentity: rootIdentity, items: candidates)
                 } catch {
-                    return (removed, ["Removal could not be recorded: \(error.localizedDescription)"], changedParents, rootChanged, [ScanRemoval](), false, parentsOverflow)
+                    return (removed, ["Removal could not be recorded: \(error.localizedDescription)"], changedParents, rootChanged, [ScanRemoval](), false, parentsOverflow, Optional<RemovalCursor>.none)
                 }
                 for item in items {
                     guard let rootIdentity, currentFileIdentity(rootURL) == rootIdentity else {
@@ -3528,7 +3563,7 @@ final class DiskModel: ObservableObject {
                     guard let identity = identities[item.id] else { continue }
                     if overlay.count < 10_000 { overlay.append(ScanRemoval(path: item.id, identity: identity)) }
                 }
-                return (removed, failures, changedParents, rootChanged, overlay, removed.count > overlay.count, parentsOverflow)
+                return (removed, failures, changedParents, rootChanged, overlay, removed.count > overlay.count, parentsOverflow, Optional(operation.cursor))
             }.value
             guard let self else { return }
             defer {
@@ -3572,6 +3607,14 @@ final class DiskModel: ObservableObject {
                 if active { self.collectionState = prepared.0 }
                 current.collectionState = prepared.0
                 current.removalEpoch &+= 1; current.removals = prepared.1.items
+                if let cursor = outcome.7 {
+                    if let target = current.durableRecoveryTarget, target.identity != cursor.identity {
+                        current.durableRecoveryConflict = true
+                        current.durablePreviewBlocked = true
+                        current.pendingFullRefresh = true
+                        if active { self.pendingFullRefresh = true }
+                    } else { current.includeRemovalTarget(cursor) }
+                }
                 let combinedParents = current.removalParents.union(outcome.2)
                 if outcome.6 || combinedParents.count > self.recoveryParentLimit {
                     current.pendingFullRefresh = true

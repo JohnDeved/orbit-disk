@@ -3,21 +3,39 @@ import Foundation
 struct PendingInventoryBatchIndex {
     let offsets: [Data: Int]
     let linkedFiles: [FileMetadata]
+    let directories: [FileMetadata]
     let estimatedByteCount: Int
+    let metadataByteCount: Int
+    let logicalSize: Int64
+    let allocatedSize: Int64
+    let fileCount: Int64
 
     init(records: [FileMetadata]) {
         var offsets: [Data: Int] = [:]
         offsets.reserveCapacity(records.count)
         var linked: [FileMetadata] = []
-        var bytes = 0
+        var directories: [FileMetadata] = []
+        var bytes = 0, metadataBytes = 0
+        var logicalSize: Int64 = 0, allocatedSize: Int64 = 0, fileCount: Int64 = 0
         for (offset, record) in records.enumerated() {
-            offsets[Data(record.name.utf8)] = offset
-            if !record.isDirectory, record.linkCount > 1 { linked.append(record) }
-            bytes += 96 + record.name.utf8.count
+            let name = Data(record.name.utf8)
+            offsets[name] = offset
+            if record.isDirectory { directories.append(record) }
+            else {
+                if record.linkCount > 1 { linked.append(record) }
+                logicalSize += record.size; allocatedSize += record.allocatedSize; fileCount += 1
+            }
+            bytes += 96 + name.count
+            metadataBytes += 160 + name.count * 2
         }
         self.offsets = offsets
         self.linkedFiles = linked
-        self.estimatedByteCount = bytes + linked.count * 96
+        self.directories = directories
+        self.estimatedByteCount = bytes + (linked.count + directories.count) * 96
+        self.metadataByteCount = metadataBytes
+        self.logicalSize = logicalSize
+        self.allocatedSize = allocatedSize
+        self.fileCount = fileCount
     }
 }
 
@@ -136,32 +154,43 @@ final class PendingInventoryRead {
     }
 
     private func node(_ path: String, key: Data, record: FileMetadata?, durable: DiskNode?) -> DiskNode? {
-        let value: DiskNode
+        guard let directory = record?.isDirectory ?? durable?.isDirectory else { return nil }
+        let delta = directory ? deltas[key] ?? Delta() : Delta()
+        var state = durable?.scanState ?? .complete
+        var accessible = durable?.isAccessible ?? true
         if let record {
-            let accessible = !record.isDirectory || (!record.isMountPoint && record.device == rootDevice)
-            let state: NodeScanState = !record.isDirectory || !accessible ? .complete : .pending
-            value = DiskNode(url: URL(fileURLWithPath: path, isDirectory: record.isDirectory), name: record.name,
-                isDirectory: record.isDirectory, isSymbolicLink: record.isSymbolicLink,
-                size: record.isDirectory ? 0 : record.size, allocatedSize: record.isDirectory ? 0 : record.allocatedSize,
-                fileCount: record.isDirectory ? 0 : 1, isAccessible: accessible,
-                rawAllocatedSize: record.isDirectory ? 0 : record.allocatedSize,
-                fileIdentity: "\(record.device):\(record.inode)", scanState: state)
-        } else if let durable { value = durable }
-        else { return nil }
-        let delta = value.isDirectory ? deltas[key] ?? Delta() : Delta()
-        var state = value.scanState
-        if value.isDirectory, byParent[key] != nil {
+            accessible = !directory || (!record.isMountPoint && record.device == rootDevice)
+            state = !directory || !accessible ? .complete : .pending
+        }
+        if directory, byParent[key] != nil {
             state = completed.contains(key) ? .complete : .scanning
-        } else if !value.isDirectory, byParent[Self.parent(key)] != nil {
+        } else if !directory, byParent[Self.parent(key)] != nil {
             state = completed.contains(Self.parent(key)) ? .complete : .pending
         }
+        if snapshot.inaccessibleDirectories.contains(key) { accessible = false; state = .complete }
+        if let record {
+            return DiskNode(url: URL(fileURLWithPath: path, isDirectory: directory), name: record.name,
+                isDirectory: directory, isSymbolicLink: record.isSymbolicLink,
+                size: (directory ? 0 : record.size) + delta.size,
+                allocatedSize: (allocations[key] ?? (directory ? 0 : record.allocatedSize)) + delta.allocated,
+                fileCount: (directory ? 0 : 1) + Int(delta.count), isAccessible: accessible,
+                rawAllocatedSize: directory ? 0 : record.allocatedSize,
+                fileIdentity: "\(record.device):\(record.inode)", scanState: state)
+        }
+        guard let value = durable else { return nil }
         return DiskNode(url: value.url, name: value.name, isDirectory: value.isDirectory, isSymbolicLink: value.isSymbolicLink,
             size: value.size + delta.size, allocatedSize: (allocations[key] ?? value.allocatedSize) + delta.allocated,
-            fileCount: value.fileCount + Int(delta.count), children: value.children, isAccessible: value.isAccessible,
-            rawAllocatedSize: value.rawAllocatedSize, fileIdentity: value.fileIdentity, scanState: state)
+            fileCount: value.fileCount + Int(delta.count), children: value.children,
+            isAccessible: accessible,
+            rawAllocatedSize: value.rawAllocatedSize, fileIdentity: value.fileIdentity,
+            scanState: state)
     }
 
     func children(_ parent: String, durable: [DiskNode], limit: Int, check: () throws -> Void) throws -> [DiskNode] {
+        let pending = byParent[Data(parent.utf8)] ?? []
+        if limit < durable.count + pending.reduce(0, { $0 + $1.records.count }) {
+            return try boundedChildren(pending, durable: durable, limit: limit, check: check)
+        }
         var children: [Data: DiskNode] = [:]
         children.reserveCapacity(durable.count)
         var inspected = 0
@@ -181,6 +210,79 @@ final class PendingInventoryRead {
         let ordered = children.values.sorted { $0.size == $1.size ? $0.name < $1.name : $0.size > $1.size }
         try check()
         return limit >= ordered.count ? ordered : Array(ordered.prefix(limit))
+    }
+
+    private struct ChildCandidate {
+        let path: Data
+        let name: String
+        let size: Int64
+        let record: FileMetadata?
+        let durable: DiskNode?
+
+        func precedes(_ other: ChildCandidate) -> Bool {
+            size == other.size ? name < other.name : size > other.size
+        }
+    }
+
+    private func boundedChildren(_ pending: [PendingInventoryBatch], durable: [DiskNode], limit: Int,
+                                 check: () throws -> Void) throws -> [DiskNode] {
+        try check()
+        guard limit > 0 else { return [] }
+        var seen = Set<Data>(), retained: [ChildCandidate] = []
+        retained.reserveCapacity(limit)
+        func consider(_ candidate: ChildCandidate) {
+            if retained.count < limit {
+                retained.append(candidate)
+                var child = retained.count - 1
+                while child > 0 {
+                    let parent = (child - 1) / 2
+                    guard retained[parent].precedes(retained[child]) else { break }
+                    retained.swapAt(child, parent); child = parent
+                }
+            } else if candidate.precedes(retained[0]) {
+                retained[0] = candidate
+                var parent = 0
+                while true {
+                    let left = parent * 2 + 1
+                    guard left < retained.count else { break }
+                    let right = left + 1
+                    let child = right < retained.count && retained[left].precedes(retained[right]) ? right : left
+                    guard retained[parent].precedes(retained[child]) else { break }
+                    retained.swapAt(parent, child); parent = child
+                }
+            }
+        }
+        var inspected = 0
+        // Visit replacements first so a discarded candidate cannot return through an older batch.
+        for batch in pending.reversed() {
+            for record in batch.records.reversed() {
+                if inspected & 255 == 0 { try check() }; inspected += 1
+                let path = HardLinkPathOrder.path(batch.parentPath, Data(record.name.utf8))
+                guard seen.insert(path).inserted else { continue }
+                let size = record.isDirectory ? deltas[path]?.size ?? 0 : record.size
+                consider(ChildCandidate(path: path, name: record.name, size: size, record: record, durable: nil))
+            }
+        }
+        for child in durable.reversed() {
+            if inspected & 255 == 0 { try check() }; inspected += 1
+            let path = Data(child.id.utf8)
+            guard seen.insert(path).inserted else { continue }
+            let size = child.size + (child.isDirectory ? deltas[path]?.size ?? 0 : 0)
+            consider(ChildCandidate(path: path, name: child.name, size: size, record: nil, durable: child))
+        }
+        try check()
+        let ordered = retained.sorted { $0.precedes($1) }
+        var result: [DiskNode] = []
+        result.reserveCapacity(ordered.count)
+        for (offset, child) in ordered.enumerated() {
+            if offset & 255 == 0 { try check() }
+            let path = child.durable?.id ?? String(decoding: child.path, as: UTF8.self)
+            if let value = node(path, key: child.path, record: child.record, durable: child.durable) {
+                result.append(value)
+            }
+        }
+        try check()
+        return result
     }
 
     func forEachMatching(_ needle: String, check: () throws -> Void, body: (DiskNode) throws -> Void) throws {

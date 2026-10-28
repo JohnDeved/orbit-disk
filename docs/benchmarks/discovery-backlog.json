@@ -1,0 +1,102 @@
+{
+  "date": "2026-10-28",
+  "scope": "Synthetic metadata discovery with the durable writer held stopped. This is a queue-backpressure reproduction, not a filesystem throughput or UI rendering benchmark.",
+  "environment": {
+    "architecture": "arm64",
+    "macOS": "27.0.1 (26A434)",
+    "swift": "6.3.3",
+    "optimization": "-O, Swift 5 language mode, ORBIT_TESTING, assertions enabled"
+  },
+  "baseline": {
+    "commit": "8ceffdba051ff82fb47364442e6b38f381db47de",
+    "release": "0.9.8",
+    "sourceSHA256": {
+      "Sources/OrbitCore/AsyncListingProducer.swift": "1d21ad887d386b2bd32580663dc8c29b08cc73d9d4e73624baa720ff41aa0466",
+      "Sources/OrbitCore/WALCrawler.swift": "4a1ccaf61e31187054d7492bba584c8d73a96c63000685c90b1fb2f6ecd3b8f2",
+      "Sources/OrbitCore/ResumableStage.swift": "f5a7e67f2f7c81b1dd0907b71e7688a7b8dda723c44f5be6fead7c57e85b9832"
+    }
+  },
+  "candidate": {
+    "state": "unreleased working tree",
+    "sourceSHA256": {
+      "Sources/OrbitCore/AsyncListingProducer.swift": "20b148cf716dcac0b357d01c4696d1cd1738096004f4313030cda42319d71498",
+      "Sources/OrbitCore/WALCrawler.swift": "6e3f459e6b8c28df28f51e5521f76bd3131895e0ee24e4a0a2acc7435a729630",
+      "Sources/OrbitCore/ResumableStage.swift": "90d597ae13b7ee1e2ae973e992ab57decf389cf2001a40c70c055500c56476a0"
+    }
+  },
+  "protocol": {
+    "runOrder": [
+      "baseline",
+      "candidate",
+      "candidate",
+      "baseline"
+    ],
+    "fixtures": "Eight real directories, each with 128 empty source files. Each native child-listing callback is replaced by 20,000 synthetic file metadata records with unique names within that directory and 220-character suffixes.",
+    "expectedFiles": 160000,
+    "expectedDirectories": 8,
+    "writer": "Never advanced; every run verified SQLite contained only its initialized root node.",
+    "stoppingRule": "Finish discovery or observe for 2 seconds, then capture metrics and cancel. Old pending-byte limit prevents enqueueing the next batch even if current pendingBytes is below the limit.",
+    "timing": "Starts after fixture and stage creation. Includes synthetic record generation and in-memory discovery ingestion. Excludes durable ingestion, publication, UI and real large-tree enumeration.",
+    "isolation": "Fresh process and private empty cache per run. Builds and regression tests stopped during measurements.",
+    "memory": "Pending-byte count is an estimate, not RSS. peakRSSBytes uses getrusage(RUSAGE_SELF)."
+  },
+  "samples": [
+    {
+      "deferredDirectories": 0,
+      "discoveredRecords": 120008,
+      "discoverySeconds": null,
+      "durableNodes": 1,
+      "finished": false,
+      "observationSeconds": 2.0185780415777117,
+      "peakPendingBytes": 115487067,
+      "peakRSSBytes": 117719040,
+      "pendingBytes": 115487067,
+      "retainedRecords": 120008,
+      "syntheticFilesExpected": 160000,
+      "variant": "baseline"
+    },
+    {
+      "deferredDirectories": 0,
+      "discoveredRecords": 160008,
+      "discoverySeconds": 0.11328670824877918,
+      "durableNodes": 1,
+      "finished": true,
+      "observationSeconds": 0.11368558323010802,
+      "peakPendingBytes": 153981911,
+      "peakRSSBytes": 133234688,
+      "pendingBytes": 153981911,
+      "retainedRecords": 160008,
+      "syntheticFilesExpected": 160000,
+      "variant": "candidate"
+    },
+    {
+      "deferredDirectories": 0,
+      "discoveredRecords": 160008,
+      "discoverySeconds": 0.09451583330519497,
+      "durableNodes": 1,
+      "finished": true,
+      "observationSeconds": 0.09488795837387443,
+      "peakPendingBytes": 153981911,
+      "peakRSSBytes": 134283264,
+      "pendingBytes": 153981911,
+      "retainedRecords": 160008,
+      "syntheticFilesExpected": 160000,
+      "variant": "candidate"
+    },
+    {
+      "deferredDirectories": 0,
+      "discoveredRecords": 120008,
+      "discoverySeconds": null,
+      "durableNodes": 1,
+      "finished": false,
+      "observationSeconds": 2.010599375003949,
+      "peakPendingBytes": 115487067,
+      "peakRSSBytes": 118833152,
+      "pendingBytes": 115487067,
+      "retainedRecords": 120008,
+      "syntheticFilesExpected": 160000,
+      "variant": "baseline"
+    }
+  ],
+  "recoveryNote": "Restored from the exact surviving metadata, protocol, source hashes and four samples in local session history after the project folder was deleted. The original validation tail was unavailable; it has not been reconstructed or presented as original output. Current verification is recorded with the parallel-discovery benchmark."
+}

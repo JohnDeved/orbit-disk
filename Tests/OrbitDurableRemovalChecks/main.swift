@@ -95,6 +95,54 @@ final class BlockingGate: @unchecked Sendable {
             try await wait("direct large reconciliation") { model.current?.id == root.path && model.current?.children.isEmpty == true && !model.isRefreshing }
             model.cancelScan()
         }
+        if args.count == 3 && ["cursor-race", "cursor-journal-race"].contains(args[2]) {
+            let journalConflict = args[2] == "cursor-journal-race"
+            let root = base.appendingPathComponent("cursor/root"), cache = base.appendingPathComponent("cursor/cache")
+            try fm.createDirectory(at: root, withIntermediateDirectories: true)
+            let victim = root.appendingPathComponent("victim"), keep = root.appendingPathComponent("keep")
+            try Data([1, 2]).write(to: victim); try Data([3]).write(to: keep)
+            let model = DiskModel(cacheDirectory: cache, preferences: UserDefaults(suiteName: "durable-cursor-\(UUID())")!)
+            model.testMonitorUnavailable = true
+            let cursorGate = Gate(), refreshGate = Gate()
+            defer { cursorGate.release(); refreshGate.release(); model.cancelScan() }
+            model.scan(root)
+            try await wait("cursor initial map") { model.current?.id == root.path && !model.isScanning && !model.isRefreshing }
+            model.testStopJournalMonitor()
+            guard let node = model.current?.children.first(where: { $0.id == victim.path }), model.collect([node]) else {
+                throw NSError(domain: "cursor collection", code: 1)
+            }
+            try await wait("cursor collection ready") { !model.isValidatingCollection }
+            model.testAfterPublishedRemovalCursorRead = { cursorGate.pauseOnce() }
+            model.testBeforeRefreshSave = { refreshGate.pauseOnce() }
+            model.rescan()
+            try await wait("old cursor captured") { cursorGate.waiting }
+            model.testStopJournalMonitor()
+            if journalConflict {
+                let locks = DiskIndexStore(directory: cache).lockDirectory
+                try fm.moveItem(at: locks.appendingPathComponent(".orbit-removals"), to: locks.appendingPathComponent("old-journal"))
+                model.testBeforeScannerStart = { refreshGate.pauseOnce() }
+            }
+            model.deleteCollectionPermanently()
+            try await wait("newer removal complete") { !model.isRemovingAcrossSessions && !fm.fileExists(atPath: victim.path) }
+            cursorGate.release()
+            try await wait("newer removal reconciliation") {
+                refreshGate.waiting && (model.current?.children.contains(where: { $0.id == victim.path }) == false || (journalConflict && model.root == nil))
+            }
+            guard model.isUpdatingRemovalSizes else { throw NSError(domain: "older cursor retired newer removal", code: 1) }
+            if !journalConflict {
+                guard let survivor = model.current?.children.first(where: { $0.id == keep.path }),
+                      !model.isUpdatingRemovalSize(of: survivor), survivor.size == 1 else {
+                    throw NSError(domain: "unaffected file size hidden during recovery", code: 1)
+                }
+            }
+            refreshGate.release()
+            try await wait("newer removal settled") { model.current?.id == root.path && !model.isScanning && !model.isRefreshing && !model.isUpdatingRemovalSizes }
+            guard model.current?.children.contains(where: { $0.id == victim.path }) == false else {
+                throw NSError(domain: "cursor race restored deleted item", code: 1)
+            }
+            print(journalConflict ? "PASS: a replaced journal forces reconciliation before retiring deletion state" :
+                "PASS: a published cursor cannot retire a newer deletion; surviving file sizes remain available")
+        }
         if args.count == 3 && args[2] == "many-parents" {
             let root = base.appendingPathComponent("parents/root"), cache = base.appendingPathComponent("parents/cache")
             try fm.createDirectory(at: root, withIntermediateDirectories: true)
@@ -128,6 +176,7 @@ final class BlockingGate: @unchecked Sendable {
             gate.release()
             try await wait("parents fallback complete") { model.current?.id == root.path && !model.isScanning && !model.isRefreshing }
             guard model.current?.children.count == 7 else { throw NSError(domain: "parent fallback lost folders", code: 1) }
+            guard !model.isUpdatingRemovalSizes else { throw NSError(domain: "full refresh left sizes updating", code: 1) }
             model.cancelScan()
         }
         if args.count == 3 && args[2] == "deferred" {
@@ -245,6 +294,7 @@ final class BlockingGate: @unchecked Sendable {
             try await wait("stopped overflow withheld") { model.root == nil }
             model.rescan()
             try await wait("stopped overflow resumed") { model.current?.id == root.path && model.current?.children.isEmpty == true && !model.isScanning && !model.isRefreshing }
+            guard !model.isUpdatingRemovalSizes else { throw NSError(domain: "resumed map left sizes updating", code: 1) }
             model.cancelScan()
         }
         if args.count == 3 && args[2] == "cumulative" {

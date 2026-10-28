@@ -34,7 +34,7 @@ struct FileRowView: View {
                 }.frame(height: 13, alignment: .leading)
             }.frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             VStack(alignment: .trailing, spacing: 4) {
-                Text(model.isUpdatingRemovalSizes ? "Updating…" : !item.isAccessible ? "Unavailable" : item.scanState == .pending ? "Waiting" : formatBytes(item.size))
+                Text(model.isUpdatingRemovalSize(of: item) ? "Updating…" : !item.isAccessible ? "Unavailable" : item.scanState == .pending ? "Waiting" : formatBytes(item.size))
                     .font(.system(size: 12, weight: .medium)).monospacedDigit().lineLimit(1)
                 ZStack(alignment: .trailing) {
                     if model.isUpdatingRemovalSizes {

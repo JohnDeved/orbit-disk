@@ -8,6 +8,7 @@ Design read: a native disk-space analysis app for Mac users, with a restrained d
 - Coral marks the scan/collection actions; the multi-hue chart palette encodes separate filesystem branches and is repeated in the content list.
 - A fixed places column, flexible map, and file inspector mirror the sequence choose, inspect, review.
 - System typography follows native Mac conventions; monospaced digits keep size comparisons stable.
+- Interface copy names locations, actions and state directly. The empty screen has one scan instruction; the empty header has no tagline. Repeated encouragement and reassurance are omitted. Deletion consequences, incomplete sizes and actionable errors remain explicit.
 - Wide space around the map separates exploration from the denser file rows.
 - The native unified title bar aligns the current location, search, refresh and folder picker with the system window buttons. The header contains no logo or wordmark. Sidebar and canvas colors continue behind the transparent title bar, including the sidebar divider. Toolbar content fits inside the native title bar instead of extending above its edge. Bounded control widths keep navigation from shifting the toolbar; long locations truncate.
 - Map folders open on a single click, and the whole center circle goes up. File rows retain native selection and double-click behavior, with a separate arrow button for direct folder navigation. Going up keeps the previous folder selected.

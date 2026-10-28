@@ -341,8 +341,9 @@ final class NthGate: @unchecked Sendable {
             }
             model.rescan()
             try await wait("resumed removal gate") {replayGate.waiting && model.isPartialMap}
-            precondition(model.current?.children.contains(where:{$0.id == victim.path}) == false,
-                         "The stale row must remain hidden while replay is held")
+            let visibleVictim = model.current?.children.first { $0.id == victim.path }
+            precondition(visibleVictim == nil || (recreate && visibleVictim?.fileIdentity != oldIdentity && visibleVictim?.size == 7),
+                         "Only a freshly discovered replacement may appear before durable replay")
             replayGate.release()
             model.testConfigureStage = { _ in }; model.testAfterStageAttach = {}
             let store = DiskIndexStore(directory:cache)

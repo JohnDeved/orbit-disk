@@ -47,17 +47,29 @@ public final class DiskScanPreview: @unchecked Sendable {
     private var version: UInt64 = 0
     private var staged: ResumableStage?
     private var preferredPath: String?
+    private let changes = ScanChangeNotifications()
+    private var stageObservation: Task<Void, Never>?
+    public var updates: AsyncStream<Void> { changes.stream() }
 
     public func attach(stage: ResumableStage) {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock(); defer { lock.unlock(); changes.send() }
         staged = stage; version &+= 1; stage.prioritize(path: preferredPath)
+        stageObservation?.cancel()
+        let updates = stage.updates
+        stageObservation = Task { [weak self] in
+            for await _ in updates {
+                if Task.isCancelled { return }
+                self?.changes.send()
+            }
+        }
     }
     public func prioritize(path: String?) {
         lock.lock(); defer { lock.unlock() }
         preferredPath = path; staged?.prioritize(path: path)
     }
     public func detachStage() {
-        lock.lock(); staged = nil; version &+= 1; lock.unlock()
+        lock.lock(); staged = nil; stageObservation?.cancel(); stageObservation = nil; version &+= 1; lock.unlock()
+        changes.send()
     }
     private func currentStage() -> ResumableStage? {
         lock.lock(); defer { lock.unlock() }; return staged
@@ -73,6 +85,7 @@ public final class DiskScanPreview: @unchecked Sendable {
     #endif
 
     public init() {}
+    deinit { stageObservation?.cancel() }
 
     public var revision: UInt64 {
         lock.lock()
@@ -360,7 +373,7 @@ public final class DiskScanPreview: @unchecked Sendable {
 
     func begin(_ root: DiskNode) {
         lock.lock()
-        defer { lock.unlock() }
+        defer { lock.unlock(); changes.send() }
         entries.removeAll(keepingCapacity: true)
         rootID = root.id
         entries[root.id] = Entry(root, parent: nil)
@@ -369,7 +382,7 @@ public final class DiskScanPreview: @unchecked Sendable {
 
     func appendListing(_ path: String, children: [DiskNode]) {
         lock.lock()
-        defer { lock.unlock() }
+        defer { lock.unlock(); changes.send() }
         guard let directory = entries[path] else { return }
         var size: Int64 = 0, allocated: Int64 = 0, count = 0
         for child in children {
@@ -389,7 +402,7 @@ public final class DiskScanPreview: @unchecked Sendable {
 
     func clearListing(_ path: String) {
         lock.lock()
-        defer { lock.unlock() }
+        defer { lock.unlock(); changes.send() }
         guard let directory = entries[path] else { return }
         for id in directory.children { entries.removeValue(forKey: id) }
         directory.children.removeAll()
@@ -400,7 +413,7 @@ public final class DiskScanPreview: @unchecked Sendable {
 
     func markScanning(_ path: String) {
         lock.lock()
-        defer { lock.unlock() }
+        defer { lock.unlock(); changes.send() }
         guard let entry = entries[path], entry.scanState != .scanning else { return }
         entry.scanState = .scanning
         version &+= 1
@@ -408,7 +421,7 @@ public final class DiskScanPreview: @unchecked Sendable {
 
     func recordListing(_ path: String, children: [DiskNode]) {
         lock.lock()
-        defer { lock.unlock() }
+        defer { lock.unlock(); changes.send() }
         guard let directory = entries[path] else { return }
         if !directory.hasListedChildren {
             for id in directory.children { entries.removeValue(forKey: id) }
@@ -435,7 +448,7 @@ public final class DiskScanPreview: @unchecked Sendable {
 
     func complete(_ node: DiskNode) {
         lock.lock()
-        defer { lock.unlock() }
+        defer { lock.unlock(); changes.send() }
         guard let entry = entries[node.id] else { return }
         updateTotals(entry, size: node.size, allocatedSize: node.allocatedSize, fileCount: node.fileCount)
         entry.isAccessible = node.isAccessible

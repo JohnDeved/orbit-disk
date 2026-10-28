@@ -71,8 +71,45 @@ final class ThreadGate: @unchecked Sendable {
         for _ in 0..<3000 { if await check() { return }; try await Task.sleep(nanoseconds: 3_000_000) }
         fatalError("timeout: \(label)")
     }
+    @MainActor static func workBeforeSaving(_ base: URL) async throws {
+        let root = base.appendingPathComponent("before-save/root")
+        let folder = root.appendingPathComponent("folder")
+        let cache = base.appendingPathComponent("before-save/cache")
+        let fm = FileManager.default
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        for index in 0..<270 { try Data([1]).write(to: folder.appendingPathComponent("visible-\(index)")) }
+        let suite = "live-ui-\(UUID())", gate = ThreadGate()
+        let preferences = UserDefaults(suiteName: suite)!
+        defer { preferences.removePersistentDomain(forName: suite); gate.release() }
+        let model = DiskModel(cacheDirectory: cache, preferences: preferences)
+        model.testAfterStageAttach = { gate.pause() }
+        model.scan(root)
+        try await wait("discovered UI with writer stopped") {
+            gate.waiting && model.isPartialMap && model.root?.fileCount == 270
+                && model.current?.children.contains { $0.name == "folder" } == true
+        }
+        model.open(model.current!.children.first { $0.name == "folder" }!)
+        try await wait("live folder navigation") { model.current?.id == folder.path && model.current?.children.count == 270 }
+        let victim = model.current!.children[0]
+        let drag = model.beginCollectionDrag([victim], label: victim.name)!
+        let payload = drag.data(forType: DiskModel.collectionDragType)!
+        model.endCollectionDrag(drag)
+        precondition(model.collectDrag(data: payload))
+        try await wait("live drag collected") { !model.isValidatingCollection && model.collection.count == 1 }
+        model.deleteCollectionPermanently(review: model.beginCollectionReview()!)
+        try await wait("delete before first inventory save") {
+            !model.isRemoving && !fm.fileExists(atPath: victim.id) && model.current?.children.count == 269
+        }
+        precondition(gate.waiting && model.isPartialMap, "Deletion required writer catch-up")
+        gate.release()
+        try await wait("saved inventory after live deletion") { !model.isScanning && !model.isPartialMap && model.root?.fileCount == 269 }
+        precondition(!model.current!.children.contains { $0.id == victim.id })
+        model.cancelScan()
+        print("PASS: UI navigation, native drag token and permanent deletion finish before the inventory writer runs")
+    }
     @MainActor static func main() async throws {
         let base = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
+        try await workBeforeSaving(base)
         let root = base.appendingPathComponent("root", isDirectory: true)
         let other = base.appendingPathComponent("other", isDirectory: true)
         let fm = FileManager.default

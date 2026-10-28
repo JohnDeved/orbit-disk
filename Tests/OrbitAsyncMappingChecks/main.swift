@@ -7,11 +7,11 @@ import Foundation
 @main struct AsyncMappingChecks {
     static let fm = FileManager.default
 
-    static func start(_ stage: ResumableStage, signals: Signals, byteLimit: Int = 64 * 1024 * 1024,
-                      frontierLimit: Int = 4096, deferDirectory: ((Data) -> Bool)? = nil) throws -> PendingInventoryMailbox {
+    static func start(_ stage: ResumableStage, signals: Signals,
+                      deferDirectory: ((Data) -> Bool)? = nil, workerCount: Int = 4) throws -> PendingInventoryMailbox {
         try stage.prepareRemovalReplay()
         stage.testDisableAsyncDiscovery = true
-        try require(stage.crawler.startAsyncDiscovery(deferDirectory: deferDirectory, byteLimit: byteLimit, frontierLimit: frontierLimit,
+        try require(stage.crawler.startAsyncDiscovery(deferDirectory: deferDirectory, workerCount: workerCount,
                     onAccepted: { signals.signal() }), "Fresh native discovery did not start")
         guard let mailbox = stage.crawler.asyncInventory else { throw AsyncCheckFailure(description: "Missing discovery mailbox") }
         return mailbox
@@ -27,17 +27,28 @@ import Foundation
         let base = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         try SecureCursorChecks.run(base)
         try DiscoveryHotPathChecks.run(base)
+        try MetadataBookkeepingChecks.run(base)
+        try BoundedChildrenChecks.run(base)
         try automaticSelection(base)
+        try liveViewsWithoutDatabase(base)
+        try resumedLiveDiscovery(base)
+        try sharedLiveDiscovery(base)
+        try refreshedLiveDiscovery(base)
+        try liveCacheInvalidation(base)
+        try ParallelDiscoveryChecks.run(base)
         try pendingNavigationAndSearch(base)
         try snapshotBoundaries(base)
+        try livePageRetirement(base)
         try preAccountingHardLinks(base)
         try journalRemoval(base)
         try concurrentReplacement(base)
         try cachedWriterAncestorReplacement(base)
         try directoryFailurePreservesProgress(base)
         try duplicateListings(base)
-        try boundedCancellation(base)
-        try boundedFrontier(base)
+        try backlogDiscovery(base)
+        try wideFrontierDiscovery(base)
+        try backlogCancellation(base)
+        try wideListingDiscovery(base)
         try crashResume(base)
         print("PASS: asynchronous discovery and durable mapping checks")
     }
@@ -55,9 +66,9 @@ import Foundation
         let serial = try fallback.stage()
         serial.configureTestScanner(DiskScanner(useBulkEnumeration: false))
         try finish(serial)
-        try require(serial.crawler.asyncInventory == nil, "Fallback walker unexpectedly used the native asynchronous path")
+        try require(serial.crawler.asyncInventory != nil, "Fallback walker did not use asynchronous discovery")
         try verifyTree(serial, fixture: fallback)
-        print("PASS: fresh native mappings select async; fallback mappings retain the serial path")
+        print("PASS: native and fallback mappings both select asynchronous discovery")
     }
 
     static func pendingNavigationAndSearch(_ base: URL) throws {
@@ -289,24 +300,6 @@ import Foundation
         print("PASS: denied and missing first directories retain unrelated discovery and RAM progress")
     }
 
-    static func boundedCancellation(_ base: URL) throws {
-        let fixture = try AsyncFixture(base, "bounded-cancel")
-        for index in 0..<2048 { try fixture.file("\(index)-" + String(repeating: "x", count: 180), size: 1) }
-        let cancellation = ScanCancellation(), stage = try fixture.stage(cancellation), signals = Signals()
-        let limit = 256 * 1024
-        let mailbox = try start(stage, signals: signals, byteLimit: limit)
-        try signals.until("producer reaches queue backpressure") { mailbox.pendingBytes > limit - 64 * 1024 }
-        try require(!mailbox.discoveryFinished, "Bounded producer consumed the entire fixture without backpressure")
-        try require(mailbox.peakPendingBytes <= limit, "Pending inventory exceeded its byte budget")
-        let started = ProcessInfo.processInfo.systemUptime
-        cancellation.cancel()
-        stage.crawler.cancelAsyncDiscovery()
-        try signals.until("cancel wakes a producer blocked on a full queue", timeout: 2) { mailbox.discoveryFinished }
-        try require(ProcessInfo.processInfo.systemUptime - started < 2, "Queue cancellation waited for writer progress")
-        try require(try scalar(stage.crawler.store.databasePath, "SELECT COUNT(*) FROM nodes") == 1, "Cancelled queue committed data")
-        print("PASS: byte-bounded backpressure and cancellation without a running writer")
-    }
-
     static func duplicateListings(_ base: URL) throws {
         for crossBatch in [false, true] {
             let fixture = try AsyncFixture(base, crossBatch ? "duplicate-across-batches" : "duplicate-within-batch")
@@ -343,19 +336,6 @@ import Foundation
         print("PASS: within-batch and cross-batch duplicate names are rejected before exposure and repaired without losing unrelated RAM")
     }
 
-    static func boundedFrontier(_ base: URL) throws {
-        let fixture = try AsyncFixture(base, "bounded-frontier")
-        for index in 0..<40 { try fixture.file("folder-\(index)/nested/leaf", size: index + 1) }
-        let stage = try fixture.stage(), signals = Signals()
-        let mailbox = try start(stage, signals: signals, frontierLimit: 2)
-        defer { stage.crawler.cancelAsyncDiscovery() }
-        try signals.until("bounded frontier discovery") { mailbox.discoveryFinished }
-        try require(mailbox.peakFrontierCount <= 2, "Directory frontier exceeded its budget")
-        try finish(stage)
-        try verifyTree(stage, fixture: fixture)
-        print("PASS: bounded directory frontier leaves durable work for serial continuation")
-    }
-
     static func crashChild(_ base: URL, boundary: String) throws {
         let fixture = try AsyncFixture(base, boundary)
         let stage = try fixture.stage(), signals = Signals()
@@ -386,7 +366,7 @@ import Foundation
             let rows = try scalar(stage.crawler.store.databasePath, "SELECT COUNT(*) FROM nodes")
             try require(boundary == "before-write" ? rows == 1 : rows > 1, "Crash boundary did not preserve the expected committed prefix")
             try finish(stage)
-            try require(stage.crawler.asyncInventory == nil, "Resumed inventory unexpectedly restarted fresh asynchronous discovery")
+            try require(stage.crawler.asyncInventory != nil, "Resumed discovery fell back to the serial writer")
             try verifyTree(stage, fixture: fixture)
         }
         print("PASS: SIGKILL before writes and after commit resumes pending directory work without loss")

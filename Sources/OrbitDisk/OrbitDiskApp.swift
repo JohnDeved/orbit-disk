@@ -8,6 +8,7 @@ struct OrbitDiskApp: App {
     @StateObject private var updater: AppUpdater
 
     init() {
+        MappingCacheReset.finishPendingReset()
         let model = DiskModel()
         _model = StateObject(wrappedValue: model)
         _updater = StateObject(wrappedValue: AppUpdater(model: model))
@@ -37,6 +38,8 @@ struct OrbitDiskApp: App {
         .commands {
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesButton(updater: updater)
+                Button("Clear Cache…", action: clearCache)
+                    .disabled(model.isRemovingAcrossSessions)
             }
             CommandGroup(replacing: .newItem) {
                 Button("Open Folder…", action: model.chooseFolder).keyboardShortcut("o")
@@ -61,5 +64,17 @@ struct OrbitDiskApp: App {
             UpdateSettingsView(updater: updater)
                 .preferredColorScheme(.dark)
         }
+    }
+
+    private func clearCache() {
+        guard !model.hasActiveRemovals else { return }
+        let alert = NSAlert()
+        alert.messageText = "Clear cached maps?"
+        alert.informativeText = "Orbit Disk will restart. Saved maps and the current collection will be cleared. Your files and Places will stay unchanged."
+        alert.addButton(withTitle: "Clear Cache and Restart")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn, !model.hasActiveRemovals else { return }
+        do { try MappingCacheReset.restart() }
+        catch { model.errorMessage = "Couldn’t restart Orbit Disk: \(error.localizedDescription)" }
     }
 }

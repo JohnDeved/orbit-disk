@@ -105,13 +105,13 @@ struct UpdateSettingsView: View {
                 get: { updater.automaticallyChecksForUpdates },
                 set: updater.setAutomaticallyChecksForUpdates
             ))
-            Text("Checks GitHub daily when Orbit Disk is open. Updates install after you choose to restart.")
+            Text("Checks for updates daily while Orbit Disk is open.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Text(updater.isWaitingForRemoval
                  ? "The update will restart Orbit Disk after file removal finishes."
-                 : "Restarting clears the current collection. Your saved disk maps remain available.")
+                 : "Restarting clears the current collection.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .frame(height: 36, alignment: .topLeading)

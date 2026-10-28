@@ -26,6 +26,7 @@ case "$1" in
     ./check-session.sh
     ;;
   mapping)
+    ./check-discovery-cache.sh
     ./check-async-mapping.sh
     ./check-resumable.sh
     ./check-mapping-reuse.sh
@@ -42,6 +43,8 @@ case "$1" in
   rendering)
     ./check-rendering.sh
     ./check-layout.sh
+    ./check-folder-places.sh
+    ./check-cache-reset.sh
     ;;
   *)
     print -u2 "Unknown CI suite: $1"

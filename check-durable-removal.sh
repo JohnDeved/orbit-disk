@@ -17,6 +17,6 @@ swiftc -assert-config Debug -parse-as-library -O -swift-version 5 -target "$targ
   Sources/OrbitDisk/IndexRefreshPlanner.swift Tests/OrbitDurableRemovalChecks/main.swift \
   -o "$build/DurableRemovalChecks"
 "$build/DurableRemovalChecks" "$fixture"
-for scenario in large cumulative direct-large stopped-overflow cancel-copy cancel-rename journal-replaced deferred many-parents; do
+for scenario in large cumulative direct-large stopped-overflow cancel-copy cancel-rename journal-replaced deferred many-parents cursor-race cursor-journal-race; do
   "$build/DurableRemovalChecks" "$fixture" "$scenario"
 done

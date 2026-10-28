@@ -79,7 +79,7 @@ package enum StreamingBulkDirectory {
                 }
                 let nameBytes = UnsafeBufferPointer(start: record.advanced(by: nameStart).assumingMemoryBound(to: UInt8.self),
                                                     count: nameLength - 1)
-                guard let name = String(bytes: nameBytes, encoding: .utf8), !name.contains("/") else {
+                guard !nameBytes.contains(47), let name = decodedName(nameBytes) else {
                     issue("\(url.path): file name could not be decoded")
                     continue
                 }
@@ -96,9 +96,8 @@ package enum StreamingBulkDirectory {
                     (isDirectory ? returned.dirattr & UInt32(ATTR_DIR_MOUNTSTATUS) != 0 : returned.fileattr & file == file)
                 if !complete {
                     if cancellation.isCancelled { throw CancellationError() }
-                    let childURL = url.appendingPathComponent(name, isDirectory: false)
                     let metadata: FileMetadata
-                    do { metadata = try readAt(descriptor, name: name, path: childURL.path) }
+                    do { metadata = try readAt(descriptor, name: name, path: url.appendingPathComponent(name, isDirectory: false).path) }
                     catch { issue(error.localizedDescription); continue }
                     try accept(metadata)
                     continue
@@ -119,10 +118,16 @@ package enum StreamingBulkDirectory {
             if let testFallbackAfterFirstBuffer { testFallbackAfterFirstBuffer(); throw Failure.needsFallback }
         }
     }
-    private static func readAt(_ descriptor: Int32, name: String, path: String) throws -> FileMetadata {
+    private static func decodedName(_ bytes: UnsafeBufferPointer<UInt8>) -> String? {
+        if #available(macOS 15, *) { return String(validating: bytes, as: UTF8.self) }
+        return String(bytes: bytes, encoding: .utf8)
+    }
+
+    private static func readAt(_ descriptor: Int32, name: String, path: @autoclosure () -> String) throws -> FileMetadata {
         var info = stat()
         guard name.withCString({ fstatat(descriptor, $0, &info, AT_SYMLINK_NOFOLLOW) }) == 0 else {
-            throw ScanError.filesystem(path, errno)
+            let code = errno
+            throw ScanError.filesystem(path(), code)
         }
         let kind = info.st_mode & mode_t(S_IFMT)
         let directory = kind == mode_t(S_IFDIR)
@@ -133,7 +138,7 @@ package enum StreamingBulkDirectory {
                 defer { close(child) }
                 var childInfo = stat()
                 guard fstat(child, &childInfo) == 0, childInfo.st_dev == info.st_dev, childInfo.st_ino == info.st_ino else {
-                    throw ScanError.filesystem(path, EAGAIN)
+                    throw ScanError.filesystem(path(), EAGAIN)
                 }
                 var attributes = attrlist(bitmapcount: UInt16(ATTR_BIT_MAP_COUNT), reserved: 0,
                                           commonattr: 0, volattr: 0, dirattr: UInt32(ATTR_DIR_MOUNTSTATUS), fileattr: 0, forkattr: 0)
@@ -142,11 +147,15 @@ package enum StreamingBulkDirectory {
                 if status == 0 && value[0] >= 8 { isMountPoint = value[1] & UInt32(DIR_MNTSTATUS_MNTPOINT) != 0 }
                 else {
                     var parentFS = statfs(), childFS = statfs()
-                    guard fstatfs(descriptor, &parentFS) == 0, fstatfs(child, &childFS) == 0 else { throw ScanError.filesystem(path, errno) }
+                    guard fstatfs(descriptor, &parentFS) == 0, fstatfs(child, &childFS) == 0 else {
+                        let code = errno
+                        throw ScanError.filesystem(path(), code)
+                    }
                     isMountPoint = parentFS.f_fsid.val.0 != childFS.f_fsid.val.0 || parentFS.f_fsid.val.1 != childFS.f_fsid.val.1
                 }
             } else if errno != EACCES && errno != EPERM {
-                throw ScanError.filesystem(path, errno)
+                let code = errno
+                throw ScanError.filesystem(path(), code)
             }
         }
         return FileMetadata(name: name, device: info.st_dev, inode: info.st_ino,
@@ -175,7 +184,7 @@ package enum StreamingBulkDirectory {
             }
             let name = withUnsafePointer(to: &entry.pointee.d_name) {
                 $0.withMemoryRebound(to: UInt8.self, capacity: Int(entry.pointee.d_namlen)) {
-                    String(bytes: UnsafeBufferPointer(start: $0, count: Int(entry.pointee.d_namlen)), encoding: .utf8)
+                    decodedName(UnsafeBufferPointer(start: $0, count: Int(entry.pointee.d_namlen)))
                 }
             }
             guard let name, !name.contains("/") else { issue("\(url.path): file name could not be decoded"); continue }

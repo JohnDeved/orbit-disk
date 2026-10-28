@@ -28,19 +28,24 @@ public final class RemovalJournal: @unchecked Sendable {
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
     private let fenceName = "journal.lock"
     private let dbName = "journal.sqlite"
+    private let waitsForLocks: Bool
+    private static let readFenceLock = NSRecursiveLock()
     #if ORBIT_TESTING
     package static var testBeforePendingCommit: (@Sendable () -> Void)?
     package static var testAfterRecoveryProbe: (@Sendable () -> Void)?
     #endif
 
-    public init(cache: URL) throws {
+    public init(cache: URL, waitForLocks: Bool = true) throws {
+        waitsForLocks = waitForLocks
         let parentURL = IndexLocations.locks(for: cache)
-        try FileManager.default.createDirectory(at: parentURL, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        if waitForLocks { try FileManager.default.createDirectory(at: parentURL, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
         let parent = open(parentURL.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard parent >= 0 else { throw Failure.unsafe("journal parent") }
         defer { close(parent) }
-        if mkdirat(parent, ".orbit-removals", 0o700) != 0 && errno != EEXIST { throw Failure.unsafe("journal directory") }
-        guard fsync(parent) == 0 else { throw Failure.unsafe("sync journal parent") }
+        if waitForLocks {
+            if mkdirat(parent, ".orbit-removals", 0o700) != 0 && errno != EEXIST { throw Failure.unsafe("journal directory") }
+            guard fsync(parent) == 0 else { throw Failure.unsafe("sync journal parent") }
+        }
         let dir = openat(parent, ".orbit-removals", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard dir >= 0 else { throw Failure.unsafe("open journal directory") }
         var info = stat()
@@ -62,6 +67,8 @@ public final class RemovalJournal: @unchecked Sendable {
     }
     private func checkedFile(_ name: String, flags: Int32, create: Bool) throws -> (Int32, stat) {
         try validateDirectory()
+        let create = create && waitsForLocks
+        let flags = waitsForLocks ? flags : flags & ~O_CREAT & ~O_EXCL
         var created = false
         var fd: Int32
         if create && (flags & O_EXCL) == 0 {
@@ -113,11 +120,12 @@ public final class RemovalJournal: @unchecked Sendable {
             guard (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == geteuid(), info.st_nlink == 1, (info.st_mode & 0o777) == 0o600 else { throw Failure.unsafe("journal sidecar identity") }
         }
     }
-    private func waitLock(_ fd: Int32, cancellation: ScanCancellation) throws {
-        while flock(fd, LOCK_EX | LOCK_NB) != 0 {
+    private func waitLock(_ fd: Int32, cancellation: ScanCancellation, shared: Bool = false) throws {
+        while flock(fd, (shared ? LOCK_SH : LOCK_EX) | LOCK_NB) != 0 {
             let e = errno
             if cancellation.isCancelled || Task<Never, Never>.isCancelled { throw CancellationError() }
             guard e == EWOULDBLOCK || e == EINTR else { throw Failure.unsafe("journal lock") }
+            guard waitsForLocks else { throw Failure.sqlite("journal busy") }
             usleep(10_000)
         }
         if cancellation.isCancelled || Task<Never, Never>.isCancelled { throw CancellationError() }
@@ -128,12 +136,13 @@ public final class RemovalJournal: @unchecked Sendable {
         fileprivate let name: String
         fileprivate let fd: Int32
         fileprivate let identity: stat
-        public let sequence: Int64
+        public let cursor: RemovalCursor
+        public var sequence: Int64 { cursor.sequence }
         private let parents: [Data: ParentIdentity]
         private let lock = NSLock()
         private var completed = false
-        fileprivate init(journal: RemovalJournal, name: String, fd: Int32, identity: stat, sequence: Int64, parents: [Data: ParentIdentity]) {
-            self.journal = journal; self.name = name; self.fd = fd; self.identity = identity; self.sequence = sequence; self.parents = parents
+        fileprivate init(journal: RemovalJournal, name: String, fd: Int32, identity: stat, cursor: RemovalCursor, parents: [Data: ParentIdentity]) {
+            self.journal = journal; self.name = name; self.fd = fd; self.identity = identity; self.cursor = cursor; self.parents = parents
         }
         /// Reject a resolved parent that changed since its intent was committed.
         public func parentIsUnchanged(path: String) -> Bool {
@@ -173,17 +182,21 @@ public final class RemovalJournal: @unchecked Sendable {
         let (fd, info) = try checkedFile(name, flags: O_CREAT | O_EXCL | O_RDWR, create: true)
         var keep = false; defer { if !keep { close(fd) } }
         try waitLock(fd, cancellation: cancellation)
-        let sequence = try withFence(cancellation: cancellation) { fence in
-            try fence.insert(root: path, rootIdentity: rootIdentity, name: name, items: items, parents: parents, cancellation: cancellation)
+        let cursor = try withFence(cancellation: cancellation) { fence in
+            let sequence = try fence.insert(root: path, rootIdentity: rootIdentity, name: name, items: items, parents: parents, cancellation: cancellation)
+            return RemovalCursor(identity: fence.identity, sequence: sequence)
         }
         keep = true
-        return Operation(journal: self, name: name, fd: fd, identity: info, sequence: sequence, parents: parents)
+        return Operation(journal: self, name: name, fd: fd, identity: info, cursor: cursor, parents: parents)
     }
 
     public func withFence<T>(cancellation: ScanCancellation = ScanCancellation(), _ body: (Fence) throws -> T) throws -> T {
+        // Concurrent read-only opens can collide during SQLite WAL setup; writers never take this mutex.
+        if !waitsForLocks { Self.readFenceLock.lock() }
+        defer { if !waitsForLocks { Self.readFenceLock.unlock() } }
         let (fd, identity) = try checkedFile(fenceName, flags: O_CREAT | O_RDWR, create: true)
         defer { close(fd) }
-        try waitLock(fd, cancellation: cancellation)
+        try waitLock(fd, cancellation: cancellation, shared: !waitsForLocks)
         try validateFile(fenceName, fd: fd, expected: identity)
         let fence = try Fence(journal: self, lockFD: fd, lockIdentity: identity, cancellation: cancellation)
         defer { fence.close() }
@@ -212,7 +225,7 @@ public final class RemovalJournal: @unchecked Sendable {
                 try journal.checkSidecars()
                 let path = journal.directory.appendingPathComponent(journal.dbName).path
                 var handle: OpaquePointer?
-                guard sqlite3_open_v2(path, &handle, SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOFOLLOW, nil) == SQLITE_OK, let handle else {
+                guard sqlite3_open_v2(path, &handle, (journal.waitsForLocks ? SQLITE_OPEN_READWRITE : SQLITE_OPEN_READONLY) | SQLITE_OPEN_NOFOLLOW, nil) == SQLITE_OK, let handle else {
                     if let handle { sqlite3_close(handle) }; throw Failure.sqlite("open journal")
                 }
                 db = handle
@@ -220,7 +233,8 @@ public final class RemovalJournal: @unchecked Sendable {
                 let appID = try scalar("PRAGMA application_id"), version = try scalar("PRAGMA user_version")
                 let objects = try scalar("SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
                 guard (appID == 0 && version == 0 && objects == 0) || (appID == 0x4f524a4e && (version == 2 || version == 3)) else { throw Failure.invalid("incompatible journal") }
-                try exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+                if journal.waitsForLocks { try exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;") }
+                else { guard version == 3, objects > 0 else { throw Failure.invalid("journal needs initialization") } }
                 if objects == 0 {
                     try exec("BEGIN IMMEDIATE; PRAGMA application_id=1330793038; PRAGMA user_version=3; CREATE TABLE metadata(singleton INTEGER PRIMARY KEY CHECK(singleton=1),identity TEXT NOT NULL); CREATE TABLE operations(seq INTEGER PRIMARY KEY AUTOINCREMENT,root BLOB NOT NULL,root_identity TEXT NOT NULL,lock_name TEXT NOT NULL UNIQUE,complete INTEGER NOT NULL DEFAULT 0); CREATE INDEX pending_operations ON operations(complete,seq); CREATE TABLE items(op INTEGER NOT NULL,path BLOB NOT NULL,identity TEXT NOT NULL,canonical BLOB,parent_identity TEXT,PRIMARY KEY(op,path)) WITHOUT ROWID;")
                     let meta = try prepare("INSERT INTO metadata VALUES(1,?)")

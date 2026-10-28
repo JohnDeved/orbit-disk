@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Quartz
 import OrbitCore
+import UniformTypeIdentifiers
 
 enum OrbitStyle {
     static let canvas = Color(red: 0.075, green: 0.082, blue: 0.10)
@@ -19,19 +20,27 @@ struct ContentView: View {
     @State private var collectionReviewOwner: CollectionReviewToken?
     @State private var mapPresentation = SunburstPresentationCache()
     @State private var listHoverTracking = ListHoverTracking()
+    @StateObject private var places = FolderPlaces()
+    @State private var sidebarDropTargeted = false
+    @State private var contentDropTargeted = false
 
     var body: some View {
         let reviewOwnerAtRender = collectionReviewOwner
         return HStack(spacing: 0) {
             sidebar
             VStack(spacing: 0) {
-                if let current = model.current {
-                    explorer(current)
-                } else if model.isScanning {
-                    scanningView
-                } else {
-                    welcomeView
+                ZStack {
+                    if let current = model.current {
+                        explorer(current)
+                    } else if model.isScanning {
+                        scanningView
+                    } else {
+                        welcomeView
+                    }
                 }
+                .contentShape(Rectangle())
+                .onDrop(of: [UTType.fileURL.identifier], delegate: FolderPlacesDrop(places: places,
+                    collectionType: DiskModel.collectionDragType.rawValue, isTargeted: $contentDropTargeted))
                 Divider()
                 collectionBar
             }
@@ -131,39 +140,55 @@ struct ContentView: View {
                }
               }
             }.frame(height: 100)
-            Text("Places").font(.system(size: 11, weight: .semibold)).foregroundStyle(OrbitStyle.muted)
+            Text(sidebarDropTargeted || contentDropTargeted ? "Release to add folders" : "Places")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(sidebarDropTargeted || contentDropTargeted ? OrbitStyle.accent : OrbitStyle.muted)
+                .lineLimit(1)
                 .padding(.horizontal, 24).padding(.top, 22).padding(.bottom, 10)
-            place("Home", icon: "house", url: FileManager.default.homeDirectoryForCurrentUser)
-            place("Downloads", icon: "arrow.down.circle", url: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads"))
-            place("Documents", icon: "doc.text", url: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents"))
-            place("Applications", icon: "square.grid.2x2", url: URL(fileURLWithPath: "/Applications"))
-            Button(action: model.chooseFolder) { Label("Choose a folder…", systemImage: "folder.badge.plus").frame(maxWidth: .infinity, alignment: .leading) }
-                .buttonStyle(.plain).pointingCursor().padding(.horizontal, 24).padding(.vertical, 12)
-            Spacer(minLength: 24)
+            ScrollView {
+                VStack(spacing: 0) {
+                    place("Home", icon: "house", url: FileManager.default.homeDirectoryForCurrentUser)
+                    place("Downloads", icon: "arrow.down.circle", url: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads"))
+                    place("Documents", icon: "doc.text", url: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents"))
+                    place("Applications", icon: "square.grid.2x2", url: URL(fileURLWithPath: "/Applications"))
+                    ForEach(places.folders, id: \.path) { folder in
+                        place(folder.lastPathComponent, icon: "folder", url: folder)
+                            .help(folder.path)
+                            .contextMenu { Button("Remove from Places") { places.remove(folder) } }
+                    }
+                    Button(action: model.chooseFolder) { Label("Choose a folder…", systemImage: "folder.badge.plus").frame(maxWidth: .infinity, alignment: .leading) }
+                        .buttonStyle(.plain).pointingCursor().padding(.horizontal, 24).padding(.vertical, 12)
+                }.padding(.bottom, 24)
+            }
         }
         .frame(width: 210).frame(maxHeight: .infinity)
         .background(OrbitStyle.sidebar)
         .overlay(alignment: .trailing) { Rectangle().fill(.white.opacity(0.06)).frame(width: 1) }
+        .contentShape(Rectangle())
+        .onDrop(of: [UTType.fileURL.identifier], delegate: FolderPlacesDrop(places: places,
+            collectionType: DiskModel.collectionDragType.rawValue, isTargeted: $sidebarDropTargeted))
     }
 
     private func place(_ title: String, icon: String, url: URL) -> some View {
         Button { model.scan(url) } label: {
             Label(title, systemImage: icon).frame(maxWidth: .infinity, alignment: .leading)
+                .lineLimit(1).truncationMode(.middle)
                 .font(.system(size: 13)).padding(.vertical, 11).padding(.horizontal, 24)
         }.buttonStyle(.plain).pointingCursor()
     }
 
     private var headerLocation: some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(model.current?.name ?? "Make room for what matters.")
+            Text(model.current?.name ?? "")
                 .font(.system(size: 17, weight: .semibold)).lineLimit(1)
-            Text(model.current?.url.path ?? "A clearer view of your storage.")
+            Text(model.current?.url.path ?? "")
                 .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted).lineLimit(1).truncationMode(.middle)
         }.frame(width: 280, alignment: .leading)
             .frame(height: 40)
             .padding(.leading, 142)
             .foregroundStyle(.white)
             .accessibilityElement(children: .contain)
+            .accessibilityHidden(model.current == nil)
     }
 
     private var header: some View {
@@ -236,7 +261,7 @@ struct ContentView: View {
                                  beginInteraction: model.beginMapInteraction)
                         .padding(.horizontal, 16).frame(maxWidth: .infinity, maxHeight: .infinity)
                     HStack(spacing: 24) {
-                        metric(node.isScanComplete ? "File size" : "File size so far", value: model.isUpdatingRemovalSizes ? "Updating…" : node.scanState == .pending ? "Waiting" : formatBytes(node.size))
+                        metric(node.isScanComplete ? "File size" : "File size so far", value: model.isUpdatingRemovalSize(of: node) ? "Updating…" : node.scanState == .pending ? "Waiting" : formatBytes(node.size))
                         Rectangle().fill(.white.opacity(0.14)).frame(width: 1, height: 30)
                         metric(node.isScanComplete ? "Allocated" : "Allocated so far", value: model.isUpdatingRemovalSizes ? "Updating…" : node.scanState == .pending ? "Waiting" : formatBytes(node.allocatedSize))
                     }.padding(.bottom, 12)
@@ -246,11 +271,6 @@ struct ContentView: View {
                     }
                     .font(.system(size: 10)).foregroundStyle(OrbitStyle.muted)
                     .padding(.bottom, 10)
-                    Text(model.isPartialMap ? (model.isScanning ? "Explore and collect while sizes update" : "Explore partial results · Restart mapping to finish") : "")
-                        .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted)
-                        .lineLimit(2).multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity).frame(height: 28)
-                        .padding(.horizontal, 16).padding(.bottom, 12)
                 }
                 filePanel(node).frame(width: 340)
             }.frame(maxHeight: .infinity)
@@ -281,8 +301,8 @@ struct ContentView: View {
                 if let description = model.mapHoverDescription {
                     Label(description, systemImage: "cursorarrow")
                         .foregroundStyle(OrbitStyle.accent).lineLimit(2).truncationMode(.middle)
-                } else {
-                    Text(model.isFiltering && !model.isSearching && !model.isSearchResultOutdated && model.searchMatchCount > 300 ? "Showing the 300 largest matches. Refine your search for more." : "Hover to locate an item in the map.")
+                } else if model.isFiltering && !model.isSearching && !model.isSearchResultOutdated && model.searchMatchCount > 300 {
+                    Text("Showing the 300 largest matches. Refine your search for more.")
                         .foregroundStyle(OrbitStyle.muted).lineLimit(2)
                 }
             }
@@ -294,8 +314,8 @@ struct ContentView: View {
                     Image(systemName: model.isFiltering ? "magnifyingglass" : "folder").font(.system(size: 25)).foregroundStyle(OrbitStyle.muted)
                     Text(model.isSearching ? "Searching…" : model.isFiltering ? (model.isSearchResultOutdated ? (model.searchFailed ? "Search unavailable. Refresh to retry." : "Search incomplete") : model.isPartialMap ? "No matches found so far" : "No matching files") : !node.isAccessible ? "Contents unavailable. See skipped items." : node.scanState == .pending ? "Waiting to map this folder" : !node.isScanComplete ? "Reading this folder…" : "This folder is empty")
                         .font(.system(size: 13)).foregroundStyle(OrbitStyle.muted)
-                    if !model.isFiltering && !node.isScanComplete {
-                        Text(model.isScanning ? "You can explore other folders while mapping continues." : "Restart mapping to finish this folder.")
+                    if !model.isFiltering && !node.isScanComplete && !model.isScanning {
+                        Text("Restart mapping to finish this folder.")
                             .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted)
                             .multilineTextAlignment(.center).padding(.horizontal, 22)
                     }
@@ -420,7 +440,7 @@ struct ContentView: View {
             Divider()
                 Text(selected?.name ?? "Select an item").font(.system(size: 12, weight: .semibold)).lineLimit(1).truncationMode(.middle)
                     .frame(height: 15, alignment: .leading)
-                Text(selected?.url.path ?? "Drag a row or segment to collect, or select one to use these actions.")
+                Text(selected?.url.path ?? "")
                     .font(.system(size: 10)).foregroundStyle(OrbitStyle.muted)
                     .lineLimit(2).truncationMode(.middle).textSelection(.enabled)
                     .frame(height: 26, alignment: .topLeading)
@@ -489,7 +509,7 @@ struct ContentView: View {
                         .pointingCursor().frame(width: 130, alignment: .trailing)
                 }
             }.controlSize(.small).frame(height: 26)
-            Text(model.isPartialMap ? (model.statusMessage ?? (model.isScanning ? model.scanPath : "You can keep exploring. Restart mapping to finish and save this map.")) : model.statusMessage ?? (model.isScanning ? model.scanTitle : ""))
+            Text(model.isPartialMap ? (model.statusMessage ?? (model.isScanning ? model.scanPath : "Restart mapping to finish.")) : model.statusMessage ?? (model.isScanning ? model.scanTitle : ""))
                 .lineLimit(1).truncationMode(.middle)
                 .frame(maxWidth: .infinity, alignment: .leading).frame(height: 14, alignment: .top)
         }
@@ -510,9 +530,9 @@ struct ContentView: View {
                 }
             }.frame(width: 36, height: 36)
             VStack(alignment: .leading, spacing: 5) {
-                Text(ready ? "Release to collect" : dragging ? "Drop here to collect" : model.isValidatingCollection ? "Checking your collection…" : model.isUpdatingCollection ? "Removing from collection…" : model.displayedCollection.isEmpty ? "Drag files and folders here" : "\(model.displayedCollection.count) \(model.displayedCollection.count == 1 ? "item" : "items") in your collection")
+                Text(ready ? "Release to collect" : dragging ? "Drop here to collect" : model.isValidatingCollection ? "Checking collection…" : model.isUpdatingCollection ? "Removing from collection…" : model.displayedCollection.isEmpty ? "Drag files and folders here" : "\(model.displayedCollection.count) \(model.displayedCollection.count == 1 ? "item" : "items") in collection")
                     .font(.system(size: 14, weight: .semibold)).lineLimit(1).truncationMode(.middle)
-                Text(dragging ? model.draggingLabel ?? "" : model.isUpdatingCollection ? "Files stay in place." : model.isPartialMap ? (model.isScanning ? "Collect items while mapping continues." : "Collect items from this partial map.") : model.displayedCollection.isEmpty ? "Drag from the map or file list. Review before removing anything." : model.isUpdatingRemovalSizes ? "Updating sizes…" : "\(formatBytes(model.displayedCollectionSize)) · Drag more items here. Files stay in place until reviewed.")
+                Text(dragging ? model.draggingLabel ?? "" : model.displayedCollection.isEmpty ? "From the map or file list." : model.isUpdatingRemovalSizes ? "Updating sizes…" : formatBytes(model.displayedCollectionSize) + (model.isPartialMap ? " so far" : ""))
                     .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted).lineLimit(1).truncationMode(.middle)
             }.frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             Button { if let owner = model.beginCollectionReview() { collectionReviewOwner = owner } } label: {
@@ -543,17 +563,12 @@ struct ContentView: View {
     private var welcomeView: some View {
         VStack(spacing: 22) {
             Image(systemName: "chart.pie").font(.system(size: 74, weight: .ultraLight)).foregroundStyle(OrbitStyle.accent)
-            VStack(spacing: 10) {
-                Text("Every byte has a place.").font(.system(size: 30, weight: .medium))
-                Text("Choose a disk or folder to see what’s taking up space.")
-                    .font(.system(size: 14)).foregroundStyle(OrbitStyle.muted)
-            }
+            Text("Choose a disk or folder to scan.")
+                .font(.system(size: 14)).foregroundStyle(OrbitStyle.muted)
             Button("Choose Folder", action: model.chooseFolder)
                 .buttonStyle(.borderedProminent).foregroundStyle(OrbitStyle.canvas).controlSize(.large)
                 .pointingCursor()
                 .padding(.top, 6)
-            Text("Files stay on your Mac. Nothing is moved without your review.")
-                .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted)
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
@@ -561,8 +576,6 @@ struct ContentView: View {
         VStack(spacing: 20) {
             ProgressView().controlSize(.large)
             Text(model.scanTitle).font(.system(size: 26, weight: .medium))
-            Text("Folders appear as they’re found. You can start exploring before mapping finishes.")
-                .font(.system(size: 12)).foregroundStyle(OrbitStyle.muted)
             HStack(spacing: 24) {
                 metric("Items found", value: model.progressCount.formatted())
                 metric("File size", value: model.isUpdatingRemovalSizes ? "Updating…" : formatBytes(model.progressBytes))
@@ -620,7 +633,7 @@ struct CollectionView: View {
         return VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Review your collection").font(.system(size: 23, weight: .semibold)).lineLimit(1).frame(height: 28)
+                    Text("Collection").font(.system(size: 23, weight: .semibold)).lineLimit(1).frame(height: 28)
                     Group {
                         if model.collectionReviewHasOwner(reviewOwner), let message = model.errorMessage {
                             VStack(alignment: .leading, spacing: 6) {
@@ -636,7 +649,7 @@ struct CollectionView: View {
                                 }
                             }
                         } else {
-                            Text(model.isUpdatingRemovalSizes ? "Updating sizes…" : hasIncompleteFolders ? "Some folder sizes are incomplete." : "\(formatBytes(model.collectionReviewHasOwner(reviewOwner) ? model.displayedCollectionSize : 0)) in file sizes. Choose Trash or permanent deletion after review.")
+                            Text(model.isUpdatingRemovalSizes ? "Updating sizes…" : hasIncompleteFolders ? "Some folder sizes are incomplete." : formatBytes(model.collectionReviewHasOwner(reviewOwner) ? model.displayedCollectionSize : 0))
                                 .font(.system(size: 12)).foregroundStyle(OrbitStyle.muted).lineLimit(2)
                         }
                     }.frame(maxWidth: .infinity, alignment: .leading).frame(height: 56, alignment: .top)
@@ -652,7 +665,7 @@ struct CollectionView: View {
                             Text(item.url.path).font(.system(size: 10)).foregroundStyle(OrbitStyle.muted).lineLimit(1).truncationMode(.middle)
                         }
                         Spacer()
-                        Text(model.isUpdatingRemovalSizes ? "Updating…" : formatBytes(item.size) + (item.isDirectory && !item.isScanComplete ? " so far" : ""))
+                        Text(model.isUpdatingRemovalSize(of: item) ? "Updating…" : formatBytes(item.size) + (item.isDirectory && !item.isScanComplete ? " so far" : ""))
                             .monospacedDigit().lineLimit(1).frame(width: 110, alignment: .trailing)
                         Button { model.removeFromCollection(item.id, review: actionToken) } label: {
                             Label {

@@ -23,6 +23,7 @@ final class Gate: @unchecked Sendable {
         let cache = base.appendingPathComponent(UUID().uuidString)
         let stage = try ResumableStage(cache: cache, root: root,
             current: StageCheckpoint(rootPath: root.path, identity: "test", eventID: 0))
+        stage.testDisableAsyncDiscovery = true
         while try stage.advance(progress: { _ in }) {}
         for cancelTask in [true, false] {
             let gate = Gate(), token = ScanCancellation()
