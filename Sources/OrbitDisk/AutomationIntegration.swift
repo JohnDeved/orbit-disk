@@ -47,7 +47,8 @@ enum AutomationIntegration {
     }
 
     private static func show(_ alert: NSAlert, completion: @escaping @MainActor (NSApplication.ModalResponse) -> Void) {
-        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow
+            ?? NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain && $0.sheetParent == nil }) {
             let sheet = alert.window
             let monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak window, weak sheet] event in
                 guard let window, let sheet, window.attachedSheet === sheet,

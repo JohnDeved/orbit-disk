@@ -1,6 +1,6 @@
 # AI integration
 
-Available in Orbit Disk 0.9.11 and later. Orbit Disk exposes its running app through MCP and a JSON command-line client. Both use the same live inventory, collection, navigation and removal checks as the interface. They can use discovered files before mapping finishes.
+Available in Orbit Disk 0.9.12 and later. Orbit Disk exposes its running app through MCP and a JSON command-line client. Both use the same live inventory, collection, navigation and removal checks as the interface. They can use discovered files before mapping finishes.
 
 ## Automatic tool discovery
 

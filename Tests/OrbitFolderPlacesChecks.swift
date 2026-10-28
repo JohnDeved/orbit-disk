@@ -18,6 +18,11 @@ enum FolderPlacesChecks {
         try manager.createSymbolicLink(at: alias, withDestinationURL: first)
         let file = root.appendingPathComponent("ordinary-file")
         try Data("file".utf8).write(to: file)
+        let candidates = [root, first, first.appendingPathComponent("nested")]
+        precondition(FolderPlaces.selectedPath(for: nil, among: candidates) == nil)
+        precondition(FolderPlaces.selectedPath(for: first.appendingPathComponent("nested/file").path, among: candidates) == candidates[2].path)
+        precondition(FolderPlaces.selectedPath(for: first.path + "-other", among: candidates) == root.path,
+                     "A similar folder name must not select its sibling")
         let places = FolderPlaces(preferences: preferences)
         await places.addFolders([first, file, first, second, alias, root.appendingPathComponent("missing"),
                                  URL(string: "https://example.com/folder")!, manager.homeDirectoryForCurrentUser])

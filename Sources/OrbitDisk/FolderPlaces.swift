@@ -18,6 +18,13 @@ final class FolderPlaces: ObservableObject {
         }
     }
 
+    static func selectedPath(for current: String?, among folders: [URL]) -> String? {
+        guard let current else { return nil }
+        return folders.map(\.path).filter { path in
+            current.utf8.elementsEqual(path.utf8) || current.utf8.starts(with: (path == "/" ? path : path + "/").utf8)
+        }.max { $0.utf8.count < $1.utf8.count }
+    }
+
     func receive(_ providers: [NSItemProvider]) async {
         var urls: [URL] = []
         for provider in providers {

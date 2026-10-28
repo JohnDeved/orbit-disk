@@ -12,6 +12,49 @@ enum OrbitStyle {
     static let accent = Color(red: 1, green: 0.56, blue: 0.40)
 }
 
+private struct PlaceRowButton: View {
+    let title: String
+    let icon: String
+    var isSelected = false
+    var verticalPadding: Double = 11
+    let action: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(.system(size: 13)).lineLimit(1).truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, verticalPadding).padding(.horizontal, 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(PlaceRowStyle(selected: isSelected, hovered: hovered))
+        .pointingCursor()
+        .onHover { inside in if hovered != inside { hovered = inside } }
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+}
+
+private struct PlaceRowStyle: ButtonStyle {
+    let selected: Bool
+    let hovered: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(selected ? OrbitStyle.accent : .white)
+            .background {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(selected ? OrbitStyle.accent.opacity(configuration.isPressed ? 0.25 : hovered ? 0.20 : 0.16)
+                          : .white.opacity(configuration.isPressed ? 0.12 : hovered ? 0.07 : 0))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(selected ? OrbitStyle.accent.opacity(0.45) : .clear, lineWidth: 1)
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 2)
+            }
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var model: DiskModel
     @FocusState private var searchFocused: Bool
@@ -109,7 +152,11 @@ struct ContentView: View {
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let selectedPlace = FolderPlaces.selectedPath(for: model.current?.id,
+            among: [home, home.appendingPathComponent("Downloads"), home.appendingPathComponent("Documents"),
+                    URL(fileURLWithPath: "/Applications")] + places.folders)
+        return VStack(alignment: .leading, spacing: 0) {
             Text("Devices").font(.system(size: 11, weight: .semibold)).foregroundStyle(OrbitStyle.muted)
                 .padding(.horizontal, 24).padding(.top, 20).padding(.bottom, 12)
             ScrollView {
@@ -147,17 +194,17 @@ struct ContentView: View {
                 .padding(.horizontal, 24).padding(.top, 22).padding(.bottom, 10)
             ScrollView {
                 VStack(spacing: 0) {
-                    place("Home", icon: "house", url: FileManager.default.homeDirectoryForCurrentUser)
-                    place("Downloads", icon: "arrow.down.circle", url: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads"))
-                    place("Documents", icon: "doc.text", url: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents"))
-                    place("Applications", icon: "square.grid.2x2", url: URL(fileURLWithPath: "/Applications"))
+                    place("Home", icon: "house", url: home, selectedPath: selectedPlace)
+                    place("Downloads", icon: "arrow.down.circle", url: home.appendingPathComponent("Downloads"), selectedPath: selectedPlace)
+                    place("Documents", icon: "doc.text", url: home.appendingPathComponent("Documents"), selectedPath: selectedPlace)
+                    place("Applications", icon: "square.grid.2x2", url: URL(fileURLWithPath: "/Applications"), selectedPath: selectedPlace)
                     ForEach(places.folders, id: \.path) { folder in
-                        place(folder.lastPathComponent, icon: "folder", url: folder)
+                        place(folder.lastPathComponent, icon: "folder", url: folder, selectedPath: selectedPlace)
                             .help(folder.path)
                             .contextMenu { Button("Remove from Places") { places.remove(folder) } }
                     }
-                    Button(action: model.chooseFolder) { Label("Choose a folder…", systemImage: "folder.badge.plus").frame(maxWidth: .infinity, alignment: .leading) }
-                        .buttonStyle(.plain).pointingCursor().padding(.horizontal, 24).padding(.vertical, 12)
+                    PlaceRowButton(title: "Choose a folder…", icon: "folder.badge.plus", verticalPadding: 12,
+                                   action: model.chooseFolder)
                 }.padding(.bottom, 24)
             }
         }
@@ -169,12 +216,8 @@ struct ContentView: View {
             collectionType: DiskModel.collectionDragType.rawValue, isTargeted: $sidebarDropTargeted))
     }
 
-    private func place(_ title: String, icon: String, url: URL) -> some View {
-        Button { model.scan(url) } label: {
-            Label(title, systemImage: icon).frame(maxWidth: .infinity, alignment: .leading)
-                .lineLimit(1).truncationMode(.middle)
-                .font(.system(size: 13)).padding(.vertical, 11).padding(.horizontal, 24)
-        }.buttonStyle(.plain).pointingCursor()
+    private func place(_ title: String, icon: String, url: URL, selectedPath: String?) -> some View {
+        PlaceRowButton(title: title, icon: icon, isSelected: selectedPath == url.path) { model.scan(url) }
     }
 
     private var headerLocation: some View {

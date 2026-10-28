@@ -49,6 +49,7 @@ case "$1" in
     ./check-rendering.sh
     ./check-layout.sh
     ./check-folder-places.sh
+    ./check-places-interaction.sh
     ./check-cache-reset.sh
     ;;
   *)
