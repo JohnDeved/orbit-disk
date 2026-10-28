@@ -105,8 +105,8 @@ private final class CaptureWindow: NSWindow {
             }
             frame.cacheDisplay(in: frame.bounds, to: bitmap)
             var samples = Set<String>()
-            for x in stride(from: 20, to: bitmap.pixelsWide, by: 80) {
-                for y in stride(from: 20, to: bitmap.pixelsHigh, by: 80) {
+            for x in stride(from: 20, to: bitmap.pixelsWide, by: 20) {
+                for y in stride(from: 20, to: bitmap.pixelsHigh, by: 20) {
                     if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) {
                         samples.insert("\(Int(color.redComponent * 255)),\(Int(color.greenComponent * 255)),\(Int(color.blueComponent * 255))")
                     }
@@ -150,8 +150,8 @@ private final class CaptureWindow: NSWindow {
         }
         reviewView.cacheDisplay(in: reviewView.bounds, to: bitmap)
         var reviewSamples = Set<String>()
-        for x in stride(from: 20, to: bitmap.pixelsWide, by: 80) {
-            for y in stride(from: 20, to: bitmap.pixelsHigh, by: 80) {
+        for x in stride(from: 20, to: bitmap.pixelsWide, by: 20) {
+            for y in stride(from: 20, to: bitmap.pixelsHigh, by: 20) {
                 if let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) {
                     reviewSamples.insert("\(Int(color.redComponent * 255)),\(Int(color.greenComponent * 255)),\(Int(color.blueComponent * 255))")
                 }
