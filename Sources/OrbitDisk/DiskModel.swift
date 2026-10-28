@@ -1819,7 +1819,7 @@ final class DiskModel: ObservableObject {
                 stage.configureTestScanner(scanner)
                 #endif
                 stageConfigurer(stage)
-                let reportProgress: @Sendable (ScanProgress) -> Void = { progress in
+                let reportProgress: @Sendable (ScanProgress) -> Void = { [weak model] progress in
                     progressCell.set(progress)
                     Task { @MainActor [weak model] in
                         guard let model, model.activeSessionID == sessionID, !token.isCancelled else { return }

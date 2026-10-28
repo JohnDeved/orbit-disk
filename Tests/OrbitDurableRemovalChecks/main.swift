@@ -97,7 +97,7 @@ final class BlockingGate: @unchecked Sendable {
         }
         if args.count == 3 && ["cursor-race", "cursor-journal-race"].contains(args[2]) {
             let journalConflict = args[2] == "cursor-journal-race"
-            let root = base.appendingPathComponent("cursor/root"), cache = base.appendingPathComponent("cursor/cache")
+            let root = base.appendingPathComponent(args[2] + "/root"), cache = base.appendingPathComponent(args[2] + "/cache")
             try fm.createDirectory(at: root, withIntermediateDirectories: true)
             let victim = root.appendingPathComponent("victim"), keep = root.appendingPathComponent("keep")
             try Data([1, 2]).write(to: victim); try Data([3]).write(to: keep)
