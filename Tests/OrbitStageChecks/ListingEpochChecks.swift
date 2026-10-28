@@ -435,7 +435,7 @@ enum ListingEpochChecks {
             precondition(counts[1] > counts[0] && counts[1] - counts[0] <= 1024)
             precondition(database.scalar("SELECT COUNT(*) FROM directories WHERE pending=1") == 1)
             precondition(database.scalar("SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name IN ('path','st_path','st_parent','st_name','st_size','st_allocated','st_is_link','folded','identity','file_identity','directory','charged')") == 0)
-            precondition(database.scalar("PRAGMA user_version") == 4)
+            precondition(database.scalar("PRAGMA user_version") == InventorySchema.version)
             precondition(database.scalar("SELECT COUNT(*) FROM directory_paths") == 1, "leaf paths must not be persisted")
             precondition(database.scalar("SELECT COUNT(*) FROM directory_paths p JOIN nodes n ON n.id=p.id WHERE n.is_dir=0") == 0)
             savedCount = counts[1]

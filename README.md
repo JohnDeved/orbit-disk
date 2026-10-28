@@ -65,9 +65,9 @@ Scanning and search happen on your Mac. Orbit Disk contacts GitHub to check for 
 
 macOS may restrict access to some folders. Full Disk Access is optional, and the app reports skipped items. Allocated space is a filesystem measurement; it is not a guarantee of how much space deletion will reclaim.
 
-## AI access in development builds
+## AI tools
 
-AI clients can inspect maps, find large files, build a collection and remove explicitly reviewed items through the live app. Connect once through **Orbit Disk → AI Integration…**; Codex then discovers the tools automatically in new sessions. A JSON command-line client is also bundled. [Setup, tools and removal behavior](docs/AI-INTEGRATION.md)
+AI clients can inspect maps, find large files, build a collection and remove explicitly reviewed items through the live app, including files discovered while mapping continues. Connect once through **Orbit Disk → AI Integration…**; Codex then discovers the tools automatically in new sessions. A JSON command-line client is also bundled. [Setup, tools and removal behavior](docs/AI-INTEGRATION.md)
 
 ## Build from source
 

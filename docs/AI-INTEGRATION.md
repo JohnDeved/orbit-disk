@@ -1,6 +1,6 @@
 # AI integration
 
-Available in development builds after 0.9.10. Orbit Disk exposes its running app through MCP and a JSON command-line client. Both use the same live inventory, collection, navigation and removal checks as the interface. They can use discovered files before mapping finishes.
+Available in Orbit Disk 0.9.11 and later. Orbit Disk exposes its running app through MCP and a JSON command-line client. Both use the same live inventory, collection, navigation and removal checks as the interface. They can use discovered files before mapping finishes.
 
 ## Automatic tool discovery
 
@@ -26,9 +26,9 @@ The server responds to initialization and tool discovery without launching the a
 | Build a collection | `orbit_collect`, `orbit_collection`, `orbit_uncollect`, `orbit_clear_collection` |
 | Remove reviewed items | `orbit_prepare_removal`, `orbit_remove` |
 
-Tool descriptions include input schemas, asynchronous behavior and mutation hints. The server also provides workflow instructions during MCP initialization so an agent can choose tools without a separate prompt or skill installation.
+Tool descriptions include input and output schemas, asynchronous behavior and mutation hints. The server also provides workflow instructions during MCP initialization so an agent can choose tools without a separate prompt or skill installation.
 
-Scanning, search, collection validation and removal return promptly. An accepted response means work started; agents must poll status and collection to observe completion and errors. Directory sizes may still be incomplete, and every item includes a completeness flag. Search uses the app's current indexed-name search and reports when its result limit truncates matches.
+Scanning, search, collection validation and removal return an accepted response when work starts. Agents must poll status and collection to observe completion and errors. Once `opening` is false, listed files can be used while `scanning` remains true. Directory sizes may still be incomplete, and every item includes a completeness flag. Search uses the app's current indexed-name search and reports when its result limit truncates matches. A failed search returns `search_failed`; submitting the same query again retries it.
 
 Cloud storage is excluded from mapping and collection by default: the standard macOS `CloudStorage` and iCloud Drive locations, plus Desktop and Documents when macOS identifies them as iCloud-backed. These exclusions apply to the native app and AI tools. Directory discovery disables automatic downloads of cloud-only content. Custom third-party sync locations outside the standard roots may not be identifiable; arbitrary folder names are not treated as proof of cloud storage. Older cached inventories are rebuilt once to apply the exclusions.
 
@@ -38,7 +38,7 @@ Cloud storage is excluded from mapping and collection by default: the standard m
 
 `prepare_removal` returns the complete proposed set of up to 200 collected items, a mode (`trash` or `permanent`), and a five-minute token. It opens the app's collection review but removes nothing. The agent must present that plan and obtain user authorization before calling `remove` with the token and `confirmed: true`.
 
-A token is valid once and is rejected after the collection, map or review changes. The existing removal pipeline rechecks file identities, parent folders and protected paths, and records the removal durably before changing files. Permanent deletion cannot be undone.
+A token is valid once and is rejected after the collection, map or review changes. After an accepted removal, `status.lastRemoval` reports that operation's completion and errors even if the user navigates to another map. The existing removal pipeline rechecks file identities, parent folders and protected paths, and records the removal durably before changing files. Permanent deletion cannot be undone.
 
 ## Command line
 
@@ -46,13 +46,20 @@ Choose **Install Command Line Tool** in AI Integration to create `~/.local/bin/o
 
 ```sh
 orbitdisk --help
+orbitdisk --version
 orbitdisk tools
 orbitdisk status
 orbitdisk scan '{"path":"/Users/you/Downloads"}'
 orbitdisk list '{"limit":20}'
 ```
 
-Commands take one optional JSON object and return JSON. Exit status is nonzero on failure. `orbitdisk mcp` uses newline-delimited JSON-RPC on standard input/output. Diagnostics never mix with MCP output.
+Commands take one optional JSON object and return JSON. `orbitdisk mcp` uses newline-delimited JSON-RPC on standard input/output. Diagnostics never mix with MCP output.
+
+## Responses and interrupted requests
+
+Successful commands return `{"ok":true,"result":{...}}`; failures return `{"ok":false,"error":{"code":"...","message":"..."}}`. MCP exposes the same envelope as structured content and text. The command-line client exits with a nonzero status on failure.
+
+A transport timeout or lost connection can occur after the app accepts a command. In that case, `error.outcomeUnknown` is true. Read status and collection before deciding what to do; do not automatically repeat a mutation. If the app restarted and the removal receipt is unavailable, inspect the current state and obtain a new review before attempting another removal.
 
 ## Local access and privacy
 

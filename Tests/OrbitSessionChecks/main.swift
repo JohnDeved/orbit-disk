@@ -537,10 +537,18 @@ final class NthGate: @unchecked Sendable {
         let cross=dir.appendingPathComponent("cross-removal"), crossFile=cross.appendingPathComponent("file")
         try fm.createDirectory(at:cross,withIntermediateDirectories:true);try Data([1]).write(to:crossFile)
         let crossScan=RootGate(cross.path), crossDelete=ResolutionGate()
-        let cm=DiskModel(cacheDirectory:dir.appendingPathComponent("cross-index"),preferences:prefs,scanProgressObserver:{crossScan.observe($0)})
+        let cm=DiskModel(cacheDirectory:dir.appendingPathComponent("cross-index"),preferences:prefs,scanProgressObserver:{
+            precondition(withUnsafeCurrentTask { $0 == nil }, "Blocking scan work must not occupy the cooperative executor")
+            crossScan.observe($0)
+        })
         cm.scan(cross);try await wait("cross preview") {crossScan.waiting && cm.current?.children.count == 1}
         precondition(cm.collect([cm.current!.children[0]]))
-        try await wait("accepted collection") { !cm.isValidatingCollection };cm.testBeforeRemoval={crossDelete.pause()};cm.deleteCollectionPermanently()
+        try await wait("accepted collection") { !cm.isValidatingCollection }
+        cm.testBeforeRemoval={
+            precondition(withUnsafeCurrentTask { $0 == nil }, "Blocking removal work must not occupy the cooperative executor")
+            crossDelete.pause()
+        }
+        cm.deleteCollectionPermanently()
         try await wait("cross deletion started") {crossDelete.waiting && cm.isRemoving}
         cm.scan(b);try await wait("cross switched") {cm.root?.id == b.path && !cm.isScanning && !cm.isRemoving}
         crossDelete.release();try await wait("cross removal detached") {!fm.fileExists(atPath:crossFile.path)}

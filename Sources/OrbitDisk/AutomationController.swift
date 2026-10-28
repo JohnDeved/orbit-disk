@@ -75,7 +75,10 @@ final class AutomationController: ObservableObject {
         default: try requireContext(args)
         }
         switch command {
-        case "search": model.query = args["query"] as! String
+        case "search":
+            let query = args["query"] as! String
+            if query == model.query { model.retryFailedSearch() }
+            else { model.query = query }
         case "back":
             guard model.navigation.count > 1 else { throw failure("at_root", "Already at the map root.") }
             model.goBack()
@@ -89,14 +92,12 @@ final class AutomationController: ObservableObject {
                 guard node.isDirectory, !node.isSymbolicLink else { throw failure("not_directory", "Choose a regular folder from list.") }
                 model.open(node)
             } else {
+                if command == "preview", node.isDirectory { throw failure("not_file", "Quick Look requires a file.") }
                 model.selectedID = node.id
                 guard model.selected?.fileIdentity == node.fileIdentity,
                       model.selected?.id.utf8.elementsEqual(node.id.utf8) == true else { throw failure("stale_item", "The selection changed. List again.") }
                 if command == "reveal" { model.revealSelection() }
-                if command == "preview" {
-                    guard !node.isDirectory else { throw failure("not_file", "Quick Look requires a file.") }
-                    model.previewSelection()
-                }
+                if command == "preview" { model.previewSelection() }
             }
         case "collect":
             guard !model.isRemoving else { throw failure("busy", "Files are being removed.") }
@@ -150,6 +151,9 @@ final class AutomationController: ObservableObject {
     }
 
     private func listing(_ kind: String, _ args: [String: Any]) throws -> [String: Any] {
+        if kind == "list", model.isFiltering, model.searchFailed, !model.isSearching {
+            throw failure("search_failed", "Search could not finish. Retry search or refresh the map.")
+        }
         let limit = (args["limit"] as? Int) ?? 100
         let offset: Int
         let snapshot: Page
@@ -176,14 +180,17 @@ final class AutomationController: ObservableObject {
             }
         }
         let end = offset + min(limit, snapshot.nodes.count - offset)
-        return ["items": snapshot.nodes[offset..<end].map(nodeJSON), "context": snapshot.context,
+        var result: [String: Any] = ["items": snapshot.nodes[offset..<end].map(nodeJSON), "context": snapshot.context,
                 "folder": snapshot.folder, "query": snapshot.query, "snapshotAt": date(snapshot.created),
                 "total": snapshot.nodes.count, "offset": offset,
                 "nextCursor": end < snapshot.nodes.count ? snapshot.id + ":" + String(end) : NSNull(),
                 "pending": kind == "collection" && (model.isValidatingCollection || model.isUpdatingCollection),
-                "mappingIncomplete": model.isPartialMap || model.isScanning,
-                "searchMatchCount": model.isFiltering ? model.searchMatchCount : snapshot.nodes.count,
-                "searchTruncated": model.isFiltering && model.searchMatchCount > snapshot.nodes.count]
+                "mappingIncomplete": model.isPartialMap || model.isScanning]
+        if kind == "list" {
+            result["searchMatchCount"] = model.isFiltering ? model.searchMatchCount : snapshot.nodes.count
+            result["searchTruncated"] = model.isFiltering && model.searchMatchCount > snapshot.nodes.count
+        }
+        return result
     }
 
     private var context: String? { model.automationSessionID?.uuidString }
@@ -216,6 +223,7 @@ final class AutomationController: ObservableObject {
             "scanning": model.isScanning, "refreshing": model.isRefreshing, "mappingIncomplete": model.isPartialMap,
             "discoveredFiles": model.progressCount, "discoveredBytes": model.progressBytes,
             "query": model.query, "searching": model.isSearching, "searchOutdated": model.isSearchResultOutdated,
+            "searchFailed": model.searchFailed,
             "collectionCount": model.displayedCollection.count, "collectionBytes": model.displayedCollectionSize,
             "collectionPending": model.isValidatingCollection || model.isUpdatingCollection,
             "removing": model.hasActiveRemovals, "updatingSizes": model.isUpdatingRemovalSizes,

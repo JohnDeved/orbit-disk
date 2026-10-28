@@ -9,6 +9,16 @@ func emit(_ value: [String: Any]) {
 func rpcError(_ id: Any, _ code: Int, _ message: String) -> [String: Any] {
     ["jsonrpc": "2.0", "id": id, "error": ["code": code, "message": message]]
 }
+let supportedProtocols = ["2025-06-18", "2025-11-25"]
+func bundledApplication() -> URL? {
+    let executable = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
+    let bundle = executable.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    return bundle.pathExtension == "app" ? bundle : nil
+}
+func serverInfo() -> [String: Any] {
+    let version = bundledApplication().flatMap { Bundle(url: $0)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String }
+    return ["name": "orbit-disk", "title": "Orbit Disk storage and file cleanup", "version": version ?? "development"]
+}
 func call(_ command: String, _ arguments: [String: Any]) -> [String: Any] {
     do {
         try AutomationCatalog.validate(command: command, arguments: arguments)
@@ -17,13 +27,11 @@ func call(_ command: String, _ arguments: [String: Any]) -> [String: Any] {
         do { response = try LocalAutomationClient().request(request) }
         catch LocalAutomationError.unavailable {
             // Launch only after a failed connection, never replay a request whose outcome is unknown.
-            let executable = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath()
-            let bundled = executable.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            let app = bundled.pathExtension == "app" ? bundled : URL(fileURLWithPath: "/Applications/Orbit Disk.app")
+            let app = bundledApplication() ?? URL(fileURLWithPath: "/Applications/Orbit Disk.app")
             guard FileManager.default.fileExists(atPath: app.appendingPathComponent("Contents/MacOS/OrbitDisk").path) else {
                 throw AutomationCatalog.Failure("app_not_installed", "Install Orbit Disk in Applications or open the app before calling tools.")
             }
-            let deadline = Date().addingTimeInterval(10)
+            let deadline = ProcessInfo.processInfo.systemUptime + 10
             let launch = Process(), terminated = DispatchSemaphore(value: 0)
             launch.executableURL = URL(fileURLWithPath: "/usr/bin/open")
             launch.arguments = ["-g", app.path]
@@ -41,11 +49,15 @@ func call(_ command: String, _ arguments: [String: Any]) -> [String: Any] {
             repeat {
                 do { received = try LocalAutomationClient().request(request) }
                 catch LocalAutomationError.unavailable { Thread.sleep(forTimeInterval: 0.1) }
-            } while received == nil && Date() < deadline
+            } while received == nil && ProcessInfo.processInfo.systemUptime < deadline
             guard let received else { throw AutomationCatalog.Failure("not_ready", "Orbit Disk did not become ready within 10 seconds. Open the app and retry.") }
             response = received
         }
-        guard let value = try JSONSerialization.jsonObject(with: response) as? [String: Any] else { throw AutomationCatalog.Failure("invalid_response", "Orbit Disk returned an invalid response.") }
+        guard let value = try? JSONSerialization.jsonObject(with: response) as? [String: Any],
+              let ok = value["ok"] as? NSNumber, CFGetTypeID(ok) == CFBooleanGetTypeID(),
+              ok.boolValue ? value["result"] is [String: Any] : (value["error"] as? [String: Any]).map({ $0["code"] is String && $0["message"] is String }) == true else {
+            throw AutomationCatalog.Failure("invalid_response", "Orbit Disk returned an invalid response. Check status before retrying; the command may already have been accepted.", outcomeUnknown: true)
+        }
         return value
     } catch { return AutomationCatalog.failure(error) }
 }
@@ -55,28 +67,32 @@ func runMCP() {
     func process(_ line: Data) {
         let request: [String: Any]
         do {
-            guard let parsed = try JSONSerialization.jsonObject(with: line) as? [String: Any] else { emit(rpcError(NSNull(), -32600, "Expected one JSON-RPC object.")); return }
+            guard let parsed = try JSONSerialization.jsonObject(with: line, options: [.fragmentsAllowed]) as? [String: Any] else { emit(rpcError(NSNull(), -32600, "Expected one JSON-RPC object.")); return }
             request = parsed
         } catch { emit(rpcError(NSNull(), -32700, "Invalid JSON.")); return }
         let id = request["id"] ?? NSNull()
-        guard request["jsonrpc"] as? String == "2.0", let method = request["method"] as? String else { emit(rpcError(id, -32600, "Invalid JSON-RPC request.")); return }
+        let validID = id is String || ((id as? NSNumber).map { CFGetTypeID($0) != CFBooleanGetTypeID() && $0.doubleValue.isFinite && $0.doubleValue.rounded() == $0.doubleValue } ?? false)
+        guard request["jsonrpc"] as? String == "2.0", let method = request["method"] as? String else {
+            emit(rpcError(validID ? id : NSNull(), -32600, "Invalid JSON-RPC request.")); return
+        }
         if request["id"] == nil {
+            guard request["params"] == nil || request["params"] is [String: Any] else { return }
             if method == "notifications/initialized", initialized { ready = true }
             return
         }
-        guard id is String || ((id as? NSNumber).map { CFGetTypeID($0) != CFBooleanGetTypeID() && $0.doubleValue.isFinite && $0.doubleValue.rounded() == $0.doubleValue } ?? false) else { emit(rpcError(NSNull(), -32600, "Invalid request ID.")); return }
+        guard validID else { emit(rpcError(NSNull(), -32600, "Invalid request ID.")); return }
         if let params = request["params"], !(params is [String: Any]) { emit(rpcError(id, -32602, "Parameters must be an object.")); return }
         let params = request["params"] as? [String: Any] ?? [:]
         var result: [String: Any]
         switch method {
         case "initialize":
             guard !initialized, let version = params["protocolVersion"] as? String,
-                  params["capabilities"] is [String: Any], params["clientInfo"] is [String: Any] else { emit(rpcError(id, -32602, "Invalid initialization.")); return }
+                  params["capabilities"] is [String: Any], let client = params["clientInfo"] as? [String: Any],
+                  client["name"] is String, client["version"] is String else { emit(rpcError(id, -32602, "Initialization requires protocolVersion, capabilities and clientInfo with name and version.")); return }
             initialized = true
-            let supported = ["2025-06-18", "2025-11-25"]
-            result = ["protocolVersion": supported.contains(version) ? version : "2025-11-25",
+            result = ["protocolVersion": supportedProtocols.contains(version) ? version : supportedProtocols.last!,
                       "capabilities": ["tools": [:]],
-                      "serverInfo": ["name": "orbit-disk", "title": "Orbit Disk storage and file cleanup", "version": "1.0.0"],
+                      "serverInfo": serverInfo(),
                       "instructions": AutomationCatalog.instructions]
         case "ping": result = [:]
         case "tools/list":
@@ -85,6 +101,7 @@ func runMCP() {
             result = ["tools": AutomationCatalog.commands]
         case "tools/call":
             guard ready else { emit(rpcError(id, -32002, "Initialize first.")); return }
+            guard params["task"] == nil else { emit(rpcError(id, -32602, "Task execution is unsupported. Call the tool normally and poll its result state.")); return }
             guard let name = params["name"] as? String, name.hasPrefix("orbit_"),
                   AutomationCatalog.commands.contains(where: { $0["name"] as? String == name }),
                   params["arguments"] == nil || params["arguments"] is [String: Any] else { emit(rpcError(id, -32602, "Unknown tool or invalid arguments.")); return }
@@ -118,12 +135,18 @@ func runMCP() {
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
+let standalone = ["mcp", "tools", "mcp-config", "connect-codex", "install-cli", "--version", "version", "--help", "help", "-h"]
+if let command = args.first, standalone.contains(command), args.count != 1 {
+    emit(AutomationCatalog.failure(AutomationCatalog.Failure("invalid_arguments", "\(command) does not accept arguments. Use --help.")))
+    exit(2)
+}
 if args.first == "mcp" { runMCP() }
 else if args.isEmpty || ["--help", "help", "-h"].contains(args[0]) {
     print("""
     Orbit Disk: inspect disk usage, find large files, and manage cleanup using the running app.
     Usage: orbitdisk COMMAND [JSON_ARGUMENTS]
            orbitdisk tools          Print command schemas
+           orbitdisk --version      Print bridge/app version and supported MCP versions
            orbitdisk mcp            Start the discoverable MCP server on stdio
            orbitdisk mcp-config     Print a standard MCP client configuration
            orbitdisk connect-codex  Register automatic tool discovery in Codex
@@ -133,8 +156,11 @@ else if args.isEmpty || ["--help", "help", "-h"].contains(args[0]) {
       orbitdisk scan '{"path":"/Users/you/Downloads"}'
       orbitdisk list '{"limit":20}'
     Commands return JSON. Scan, search and collection validation are asynchronous.
-    Use status to check progress. Removal requires prepare_removal followed by user-authorized remove.
+    Use status to check progress. Visible files are usable while mapping continues.
+    Removal requires prepare_removal followed by user-authorized remove.
     """)
+} else if ["--version", "version"].contains(args[0]) {
+    emit(["serverInfo": serverInfo(), "protocolVersions": supportedProtocols])
 } else if args[0] == "tools" { emit(["tools": AutomationCatalog.commands, "instructions": AutomationCatalog.instructions]) }
 else if ["connect-codex", "install-cli"].contains(args[0]) {
     do {
@@ -150,7 +176,9 @@ else if ["connect-codex", "install-cli"].contains(args[0]) {
         guard args.count <= 2 else { throw AutomationCatalog.Failure("invalid_arguments", "Expected one command and optional JSON object. Use --help.") }
         let arguments: [String: Any]
         if args.count == 2 {
-            guard let parsed = try JSONSerialization.jsonObject(with: Data(args[1].utf8)) as? [String: Any] else { throw AutomationCatalog.Failure("invalid_arguments", "Arguments must be a JSON object.") }
+            guard let parsed = try? JSONSerialization.jsonObject(with: Data(args[1].utf8)) as? [String: Any] else {
+                throw AutomationCatalog.Failure("invalid_arguments", "Arguments must be one valid JSON object.")
+            }
             arguments = parsed
         } else { arguments = [:] }
         let response = call(args[0], arguments)

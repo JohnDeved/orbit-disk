@@ -68,14 +68,27 @@ struct AutomationChecks {
     @MainActor
     static func main() async throws {
         setbuf(stdout, nil)
+        for (error, code) in [(LocalAutomationError.timeout, "request_timeout"), (.disconnected, "connection_closed")] {
+            let failure = AutomationCatalog.failure(error)["error"] as! [String: Any]
+            precondition(failure["code"] as? String == code && failure["outcomeUnknown"] as? Bool == true)
+        }
+        let peerFailure = AutomationCatalog.failure(LocalAutomationError.peerMismatch)["error"] as! [String: Any]
+        precondition(peerFailure["code"] as? String == "peer_mismatch" && peerFailure["outcomeUnknown"] == nil)
+        try AutomationCatalog.validate(command: "search", arguments: ["context": "x", "query": String(repeating: "é", count: 4096)])
+        do {
+            try AutomationCatalog.validate(command: "search", arguments: ["context": "x", "query": String(repeating: "é", count: 4097)])
+            preconditionFailure("Accepted a query beyond the schema limit")
+        } catch let failure as AutomationCatalog.Failure { precondition(failure.code == "invalid_arguments") }
+        print("PASS: transport uncertainty and Unicode schema limits")
         let directory = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         let fm = FileManager.default
         let a = directory.appendingPathComponent("a"), b = directory.appendingPathComponent("b")
         let first = a.appendingPathComponent("first"), second = a.appendingPathComponent("second")
         let nativeLater = a.appendingPathComponent("native-later")
         let outside = b.appendingPathComponent("untouched")
+        let folder = b.appendingPathComponent("folder")
         try fm.createDirectory(at: a, withIntermediateDirectories: true)
-        try fm.createDirectory(at: b, withIntermediateDirectories: true)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
         try Data([1]).write(to: first)
         try Data([2, 2]).write(to: second)
         try Data().write(to: nativeLater)
@@ -120,6 +133,10 @@ struct AutomationChecks {
         rejected(controller, "collect", ["context": initialContext, "items": [oldFirst]], "stale_context")
         opening.release()
         try await wait("second map") { model.root?.id == b.path && !model.isOpeningFolder && !model.isScanning }
+        success(controller, "select", ["context": context(controller), "item": item(model.current!.children.first { $0.id == outside.path }!)])
+        rejected(controller, "preview", ["context": context(controller), "item": item(model.current!.children.first { $0.id == folder.path }!)], "not_file")
+        precondition(model.selectedID == outside.path && model.previewURL == nil)
+        print("PASS: invalid Quick Look request preserves the selected item")
         for command in ["select", "open", "reveal", "preview"] {
             rejected(controller, command, ["context": initialContext, "item": oldFirst], "stale_context")
         }
@@ -140,6 +157,13 @@ struct AutomationChecks {
         let replacement = item(model.current!.children.first { $0.name == "first" }!)
         success(controller, "collect", ["context": currentContext, "items": [replacement, secondItem]])
         try await wait("collection validation") { ready(model) && model.displayedCollection.count == 2 }
+        success(controller, "search", ["context": currentContext, "query": "second"])
+        try await wait("search alongside collection") { !model.isSearching && !model.isSearchResultOutdated }
+        precondition(success(controller, "list")["searchMatchCount"] as? Int == 1)
+        let collected = success(controller, "collection")
+        precondition(collected["total"] as? Int == 2 && collected["searchMatchCount"] == nil && collected["searchTruncated"] == nil)
+        success(controller, "search", ["context": currentContext, "query": ""])
+        print("PASS: collection pages do not report unrelated search counts")
         let stalePlan = success(controller, "prepare_removal", ["context": currentContext, "mode": "permanent"])
         precondition(stalePlan["count"] as? Int == 2 && stalePlan["requiresUserAuthorization"] as? Bool == true)
         success(controller, "uncollect", ["context": currentContext, "items": [replacement]])
@@ -234,6 +258,35 @@ struct AutomationChecks {
         try await wait("partial map finishes") { !live.isScanning && !live.isOpeningFolder }
         precondition(fm.fileExists(atPath: outside.path))
         print("PASS: partial-map items can be collected and deleted without waiting for discovery")
+
+        let failedRoot = directory.appendingPathComponent("failed-search"), failedCache = directory.appendingPathComponent("failed-search-index")
+        try fm.createDirectory(at: failedRoot, withIntermediateDirectories: true)
+        try Data([1]).write(to: failedRoot.appendingPathComponent("searchable-file"))
+        let failedModel = DiskModel(cacheDirectory: failedCache, preferences: preferences)
+        failedModel.testMonitorUnavailable = true
+        let failedController = AutomationController(model: failedModel)
+        diagnostics = { String(describing: success(failedController, "status")) }
+        defer { failedController.stop(); failedModel.cancelScan() }
+        success(failedController, "scan", ["path": failedRoot.path])
+        try await wait("failed-search fixture ready") { failedModel.root?.id == failedRoot.path && !failedModel.isOpeningFolder && !failedModel.isScanning }
+        let failedContext = context(failedController)
+        success(failedController, "search", ["context": failedContext, "query": "searchable"])
+        try await wait("initial search result") { !failedModel.isSearching && !failedModel.isSearchResultOutdated && failedModel.searchMatchCount == 1 }
+        let saved = DiskIndexStore(directory: failedCache).savedSnapshot(for: failedRoot)!
+        let unavailable = directory.appendingPathComponent("temporarily-unavailable-index")
+        try fm.moveItem(at: saved.databaseURL, to: unavailable)
+        failedModel.testRetrySearch()
+        try await wait("search failure") { failedModel.searchFailed && !failedModel.isSearching }
+        precondition(success(failedController, "status")["searchFailed"] as? Bool == true)
+        rejected(failedController, "list", [:], "search_failed")
+        precondition(success(failedController, "collection")["total"] as? Int == 0)
+        try fm.moveItem(at: unavailable, to: saved.databaseURL)
+        success(failedController, "search", ["context": failedContext, "query": "searchable"])
+        precondition(failedModel.isSearching)
+        try await wait("same-query retry recovers") { !failedModel.isSearching && !failedModel.searchFailed && !failedModel.isSearchResultOutdated }
+        precondition(success(failedController, "status")["searchFailed"] as? Bool == false)
+        precondition(success(failedController, "list")["total"] as? Int == 1)
+        print("PASS: failed search reports an error and the same query can retry successfully")
         print("PASS: automation controller checks")
     }
 }

@@ -1882,10 +1882,19 @@ final class DiskModel: ObservableObject {
                     }
                 }
                 stageAttachObserver()
-                while try stage.advance(progress: { progress in
-                    observer(progress)
-                    reportProgress(progress)
-                }) { stageStepObserver(stage) }
+                try await withTaskCancellationHandler(operation: {
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            do {
+                                while try stage.advance(progress: { progress in
+                                    observer(progress)
+                                    reportProgress(progress)
+                                }) { stageStepObserver(stage) }
+                                continuation.resume()
+                            } catch { continuation.resume(throwing: error) }
+                        }
+                    }
+                }, onCancel: { token.cancel() })
                 if let preview { await model.readPreview(preview, scanID: await model.generation, token: token, force: true) }
                 let saved = try stage.publish(elapsed: ProcessInfo.processInfo.systemUptime - started)
                 return (saved, try indexedFolder(desiredPath, store: store, snapshot: saved, colors: colors, cancellation: token), false)
@@ -3555,64 +3564,70 @@ final class DiskModel: ObservableObject {
         let removalObserver: @Sendable () -> Void = {}
         #endif
         Task { [weak self, session] in
-            let outcome = await Task.detached(priority: .userInitiated) {
-                removalObserver()
-                var removed = Set<String>()
-                var failures: [String] = []
-                var changedParents = Set<String>()
-                var rootChanged = false
-                var parentsOverflow = false
-                func noteParent(_ path: String) {
-                    if changedParents.contains(path) || changedParents.count < parentLimit { changedParents.insert(path) }
-                    else { parentsOverflow = true }
-                }
-                let candidates = items.compactMap { item in
-                    identities[item.id].map { ScanRemoval(path: item.id, identity: $0) }
-                }
-                let operation: RemovalJournal.Operation
-                do {
-                    guard let rootIdentity, !candidates.isEmpty else {
-                        throw DiskIndexError.invalid("The selected items no longer have a valid mapping identity.")
+            let outcome = await withCheckedContinuation { continuation in
+                // File removal can block; keep its I/O off the cooperative executor.
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let remove = {
+                        removalObserver()
+                        var removed = Set<String>()
+                        var failures: [String] = []
+                        var changedParents = Set<String>()
+                        var rootChanged = false
+                        var parentsOverflow = false
+                        func noteParent(_ path: String) {
+                            if changedParents.contains(path) || changedParents.count < parentLimit { changedParents.insert(path) }
+                            else { parentsOverflow = true }
+                        }
+                        let candidates = items.compactMap { item in
+                            identities[item.id].map { ScanRemoval(path: item.id, identity: $0) }
+                        }
+                        let operation: RemovalJournal.Operation
+                        do {
+                            guard let rootIdentity, !candidates.isEmpty else {
+                                throw DiskIndexError.invalid("The selected items no longer have a valid mapping identity.")
+                            }
+                            operation = try RemovalJournal(cache: journalCache).begin(root: rootURL, rootIdentity: rootIdentity, items: candidates)
+                        } catch {
+                            return (removed, ["Removal could not be recorded: \(error.localizedDescription)"], changedParents, rootChanged, [ScanRemoval](), false, parentsOverflow, Optional<RemovalCursor>.none)
+                        }
+                        for item in items {
+                            guard let rootIdentity, currentFileIdentity(rootURL) == rootIdentity else {
+                                failures.append("The mapped folder changed. Refresh the map before removing any more items.")
+                                rootChanged = true
+                                break
+                            }
+                            guard let expected = identities[item.id], currentFileIdentity(item.url) == expected else {
+                                failures.append("\(item.name): the item changed. Remove it from the collection and add it again.")
+                                if isWithin(item.id, root: rootURL.path) { noteParent(item.url.deletingLastPathComponent().path) }
+                                continue
+                            }
+                            guard operation.parentIsUnchanged(path: item.id) else {
+                                failures.append("\(item.name): the containing folder changed. Refresh the map before removing it.")
+                                noteParent(item.url.deletingLastPathComponent().path)
+                                continue
+                            }
+                            if let reason = TrashPolicy.rejectionReason(for: item.url, scanRoot: rootURL) {
+                                failures.append("\(item.name): \(reason)"); continue
+                            }
+                            noteParent(item.url.deletingLastPathComponent().path)
+                            do {
+                                if permanently { try FileManager.default.removeItem(at: item.url) }
+                                else { try FileManager.default.trashItem(at: item.url, resultingItemURL: nil) }
+                                removed.insert(item.id)
+                            } catch { failures.append("\(item.name): \(error.localizedDescription)") }
+                        }
+                        do { try operation.complete() }
+                        catch { failures.append("Removal tracking could not be completed: \(error.localizedDescription)") }
+                        var overlay: [ScanRemoval] = []
+                        for item in items where removed.contains(item.id) {
+                            guard let identity = identities[item.id] else { continue }
+                            if overlay.count < 10_000 { overlay.append(ScanRemoval(path: item.id, identity: identity)) }
+                        }
+                        return (removed, failures, changedParents, rootChanged, overlay, removed.count > overlay.count, parentsOverflow, Optional(operation.cursor))
                     }
-                    operation = try RemovalJournal(cache: journalCache).begin(root: rootURL, rootIdentity: rootIdentity, items: candidates)
-                } catch {
-                    return (removed, ["Removal could not be recorded: \(error.localizedDescription)"], changedParents, rootChanged, [ScanRemoval](), false, parentsOverflow, Optional<RemovalCursor>.none)
+                    continuation.resume(returning: remove())
                 }
-                for item in items {
-                    guard let rootIdentity, currentFileIdentity(rootURL) == rootIdentity else {
-                        failures.append("The mapped folder changed. Refresh the map before removing any more items.")
-                        rootChanged = true
-                        break
-                    }
-                    guard let expected = identities[item.id], currentFileIdentity(item.url) == expected else {
-                        failures.append("\(item.name): the item changed. Remove it from the collection and add it again.")
-                        if isWithin(item.id, root: rootURL.path) { noteParent(item.url.deletingLastPathComponent().path) }
-                        continue
-                    }
-                    guard operation.parentIsUnchanged(path: item.id) else {
-                        failures.append("\(item.name): the containing folder changed. Refresh the map before removing it.")
-                        noteParent(item.url.deletingLastPathComponent().path)
-                        continue
-                    }
-                    if let reason = TrashPolicy.rejectionReason(for: item.url, scanRoot: rootURL) {
-                        failures.append("\(item.name): \(reason)"); continue
-                    }
-                    noteParent(item.url.deletingLastPathComponent().path)
-                    do {
-                        if permanently { try FileManager.default.removeItem(at: item.url) }
-                        else { try FileManager.default.trashItem(at: item.url, resultingItemURL: nil) }
-                        removed.insert(item.id)
-                    } catch { failures.append("\(item.name): \(error.localizedDescription)") }
-                }
-                do { try operation.complete() }
-                catch { failures.append("Removal tracking could not be completed: \(error.localizedDescription)") }
-                var overlay: [ScanRemoval] = []
-                for item in items where removed.contains(item.id) {
-                    guard let identity = identities[item.id] else { continue }
-                    if overlay.count < 10_000 { overlay.append(ScanRemoval(path: item.id, identity: identity)) }
-                }
-                return (removed, failures, changedParents, rootChanged, overlay, removed.count > overlay.count, parentsOverflow, Optional(operation.cursor))
-            }.value
+            }
             guard let self else { return }
             defer {
                 self.finishRemovalReceipt(removalID, count: outcome.0.count, permanently: permanently, failures: outcome.1)
@@ -3745,6 +3760,10 @@ final class DiskModel: ObservableObject {
             guard ownsCompletionPresentation(), self.generation == removalGeneration else { return }
             self.refreshVolumes()
         }
+    }
+
+    func retryFailedSearch() {
+        if searchFailed && !isSearching { search() }
     }
 
     private func search() {

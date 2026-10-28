@@ -8,8 +8,8 @@ enum AutomationIntegration {
     static func show() {
         guard !working else { present(message: "Setup is in progress", detail: "Wait for the current setup to finish."); return }
         let alert = NSAlert()
-        alert.messageText = "Use Orbit Disk with AI tools"
-        alert.informativeText = "Connect once so Codex can discover Orbit Disk’s tools in new conversations. It can inspect maps and manage your collection. Removing files requires your approval of the exact items and removal mode."
+        alert.messageText = "Connect your AI assistant"
+        alert.informativeText = "Let Codex use your maps and collection in a new chat. For another assistant, copy the MCP settings. Your assistant must ask you to approve the exact files before removing them."
         alert.addButton(withTitle: "Connect to Codex")
         alert.addButton(withTitle: "Copy MCP Settings")
         alert.addButton(withTitle: "Install Command Line Tool")
@@ -48,7 +48,18 @@ enum AutomationIntegration {
 
     private static func show(_ alert: NSAlert, completion: @escaping @MainActor (NSApplication.ModalResponse) -> Void) {
         if let window = NSApp.keyWindow ?? NSApp.mainWindow {
-            alert.beginSheetModal(for: window) { response in completion(response) }
+            let sheet = alert.window
+            let monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak window, weak sheet] event in
+                guard let window, let sheet, window.attachedSheet === sheet,
+                      sheet.attachedSheet == nil, event.window === window,
+                      !sheet.frame.contains(window.convertPoint(toScreen: event.locationInWindow)) else { return event }
+                window.endSheet(sheet, returnCode: .cancel)
+                return nil
+            }
+            alert.beginSheetModal(for: window) { response in
+                if let monitor { NSEvent.removeMonitor(monitor) }
+                completion(response)
+            }
         } else { completion(alert.runModal()) }
     }
 }
