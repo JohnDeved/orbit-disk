@@ -16,10 +16,13 @@ plutil -lint Config/Info.plist
 architectures=("$(uname -m)")
 $universal && architectures=(arm64 x86_64)
 binaries=()
+control_binaries=()
 for architecture in "${architectures[@]}"; do
   swift build -c release --arch "$architecture" --product OrbitDisk
+  swift build -c release --arch "$architecture" --product OrbitControl
   bin_path=$(swift build -c release --arch "$architecture" --show-bin-path)
   binaries+=("$bin_path/OrbitDisk")
+  control_binaries+=("$bin_path/OrbitControl")
 done
 sparkle_path="$PWD/.build/artifacts/sparkle/Sparkle"
 framework="$sparkle_path/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
@@ -40,9 +43,13 @@ codesign --force --sign - --preserve-metadata=identifier,entitlements,flags \
 if $universal; then
   lipo -create "${binaries[@]}" -output "$bundle/Contents/MacOS/OrbitDisk"
   lipo "$bundle/Contents/MacOS/OrbitDisk" -verify_arch arm64 x86_64
+  lipo -create "${control_binaries[@]}" -output "$bundle/Contents/MacOS/OrbitControl"
+  lipo "$bundle/Contents/MacOS/OrbitControl" -verify_arch arm64 x86_64
 else
   cp "${binaries[1]}" "$bundle/Contents/MacOS/OrbitDisk"
+  cp "${control_binaries[1]}" "$bundle/Contents/MacOS/OrbitControl"
 fi
+codesign --force --sign - "$bundle/Contents/MacOS/OrbitControl"
 codesign --force --sign - "$bundle"
 codesign --verify --deep --strict "$bundle"
 # Swap only after the complete replacement has passed verification.

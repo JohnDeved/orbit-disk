@@ -61,9 +61,13 @@ The app is ad-hoc signed and has not been notarized by Apple. If macOS blocks th
 
 ## Privacy and permissions
 
-Scanning and search happen on your Mac. Orbit Disk contacts GitHub to check for updates; it does not upload your file names, paths, sizes, or contents.
+Scanning and search happen on your Mac. Orbit Disk contacts GitHub to check for updates; it does not upload your file names, paths, sizes, or contents. If you connect an AI client, that client receives the metadata returned by the automation tools and handles it according to its own settings.
 
 macOS may restrict access to some folders. Full Disk Access is optional, and the app reports skipped items. Allocated space is a filesystem measurement; it is not a guarantee of how much space deletion will reclaim.
+
+## AI access in development builds
+
+AI clients can inspect maps, find large files, build a collection and remove explicitly reviewed items through the live app. Connect once through **Orbit Disk → AI Integration…**; Codex then discovers the tools automatically in new sessions. A JSON command-line client is also bundled. [Setup, tools and removal behavior](docs/AI-INTEGRATION.md)
 
 ## Build from source
 

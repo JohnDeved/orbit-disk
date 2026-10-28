@@ -6,12 +6,14 @@ struct OrbitDiskApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var model: DiskModel
     @StateObject private var updater: AppUpdater
+    @StateObject private var automation: AutomationController
 
     init() {
         MappingCacheReset.finishPendingReset()
         let model = DiskModel()
         _model = StateObject(wrappedValue: model)
         _updater = StateObject(wrappedValue: AppUpdater(model: model))
+        _automation = StateObject(wrappedValue: AutomationController(model: model))
     }
 
     var body: some Scene {
@@ -21,9 +23,11 @@ struct OrbitDiskApp: App {
                 .frame(minWidth: 1060, minHeight: 680)
                 .onAppear {
                     delegate.model = model
+                    delegate.stopAutomation = { automation.stop() }
                     updater.start()
                     guard !model.didLaunch else { return }
                     model.didLaunch = true
+                    automation.start()
                     if let index = CommandLine.arguments.firstIndex(of: "--scan"),
                        CommandLine.arguments.indices.contains(index + 1) {
                         model.scan(URL(fileURLWithPath: CommandLine.arguments[index + 1]))
@@ -38,6 +42,7 @@ struct OrbitDiskApp: App {
         .commands {
             CommandGroup(after: .appInfo) {
                 CheckForUpdatesButton(updater: updater)
+                Button("AI Integration…", action: AutomationIntegration.show)
                 Button("Clear Cache…", action: clearCache)
                     .disabled(model.isRemovingAcrossSessions)
             }

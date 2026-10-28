@@ -125,6 +125,9 @@ struct UpdateSettingsView: View {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: DiskModel?
+    var stopAutomation: (() -> Void)?
+
+    func applicationWillTerminate(_ notification: Notification) { stopAutomation?() }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)

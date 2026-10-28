@@ -248,7 +248,8 @@ final class AsyncListingProducer: @unchecked Sendable {
          deferDirectory: ((Data) -> Bool)?, preferredDirectory: (() -> Data?)?,
          live: LiveMappingInventory? = nil, seedPath: String? = nil, startingGeneration: Int64 = 0, reuse: DiscoveryReuse? = nil,
          forceFallback: Bool = false, workerCount: Int = 4, onAccepted: @escaping () -> Void) throws {
-        self.rootURL = rootURL; root = try SecureRoot(url: rootURL)
+        self.rootURL = rootURL
+        root = try CloudStoragePolicy.withoutMaterialization { try SecureRoot(url: rootURL) }
         guard root.identity == rootIdentity else { throw SecureTraversalError.identityChanged }
         self.excludedDirectories = excludedDirectories; self.excludedPaths = excludedPaths
         self.deferDirectory = deferDirectory; self.preferredDirectory = preferredDirectory
@@ -309,6 +310,11 @@ final class AsyncListingProducer: @unchecked Sendable {
     }
 
     private func runWorker() {
+        do { try CloudStoragePolicy.withoutMaterialization { runLocalWorker() } }
+        catch { cancel() }
+    }
+
+    private func runLocalWorker() {
         let cursor: SecureDirectoryCursor
         do { cursor = try SecureDirectoryCursor(root: root, rootURL: rootURL) }
         catch { cancel(); return }

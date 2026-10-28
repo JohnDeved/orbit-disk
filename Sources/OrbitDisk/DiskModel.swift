@@ -440,13 +440,14 @@ func hasCollectedAncestor(_ path: String, in paths: Set<String>, includingSelf: 
 private func validateCollectionNodes(_ nodes: [DiskNode], root: URL,
                                      cancellation: ScanCancellation? = nil) -> CollectionValidation? {
     var result = CollectionValidation()
+    let cloudValidator = CloudStoragePolicy.Validator()
     for node in nodes {
         if cancellation?.isCancelled == true { return nil }
         guard node.isAccessible, !node.isSymbolicLink else {
             result.rejections.append("\(node.name): this item cannot be collected.")
             continue
         }
-        if let reason = TrashPolicy.rejectionReason(for: node.url, scanRoot: root) {
+        if let reason = TrashPolicy.rejectionReason(for: node.url, scanRoot: root, cloudValidator: cloudValidator) {
             result.rejections.append("\(node.name): \(reason)")
             continue
         }
@@ -498,6 +499,15 @@ struct CollectionReviewToken: Hashable {
     fileprivate let reviewID: UUID
     fileprivate let collectionRevision: UUID
     fileprivate let errorRevision: UInt64
+}
+
+struct AutomationRemovalReceipt {
+    let id: UUID
+    let sessionID: UUID
+    var running: Bool
+    var removedCount: Int?
+    var status: String
+    var error: String?
 }
 
 @MainActor
@@ -789,6 +799,8 @@ final class DiskModel: ObservableObject {
     @Published var isRemoving = false
     @Published private(set) var isRemovingAcrossSessions = false
     private var activeRemovalIDs = Set<UUID>()
+    private var removalReceipts: [UUID: AutomationRemovalReceipt] = [:]
+    private var removalReceiptOrder: [UUID] = []
     private var startingRemovals: [UUID: (path: Data, identity: String?)] = [:]
     private var finishingRemovals: [UUID: (path: Data, identity: String?)] = [:]
     var hasActiveRemovals: Bool { !activeRemovalIDs.isEmpty }
@@ -864,7 +876,7 @@ final class DiskModel: ObservableObject {
     private var sessions: [String: MappingSession] = [:]
     private var activeSessionID: UUID?
     private var resolutionID = UUID()
-    private var resolutionWorker: Task<(URL, String?, String?, Bool), Never>?
+    private var resolutionWorker: Task<(URL, String?, String?, Bool, String?), Never>?
     private var generation = UUID()
     private var browseGeneration = UUID()
     private var requestedFolderPath: String?
@@ -1114,6 +1126,27 @@ final class DiskModel: ObservableObject {
         guard searchPreparationCancellation === cancellation else { return }
         searchPreparationCancellation = nil; searchPreparationTask = nil
         searchPreparationSnapshotID = nil; searchPreparationDatabaseURL = nil
+    }
+
+    var automationSessionID: UUID? { displayedRootMatchesActiveSession && !isOpeningFolder ? activeSessionID : nil }
+    func automationRemovalReceipt(_ id: UUID) -> AutomationRemovalReceipt? { removalReceipts[id] }
+    func latestAutomationRemovalReceipt(sessionID: UUID) -> AutomationRemovalReceipt? {
+        removalReceiptOrder.reversed().lazy.compactMap { self.removalReceipts[$0] }.first { $0.sessionID == sessionID }
+    }
+    private func finishRemovalReceipt(_ id: UUID, count: Int, permanently: Bool, failures: [String]) {
+        guard var receipt = removalReceipts[id] else { return }
+        receipt.running = false
+        receipt.removedCount = count
+        let noun = count == 1 ? "item" : "items"
+        receipt.status = permanently ? "Deleted \(count) \(noun) permanently." : "Moved \(count) \(noun) to Trash."
+        receipt.error = failures.isEmpty ? nil : failures.joined(separator: "\n")
+        removalReceipts[id] = receipt
+        var finished = 0
+        for key in removalReceiptOrder.reversed() where removalReceipts[key]?.running == false {
+            finished += 1
+            if finished > 32 { removalReceipts.removeValue(forKey: key) }
+        }
+        removalReceiptOrder.removeAll { removalReceipts[$0] == nil }
     }
 
     var current: DiskNode? { navigation.last }
@@ -1409,8 +1442,12 @@ final class DiskModel: ObservableObject {
         #endif
         isOpeningFolder = true
         let cache = store.directory, staging = stagingDirectory
-        let check = Task.detached(priority: .userInitiated) { () -> (URL, String?, String?, Bool) in
+        let check = Task.detached(priority: .userInitiated) { () -> (URL, String?, String?, Bool, String?) in
             observer()
+            if let reason = CloudStoragePolicy.exclusionReason(for: requestedURL) {
+                return (requestedURL, nil, nil, false, reason)
+            }
+            do { return try CloudStoragePolicy.withoutMaterialization {
             let identity = currentFileIdentity(requestedURL)
             let replaced = coveringRemovals.contains { removal in
                 guard let live = currentFileIdentity(URL(fileURLWithPath: removal.path)) else { return false }
@@ -1418,19 +1455,25 @@ final class DiskModel: ObservableObject {
             }
             if let candidateURL, let candidateIdentity, !replaced,
                isReachableWithinSession(root: candidateURL, target: requestedURL, expectedIdentity: candidateIdentity) {
-                return (candidateURL, candidateIdentity, identity, true)
+                return (candidateURL, candidateIdentity, identity, true, nil)
             }
             if !force, !Task.isCancelled,
                let coverage = try? MappingCoverage.find(for: requestedURL, cache: cache, stagingDirectory: staging) {
-                return (coverage.rootURL, coverage.rootIdentity, coverage.requestedIdentity, false)
+                return (coverage.rootURL, coverage.rootIdentity, coverage.requestedIdentity, false, nil)
             }
-            return (requestedURL, identity, identity, false)
+            return (requestedURL, identity, identity, false, nil)
+            } } catch { return (requestedURL, nil, nil, false, error.localizedDescription) }
         }
         resolutionWorker = check
         Task { [weak self, weak session] in
-            let (coveredRoot, coveredIdentity, requestedIdentity, usedSession) = await check.value
+            let (coveredRoot, coveredIdentity, requestedIdentity, usedSession, exclusion) = await check.value
             guard let self, self.resolutionID == request, !Task.isCancelled else { return }
             self.resolutionWorker = nil
+            if let exclusion {
+                self.isOpeningFolder = false
+                self.errorMessage = exclusion
+                return
+            }
             if let session, session.removalEpoch != candidateEpoch {
                 self.scan(requestedURL, force: force); return
             }
@@ -1705,7 +1748,8 @@ final class DiskModel: ObservableObject {
                             do {
                                 result = try DiskScanner().scan(URL(fileURLWithPath: path), cancellation: token,
                                                                 excluding: [store.directory, store.lockDirectory, stagingDirectory])
-                            } catch ScanError.filesystem(_, let code) where code == ENOENT || code == ENOTDIR { result = nil }
+                            } catch ScanError.excluded { result = nil }
+                            catch ScanError.filesystem(_, let code) where code == ENOENT || code == ENOTDIR { result = nil }
                             workingSaved = try store.update(snapshot: workingSaved, replacements: [IndexReplacement(path: path, result: result)],
                                                             eventID: saved.eventID, eventIdentity: saved.eventIdentity, cancellation: token,
                                                             journalFenceCursor: recovery.cursor)
@@ -2511,7 +2555,8 @@ final class DiskModel: ObservableObject {
                         do {
                             result = try DiskScanner().scan(URL(fileURLWithPath: path), cancellation: token,
                                                             excluding: [store.directory, store.lockDirectory, stagingDirectory])
-                        } catch ScanError.filesystem(_, let code) where code == ENOENT || code == ENOTDIR { result = nil }
+                        } catch ScanError.excluded { result = nil }
+                        catch ScanError.filesystem(_, let code) where code == ENOENT || code == ENOTDIR { result = nil }
                         refreshObserver()
                         workingSaved = try store.update(snapshot: workingSaved, replacements: [IndexReplacement(path: path, result: result)],
                                                         eventID: saved.eventID, eventIdentity: saved.eventIdentity, cancellation: token,
@@ -3472,6 +3517,9 @@ final class DiskModel: ObservableObject {
         session.removalError = nil
         startingRemovals[sessionID] = (Data(rootURL.path.utf8), session.identity)
         let removalID = beginRemovalActivity()
+        removalReceipts[removalID] = AutomationRemovalReceipt(id: removalID, sessionID: sessionID, running: true,
+            removedCount: nil, status: permanently ? "Deleting collected items permanently…" : "Moving collected items to Trash…", error: nil)
+        removalReceiptOrder.append(removalID)
         if activeSessionID == sessionID, generation == startGeneration { isRemoving = true }
         // An observer can switch sessions before @Published commits the value.
         // Restore the pending removal to A and reconcile the visible flag with its current owner.
@@ -3567,6 +3615,7 @@ final class DiskModel: ObservableObject {
             }.value
             guard let self else { return }
             defer {
+                self.finishRemovalReceipt(removalID, count: outcome.0.count, permanently: permanently, failures: outcome.1)
                 self.endRemovalActivity(removalID)
             }
             let completedSession: MappingSession

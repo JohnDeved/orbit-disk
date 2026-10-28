@@ -83,6 +83,7 @@ public final class ResumableStage: @unchecked Sendable {
     }
 
     public init(cache: URL, stagingDirectory: URL? = nil, root: URL, current: StageCheckpoint, cancellation: ScanCancellation = ScanCancellation()) throws {
+        if let reason = CloudStoragePolicy.exclusionReason(for: root) { throw ScanError.excluded(reason) }
         let root = root.standardizedFileURL
         let cache = IndexLocations.canonicalCache(cache)
         let lockDirectory = IndexLocations.locks(for: cache)
@@ -309,7 +310,7 @@ public final class ResumableStage: @unchecked Sendable {
     }
 
     public func prepareRemovalReplay() throws {
-        try removalReplay.prepare()
+        try CloudStoragePolicy.withoutMaterialization { try removalReplay.prepare() }
         removalReplayPrepared = true
         bumpRevision()
     }
@@ -402,6 +403,10 @@ public final class ResumableStage: @unchecked Sendable {
     }
 
     public func advance(progress: @escaping @Sendable (ScanProgress) -> Void) throws -> Bool {
+        try CloudStoragePolicy.withoutMaterialization { try advanceLocal(progress: progress) }
+    }
+
+    private func advanceLocal(progress: @escaping @Sendable (ScanProgress) -> Void) throws -> Bool {
         try startDiscovery(progress: progress)
         try crawler.store.prepareQueueIndexes(cancellation: crawler.cancellation)
         let replayGeneration = removalReplay.viewState().generation
@@ -448,6 +453,10 @@ public final class ResumableStage: @unchecked Sendable {
     }
 
     public func publish(elapsed: TimeInterval) throws -> IndexSnapshot {
+        try CloudStoragePolicy.withoutMaterialization { try publishLocal(elapsed: elapsed) }
+    }
+
+    private func publishLocal(elapsed: TimeInterval) throws -> IndexSnapshot {
         cancelSearchPreparation(suspend: true)
         var published = false
         defer {

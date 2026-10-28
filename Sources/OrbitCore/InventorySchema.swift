@@ -2,7 +2,8 @@ import CSQLite
 import Foundation
 
 enum InventorySchema {
-    static let version: Int64 = 4
+    // Older inventories may contain cloud storage and cannot be reused under the local-only policy.
+    static let version: Int64 = 5
     static let applicationID: Int64 = 0x4F524254
 
     static let createSQL = """

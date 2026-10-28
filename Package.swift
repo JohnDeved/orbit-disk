@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .executable(name: "OrbitDisk", targets: ["OrbitDisk"]),
         .executable(name: "OrbitScan", targets: ["OrbitScan"]),
+        .executable(name: "OrbitControl", targets: ["OrbitControl"]),
         .executable(name: "OrbitCoreChecks", targets: ["OrbitCoreChecks"]),
         .library(name: "OrbitCore", targets: ["OrbitCore"])
     ],
@@ -16,9 +17,11 @@ let package = Package(
     targets: [
         .systemLibrary(name: "CSQLite"),
         .target(name: "OrbitCore", dependencies: ["CSQLite"]),
+        .target(name: "OrbitAutomation"),
+        .executableTarget(name: "OrbitControl", dependencies: ["OrbitAutomation"]),
         .executableTarget(
             name: "OrbitDisk",
-            dependencies: ["OrbitCore", .product(name: "Sparkle", package: "Sparkle")],
+            dependencies: ["OrbitCore", "OrbitAutomation", .product(name: "Sparkle", package: "Sparkle")],
             linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"])]
         ),
         .executableTarget(name: "OrbitScan", dependencies: ["OrbitCore"]),

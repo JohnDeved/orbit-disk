@@ -4,9 +4,33 @@ public enum TrashPolicy {
     public static func rejectionReason(
         for url: URL,
         scanRoot: URL,
-        home: URL = FileManager.default.homeDirectoryForCurrentUser
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        excluding roots: [URL]? = nil,
+        cloudValidator: CloudStoragePolicy.Validator? = nil
     ) -> String? {
         guard url.isFileURL, scanRoot.isFileURL else { return "Only local files can be removed." }
+        do {
+            return try CloudStoragePolicy.withoutMaterialization {
+                localRejectionReason(for: url, scanRoot: scanRoot, home: home,
+                                     excluding: roots, cloudValidator: cloudValidator)
+            }
+        } catch {
+            return "This item cannot be checked without downloading cloud content."
+        }
+    }
+
+    private static func localRejectionReason(for url: URL, scanRoot: URL, home: URL,
+                                             excluding roots: [URL]?, cloudValidator: CloudStoragePolicy.Validator?) -> String? {
+        let cloudReason: String?
+        if let cloudValidator {
+            cloudReason = cloudValidator.exclusionReason(for: url)
+        } else {
+            cloudReason = CloudStoragePolicy.exclusionReason(for: url, home: home, excluding: roots,
+                                                            protectContainingRoots: true)
+        }
+        if let reason = cloudReason {
+            return reason
+        }
         let manager = FileManager.default
         let original = url.standardizedFileURL
         let root = scanRoot.standardizedFileURL.resolvingSymlinksInPath()

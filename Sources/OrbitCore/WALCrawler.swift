@@ -35,20 +35,27 @@ final class DurableCrawler {
     init(rootURL: URL, database: String, checkpoint: StageCheckpoint,
          cancellation: ScanCancellation = ScanCancellation(), writeChunkSize: Int = 1024, mirror: Bool = false,
          expectedSnapshot: SnapshotExpectation? = nil, generation: String? = nil, excluding: [URL] = []) throws {
+        let cloudRoots = CloudStoragePolicy.scanExclusions()
+        if let reason = CloudStoragePolicy.exclusionReason(for: rootURL, excluding: cloudRoots) {
+            throw ScanError.excluded(reason)
+        }
+        let excluding = excluding + cloudRoots
         self.rootURL = rootURL.standardizedFileURL
         self.rootPath = Data(self.rootURL.path.utf8)
-        self.root = try SecureRoot(url: self.rootURL)
+        self.root = try CloudStoragePolicy.withoutMaterialization { try SecureRoot(url: rootURL.standardizedFileURL) }
         self.liveInventory = LiveMappingInventory(root: self.rootURL, identity: self.root.identity, cancellation: cancellation)
         self.store = try ListingStage(path: database, mirror: mirror)
         self.cancellation = cancellation
         self.writeChunkSize = max(128, writeChunkSize)
-        self.excludedDirectories = Set(excluding.compactMap { url in
-            var info = stat()
-            guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR else { return nil }
-            return DirectoryIdentity(device: info.st_dev, inode: info.st_ino)
-        })
-        self.excludedPaths = IndexLocations.exclusionPaths(excluding)
-        try root.validate(url: self.rootURL)
+        self.excludedDirectories = try CloudStoragePolicy.withoutMaterialization {
+            Set(excluding.compactMap { url in
+                var info = stat()
+                guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR else { return nil }
+                return DirectoryIdentity(device: info.st_dev, inode: info.st_ino)
+            })
+        }
+        self.excludedPaths = try CloudStoragePolicy.withoutMaterialization { IndexLocations.exclusionPaths(excluding) }
+        try CloudStoragePolicy.withoutMaterialization { try root.validate(url: self.rootURL) }
         try store.preserveScanStart(root: rootPath, identity: checkpoint.identity, eventID: checkpoint.eventID, expected: expectedSnapshot, generation: generation)
         try store.registerDirectory(path: rootPath, device: root.identity.device, inode: root.identity.inode)
         try store.initializeMirrorRoot(url: self.rootURL, identity: root.identity)
@@ -92,9 +99,11 @@ final class DurableCrawler {
         // Cancellation may originate on another thread; cursor teardown stays on the writer.
         defer { if !hasActiveAsyncDiscovery { asyncWriterCursor = nil } }
         do {
-            return try consumeAsync(beforeAccounting: beforeAccounting, onRecordCount: onRecordCount,
-                onBatch: onBatch, onListingComplete: onListingComplete,
-                onListingStart: onListingStart, onListingEnd: onListingEnd)
+            return try CloudStoragePolicy.withoutMaterialization {
+                try consumeAsync(beforeAccounting: beforeAccounting, onRecordCount: onRecordCount,
+                    onBatch: onBatch, onListingComplete: onListingComplete,
+                    onListingStart: onListingStart, onListingEnd: onListingEnd)
+            }
         } catch { cancelAsyncDiscovery(); throw error }
     }
 
@@ -204,6 +213,16 @@ final class DurableCrawler {
               onRecordCount: ((Int) -> Void)? = nil, onBatch: ((Data, Int) throws -> Void)? = nil,
               onListingComplete: (() -> Void)? = nil,
               onListingStart: ((Data, String) -> Void)? = nil, onListingEnd: (() -> Void)? = nil) throws -> Bool {
+        try CloudStoragePolicy.withoutMaterialization {
+            try stepLocal(maxBatches: maxBatches, beforeAccounting: beforeAccounting, onRecordCount: onRecordCount,
+                onBatch: onBatch, onListingComplete: onListingComplete, onListingStart: onListingStart, onListingEnd: onListingEnd)
+        }
+    }
+
+    private func stepLocal(maxBatches: Int?, beforeAccounting: (() throws -> Void)?,
+                           onRecordCount: ((Int) -> Void)?, onBatch: ((Data, Int) throws -> Void)?,
+                           onListingComplete: (() -> Void)?, onListingStart: ((Data, String) -> Void)?,
+                           onListingEnd: (() -> Void)?) throws -> Bool {
         guard !cancellation.isCancelled else { asyncWriterCursor = nil; cancelAsyncDiscovery(); throw CancellationError() }
         if hasActiveAsyncDiscovery {
             if maxBatches != nil { cancelAsyncDiscovery() }

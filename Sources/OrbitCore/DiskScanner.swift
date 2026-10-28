@@ -41,8 +41,20 @@ public struct DiskScanner: Sendable {
                      preview: DiskScanPreview? = nil,
                      excluding: [URL] = [],
                      progress: @escaping @Sendable (ScanProgress) -> Void = { _ in }) throws -> ScanResult {
+        try CloudStoragePolicy.withoutMaterialization {
+            try scanLocal(url, cancellation: cancellation, preview: preview, excluding: excluding, progress: progress)
+        }
+    }
+
+    private func scanLocal(_ url: URL, cancellation: ScanCancellation, preview: DiskScanPreview?,
+                           excluding: [URL], progress: @escaping @Sendable (ScanProgress) -> Void) throws -> ScanResult {
         guard url.isFileURL else { throw ScanError.notDirectory(url.absoluteString) }
         let rootURL = url.standardizedFileURL
+        let cloudRoots = CloudStoragePolicy.scanExclusions()
+        if let reason = CloudStoragePolicy.exclusionReason(for: rootURL, excluding: cloudRoots) {
+            throw ScanError.excluded(reason)
+        }
+        let excluding = excluding + cloudRoots
         let state = ScanState(cancellation: cancellation, progress: progress, useBulk: useBulkEnumeration, preview: preview)
         state.excludedDirectories = Set(excluding.compactMap { url in
             var info = stat()
@@ -273,6 +285,8 @@ private final class ScanState {
                             for (index, entry) in entries.prefix(512).enumerated() {
                                 if index & 127 == 0 { try self.checkCancellation() }
                                 let childURL = url.appendingPathComponent(entry.name, isDirectory: entry.isDirectory)
+                                if entry.isDirectory && (self.excludedPaths.contains(Data(childURL.path.utf8)) ||
+                                    self.excludedDirectories.contains(FileIdentity(device: entry.device, inode: entry.inode))) { continue }
                                 nodes.append(self.previewNode(childURL, metadata: entry, scanState: .pending))
                             }
                             preview.appendListing(url.path, children: nodes)

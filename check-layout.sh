@@ -14,6 +14,8 @@ app_sources=(${app_sources:#*/ContentView.swift})
 app_sources=(${app_sources:#*/FileRowView.swift})
 app_sources=(${app_sources:#*/OrbitDiskApp.swift})
 app_sources=(${app_sources:#*/AppUpdater.swift})
+app_sources=(${app_sources:#*/AutomationController.swift})
+app_sources=(${app_sources:#*/AutomationIntegration.swift})
 swiftc -assert-config Debug -parse-as-library -O -swift-version 5 -target "$target" -D ORBIT_TESTING -package-name OrbitDisk \
   -module-cache-path "$PWD/.build/module-cache" \
   -I "$build_path" -I Sources/CSQLite -L "$build_path" -lOrbitCore \

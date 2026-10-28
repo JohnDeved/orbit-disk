@@ -88,11 +88,13 @@ public final class ScanCancellation: @unchecked Sendable {
 }
 
 public enum ScanError: LocalizedError {
+    case excluded(String)
     case notDirectory(String)
     case filesystem(String, Int32)
 
     public var errorDescription: String? {
         switch self {
+        case .excluded(let reason): return reason
         case .notDirectory(let path):
             return "Choose a folder or disk to scan. \(path) is not a folder."
         case .filesystem(let path, let code):

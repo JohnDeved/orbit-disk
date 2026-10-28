@@ -73,7 +73,12 @@ let policyChecks: [(String, (TrashPolicyTests) throws -> Void)] = [
     ("Trash root and sibling protection", { try $0.testOrdinaryDescendantIsAllowedButRootAndSiblingAreProtected() }),
     ("Trash symlink escape protection", { try $0.testSymlinkAndAncestorEscapeAreRejected() }),
     ("Trash hidden directory protection", { try $0.testHiddenDirectoriesTrashAndLibraryAreProtected() }),
-    ("Trash system and missing path protection", { $0.testSystemPathsVolumesAndMissingItemsAreRejected() })
+    ("Trash system and missing path protection", { $0.testSystemPathsVolumesAndMissingItemsAreRejected() }),
+    ("Cloud roots, containing folders and resolved aliases", { try $0.testCloudRootsAndResolvedAliasesAreProtected() }),
+    ("Cloud scan exclusions snapshot known folder metadata", { try $0.testCloudRootSnapshotUsesOnlyKnownFolderMetadata() }),
+    ("Cloud metadata, ancestors and dataless errors", { try $0.testCloudMetadataAndDatalessErrorsAreDistinguished() }),
+    ("Cloud batch validation reuses ancestors and rechecks items", { try $0.testCloudBatchValidatorReusesAncestorsButRefreshesEachItem() }),
+    ("Cloud materialization guard restores thread policy", { try $0.testCloudMaterializationPolicyRestoresAfterFailure() })
 ]
 for (name, check) in policyChecks { run(name, make: TrashPolicyTests.init, check: check) }
 let indexChecks: [(String, (DiskIndexStoreTests) throws -> Void)] = [

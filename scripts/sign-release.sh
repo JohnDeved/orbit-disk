@@ -48,7 +48,7 @@ for target in \
   "$framework/Versions/Current/XPCServices/Installer.xpc" \
   "$framework/Versions/Current/Autoupdate" \
   "$framework/Versions/Current/Updater.app" \
-  "$framework" "$app_path"; do
+  "$framework" "$app_path/Contents/MacOS/OrbitControl" "$app_path"; do
   codesign --force --sign "$APPLE_SIGNING_IDENTITY" --keychain "$keychain" \
     --options runtime --timestamp --preserve-metadata=identifier,entitlements "$target"
 done

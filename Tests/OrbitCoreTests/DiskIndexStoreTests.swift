@@ -124,7 +124,7 @@ final class DiskIndexStoreTests: CheckCase {
             guard sqlite3_step(statement) == SQLITE_ROW else { throw CheckFailure("Missing inventory invariant result") }
             return sqlite3_column_int64(statement, 0)
         }
-        checkEqual(try scalar(snapshot.databaseURL, "PRAGMA user_version"), 4)
+        checkEqual(try scalar(snapshot.databaseURL, "PRAGMA user_version"), 5)
         checkEqual(try scalar(snapshot.databaseURL, "SELECT COUNT(*) FROM nodes"), 4)
         checkEqual(try scalar(snapshot.databaseURL, "SELECT COUNT(*) FROM directory_paths"), 2)
         checkEqual(try scalar(snapshot.databaseURL, "SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name IN ('path','st_parent','st_name','st_size','st_allocated','directory','charged','file_identity')"), 0)
@@ -299,7 +299,9 @@ final class DiskIndexStoreTests: CheckCase {
         checkNil(store.savedSnapshot(for: root), "Older caches without directory identities must be rebuilt")
         try mutate(next.databaseURL, sql: "PRAGMA user_version=3")
         checkNil(store.savedSnapshot(for: root), "Full-path inventories must be rebuilt")
-        try mutate(next.databaseURL, sql: "PRAGMA user_version=4; UPDATE metadata SET root_path='/wrong'")
+        try mutate(next.databaseURL, sql: "PRAGMA user_version=4")
+        checkNil(store.savedSnapshot(for: root), "Inventories that included cloud storage must be rebuilt")
+        try mutate(next.databaseURL, sql: "PRAGMA user_version=5; UPDATE metadata SET root_path='/wrong'")
         checkNil(store.savedSnapshot(for: root))
         try Data("damaged".utf8).write(to: next.databaseURL)
         checkNil(store.savedSnapshot(for: root))

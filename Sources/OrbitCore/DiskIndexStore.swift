@@ -93,6 +93,7 @@ public struct DiskIndexStore: Sendable {
     }
 
     public func savedSnapshot(for root: URL, waitForLocks: Bool = true) -> IndexSnapshot? {
+        guard !CloudStoragePolicy.isKnownCloudPath(root.standardizedFileURL.path) else { return nil }
         let rootPath = Self.path(root)
         let file = databaseURL(for: root)
         var presence = stat()

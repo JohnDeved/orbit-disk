@@ -9,11 +9,15 @@ case "$1" in
   core)
     swift package resolve
     python3 Tests/test_update_copy.py
+    swift build -c release --product OrbitControl
+    python3 Tests/test_mcp.py "$(swift build -c release --show-bin-path)/OrbitControl"
     swift run -c release OrbitCoreChecks
     ./check-updater.sh
     ;;
   native)
     ./check-app.sh --native-only
+    ./check-automation.sh
+    ./scripts/check-automation-transport.sh
     ;;
   search)
     ./check-prepared-search.sh
@@ -26,6 +30,7 @@ case "$1" in
     ./check-session.sh
     ;;
   mapping)
+    ./check-cloud-scanning.sh
     ./check-discovery-cache.sh
     ./check-async-mapping.sh
     ./check-resumable.sh
