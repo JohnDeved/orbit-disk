@@ -98,6 +98,21 @@ public final class DiskScanPreview: @unchecked Sendable {
         return try! view(path: path, removals: [], checkCancellation: nil)
     }
 
+    public func discoveredFileCount(removals: [ScanRemoval] = [], cancellation: ScanCancellation) throws -> Int? {
+        try Task.checkCancellation()
+        if cancellation.isCancelled { throw CancellationError() }
+        if let staged = currentStage() {
+            return try staged.discoveredFileCount(removals: removals, cancellation: cancellation)
+        }
+        lock.lock()
+        let root = rootID.flatMap { entries[$0]?.node() }
+        let sources = removals.compactMap { entries[$0.path]?.node() }
+        lock.unlock()
+        guard let root else { return nil }
+        let projection = try DiskRemovalProjection(removals: removals, source: sources, cancellation: cancellation)
+        return try projection.apply(root, cancellation: cancellation)?.fileCount
+    }
+
     public func view(path: String? = nil, cancellation: ScanCancellation) throws -> ScanPreviewView? {
         if let staged = currentStage() { return try staged.view(path: path, removals: [], cancellation: cancellation) }
         return try view(path: path, removals: []) {

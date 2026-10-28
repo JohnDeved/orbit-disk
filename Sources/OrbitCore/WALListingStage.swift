@@ -11,6 +11,7 @@ struct AsyncInventoryCommit {
 final class ListingStage {
     private var db: OpaquePointer?
     private var indexRoot: Data?
+    private var traversalScope: VolumeTraversalScope?
     private var queueIndexesReady = false
     #if ORBIT_TESTING
     static var testQueueMigrationProgress: (@Sendable () -> Void)?
@@ -186,6 +187,7 @@ final class ListingStage {
     }
 
     func initializeMirrorRoot(url: URL, identity: DirectoryIdentity) throws {
+        traversalScope = VolumeTraversalScope(rootURL: url, rootIdentity: identity)
         try exec("BEGIN IMMEDIATE")
         do {
             if try directoryID(path: Data(url.path.utf8)) == nil {
@@ -371,6 +373,25 @@ final class ListingStage {
         } catch { try? exec("ROLLBACK"); throw error }
     }
 
+    func upgradeBootTraversal(from previous: StageCheckpoint, to current: StageCheckpoint) throws {
+        guard current.upgradesBootTraversal(from: previous) else { throw Failure.sqlite("invalid boot traversal upgrade") }
+        try exec("BEGIN IMMEDIATE")
+        do {
+            let root = Data(current.rootPath.utf8)
+            guard let saved = try scanStart(root: root), saved.identity == previous.identity,
+                  saved.eventID == previous.eventID else { throw Failure.sqlite("boot traversal checkpoint changed") }
+            try markFullRefresh()
+            let update = try prepare("UPDATE scan SET identity=?,event_id=? WHERE root=?")
+            defer { sqlite3_finalize(update) }
+            bind(Data(current.identity.utf8), 1, update)
+            sqlite3_bind_int64(update, 2, Int64(bitPattern: current.eventID)); bind(root, 3, update); try step(update)
+            let metadata = try prepare("UPDATE metadata SET event_identity=?,event_id=? WHERE singleton=1")
+            defer { sqlite3_finalize(metadata) }
+            bindText(current.identity, 1, metadata); bindText(String(current.eventID), 2, metadata); try step(metadata)
+            try exec("DELETE FROM sealed; COMMIT")
+        } catch { try? exec("ROLLBACK"); throw error }
+    }
+
     func preserveScanStart(root: Data, identity: String, eventID: UInt64, expected: SnapshotExpectation? = nil, generation: String? = nil) throws {
         try exec("BEGIN IMMEDIATE")
         do {
@@ -524,6 +545,10 @@ final class ListingStage {
 
     private func appendBatch(parent: Data, epoch: Int64?, records: [FileMetadata], rootDevice: Int32?,
                              completion: FreshListingCompletion?, asyncCommit: AsyncInventoryCommit?) throws -> Int64? {
+        func canTraverse(_ record: FileMetadata, path: Data, rootDevice: Int32) -> Bool {
+            traversalScope?.allows(path: path, device: record.device, isMountPoint: record.isMountPoint)
+                ?? (!record.isMountPoint && record.device == rootDevice)
+        }
         if let rootDevice {
             var prefix = parent
             if prefix.last != 47 { prefix.append(47) }
@@ -544,7 +569,7 @@ final class ListingStage {
                 let status = sqlite3_step(query)
                 if status == SQLITE_ROW {
                     let device = Int32(sqlite3_column_int64(query, 0)), inode = UInt64(bitPattern: sqlite3_column_int64(query, 1))
-                    if !record.isDirectory || record.isMountPoint || record.device != rootDevice || device != record.device || inode != record.inode {
+                    if !record.isDirectory || !canTraverse(record, path: child, rootDevice: rootDevice) || device != record.device || inode != record.inode {
                         try startPrune(path: child, parent: parent, name: Data(record.name.utf8))
                         throw Reconcile.pruneRequired
                     }
@@ -581,7 +606,7 @@ final class ListingStage {
                 INSERT INTO nodes(id,parent,name,search_name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,
                     dev,inode,is_mount,links,epoch)
                 VALUES(?15,?1,CAST(?2 AS TEXT),CAST(?14 AS TEXT),?5,?6,
-                    CASE WHEN ?5=1 AND (?7=1 OR ?3<>(SELECT device FROM directories WHERE path=(SELECT root FROM scan LIMIT 1))) THEN 0 ELSE 1 END,
+                    COALESCE(?16,CASE WHEN ?5=1 AND (?7=1 OR ?3<>(SELECT device FROM directories WHERE path=(SELECT root FROM scan LIMIT 1))) THEN 0 ELSE 1 END),
                     CASE WHEN ?5=1 THEN COALESCE((SELECT logical FROM directories WHERE path=?12),0) ELSE ?8 END,
                     CASE WHEN ?5=1 THEN COALESCE((SELECT allocated FROM directories WHERE path=?12),0) ELSE ?13 END,
                     CASE WHEN ?5=1 THEN COALESCE((SELECT files FROM directories WHERE path=?12),0) ELSE 1 END,
@@ -671,12 +696,16 @@ final class ListingStage {
                 sqlite3_bind_int(insert, 5, record.isDirectory ? 1 : 0)
                 sqlite3_bind_int(insert, 6, record.isSymbolicLink ? 1 : 0)
                 sqlite3_bind_int(insert, 7, record.isMountPoint ? 1 : 0)
+                let traversable: Bool? = record.isDirectory
+                    ? (traversalScope.map { $0.allows(path: fullPath, device: record.device, isMountPoint: record.isMountPoint) }
+                        ?? rootDevice.map { !record.isMountPoint && record.device == $0 }) : true
+                if let traversable { sqlite3_bind_int(insert, 16, !record.isDirectory || traversable ? 1 : 0) }
                 sqlite3_bind_int64(insert, 8, record.size); sqlite3_bind_int64(insert, 9, record.allocatedSize)
                 sqlite3_bind_int64(insert, 10, Int64(record.linkCount)); sqlite3_bind_int64(insert, 11, batchEpoch)
                 if mayHaveIssues {
                     sqlite3_reset(clearIssue); sqlite3_clear_bindings(clearIssue); bind(fullPath, 1, clearIssue); try step(clearIssue)
                 }
-                if let rootDevice, record.isDirectory && (record.isMountPoint || record.device != rootDevice) {
+                if rootDevice != nil, record.isDirectory && traversable == false {
                     mayHaveIssues = true
                     sqlite3_reset(mountIssue); sqlite3_clear_bindings(mountIssue); bind(fullPath, 1, mountIssue)
                     bindText("\(String(decoding: fullPath, as: UTF8.self)): nested volume skipped", 2, mountIssue); try step(mountIssue)
@@ -694,7 +723,7 @@ final class ListingStage {
                     sqlite3_reset(directoryPathRemove); sqlite3_clear_bindings(directoryPathRemove)
                     sqlite3_bind_int64(directoryPathRemove, 1, nodeID); try step(directoryPathRemove!)
                 }
-                if let rootDevice, record.isDirectory, !record.isMountPoint, record.device == rootDevice {
+                if rootDevice != nil, record.isDirectory, traversable == true {
                     if registerInsert == nil { registerInsert = try prepare("INSERT OR IGNORE INTO directories(path,device,inode,pending) VALUES(?,?,?,1)") }
                     if registerCheck == nil { registerCheck = try prepare("SELECT device,inode FROM directories WHERE path=?") }
                     try registerDirectory(path: fullPath, device: record.device, inode: record.inode,

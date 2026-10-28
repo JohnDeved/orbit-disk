@@ -221,6 +221,7 @@ func checkCancellation() async throws {
         try checkCollectionMembership()
         try await checkCancellation()
         try checkCompactNames()
-        print("7 portable core check groups passed")
+        try checkMappingProgress()
+        print("8 portable core check groups passed")
     }
 }

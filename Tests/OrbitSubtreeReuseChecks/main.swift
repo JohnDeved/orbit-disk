@@ -1,5 +1,6 @@
 @testable import OrbitCore
 import Darwin
+import CoreServices
 import Foundation
 
 private struct Failure: Error { let message: String }
@@ -40,6 +41,42 @@ private final class Once: @unchecked Sendable {
     func take() -> Bool { lock.lock(); defer { lock.unlock() }; if taken { return false }; taken = true; return true }
 }
 private struct PauseReuse: Error {}
+
+private func checkBootTraversalUpgrade(_ cache: URL, current: StageCheckpoint) throws {
+    var legacyObject = try JSONSerialization.jsonObject(with: Data(current.identity.utf8)) as! [String: Any]
+    try require(legacyObject.removeValue(forKey: "bootTraversal") as? Int == 2, "root checkpoint lacks traversal scope")
+    let legacyIdentity = String(decoding: try JSONSerialization.data(withJSONObject: legacyObject, options: [.sortedKeys]), as: UTF8.self)
+    let legacy = StageCheckpoint(rootPath: "/", identity: legacyIdentity, eventID: current.eventID)
+    try require(current.upgradesBootTraversal(from: legacy), "legacy root scope was not recognized")
+    try require(!current.upgradesBootTraversal(from: current), "current root scope re-upgraded")
+    legacyObject["rootFileID"] = 0
+    let replaced = StageCheckpoint(rootPath: "/", identity: String(decoding: try JSONSerialization.data(withJSONObject: legacyObject), as: UTF8.self), eventID: current.eventID)
+    try require(!current.upgradesBootTraversal(from: replaced), "replacement root was treated as a scope upgrade")
+
+    let root = URL(fileURLWithPath: "/"), recordName = "orbit-boot-upgrade-fixture-\(UUID().uuidString)"
+    var info = stat(); try require(lstat("/", &info) == 0, "missing boot root")
+    do {
+        let previous = try ResumableStage(cache: cache, root: root, current: legacy)
+        let record = FileMetadata(name: recordName, device: info.st_dev, inode: 123, isDirectory: false,
+            isSymbolicLink: false, isMountPoint: false, linkCount: 1, size: 19, allocatedSize: 512)
+        try require(try previous.crawler.store.completeFreshListing(parent: Data("/".utf8), records: [record],
+            rootDevice: info.st_dev, expectedRevision: 0, expectedFullGeneration: 0), "could not seed legacy root listing")
+    }
+    for _ in 0..<2 {
+        let resumed = try ResumableStage(cache: cache, root: root, current: current)
+        let state = try resumed.crawler.store.fullRefreshState()
+        try require(resumed.hasPriorCheckpoint && resumed.checkpoint == current && state.pending && state.generation == 1,
+                    "root stage did not atomically adopt one full-refresh generation")
+        try require(try resumed.testUnprojectedNode(path: "/" + recordName)?.size == 19,
+                    "scope upgrade discarded existing preview rows")
+        let reader = try DiscoveryCacheReader(path: resumed.crawler.store.databasePath,
+            rootIdentity: DirectoryIdentity(device: info.st_dev, inode: info.st_ino), cancellation: ScanCancellation())
+        let listing = try reader.listing(ListingStage.QueuedDirectory(path: Data("/".utf8), device: info.st_dev, inode: info.st_ino))
+        try require(listing != nil && listing?.records == nil && listing?.generation == 1,
+                    "old complete root listing escaped immediate reconciliation")
+    }
+    print("PASS: legacy root scope upgrades once, retains preview rows and immediately rejects stale discovery listings")
+}
 
 private func checkNameFoldFallback(_ base: URL) throws {
     let files = FileManager.default, rawName = "が-file"
@@ -174,6 +211,41 @@ private func checkNameFoldFallback(_ base: URL) throws {
         try require(try pageReader.page(limit: 128).count == 1, "short final source page size")
         try require(try pageReader.page(limit: 128).isEmpty && pageReader.page(limit: 128).isEmpty,
                     "source reader restarted after SQLITE_DONE")
+        var pagedRootInfo = stat(); _ = lstat(pagedRoot.path, &pagedRootInfo)
+        for validation in [StageReuseCandidate.HistoryValidation.sharedStream, .verifiedThroughParentCheckpoint] {
+            let parentCheckpoint = StageCheckpoint(rootPath: pagedRoot.path, identity: "events", eventID: 20)
+            let discovery = DiscoveryReuse(provider: { _, _ in
+                StageReuseCandidate(snapshot: pagedSaved, checkpoint: parentCheckpoint, historyValidation: validation)
+            }, cache: pagedCache, root: pagedRoot,
+                identity: DirectoryIdentity(device: pagedRootInfo.st_dev, inode: pagedRootInfo.st_ino),
+                checkpoint: parentCheckpoint, cancellation: ScanCancellation())
+            let listing = try discovery.listing(ListingStage.QueuedDirectory(path: Data(pagedChild.path.utf8),
+                device: pagedInfo.st_dev, inode: pagedInfo.st_ino))
+            try require((listing != nil) == (validation == .verifiedThroughParentCheckpoint),
+                        "source cursor floor was relaxed without explicit history verification")
+        }
+        let lookupEntered = DispatchSemaphore(value: 0), lookupRelease = DispatchSemaphore(value: 0)
+        let otherLookup = DispatchSemaphore(value: 0), lookupFinished = DispatchSemaphore(value: 0)
+        let sharedDiscovery = DiscoveryReuse(provider: { directory, _ in
+            if directory == pagedChild { lookupEntered.signal(); lookupRelease.wait() }
+            else { otherLookup.signal() }
+            return nil
+        }, cache: pagedCache, root: pagedRoot,
+            identity: DirectoryIdentity(device: pagedRootInfo.st_dev, inode: pagedRootInfo.st_ino),
+            checkpoint: StageCheckpoint(rootPath: pagedRoot.path, identity: "events", eventID: 20), cancellation: ScanCancellation())
+        let otherDiscovery = sharedDiscovery.clone(cancellation: ScanCancellation())
+        DispatchQueue.global().async {
+            _ = try? sharedDiscovery.listing(ListingStage.QueuedDirectory(path: Data(pagedChild.path.utf8), device: pagedInfo.st_dev, inode: pagedInfo.st_ino))
+            lookupFinished.signal()
+        }
+        try require(lookupEntered.wait(timeout: .now() + 2) == .success, "validation fixture did not start")
+        DispatchQueue.global().async {
+            _ = try? otherDiscovery.listing(ListingStage.QueuedDirectory(path: Data((pagedRoot.path + "/other").utf8), device: pagedInfo.st_dev, inode: pagedInfo.st_ino))
+        }
+        let independent = otherLookup.wait(timeout: .now() + 2) == .success
+        lookupRelease.signal()
+        try require(lookupFinished.wait(timeout: .now() + 2) == .success && independent,
+                    "one history validator blocked another discovery worker")
         print("PASS: short final source pages reach stable exhaustion exactly once")
 
         let child = try directory("resume/root/child"), root = child.deletingLastPathComponent()
@@ -340,7 +412,75 @@ private func checkNameFoldFallback(_ base: URL) throws {
         let wrong = try DiskChangeMonitor.reuseCandidate(actualSaved, for: StageCheckpoint(rootPath: actualRoot.path, identity: "wrong", eventID: parentEvent.eventID))
         try require(wrong == nil, "changed parent history identity was accepted")
         let host = try DiskChangeMonitor.capture(root: URL(fileURLWithPath: "/"))
-        try require(try DiskChangeMonitor.reuseCandidate(actualSaved, for: StageCheckpoint(rootPath: "/", identity: host.identity, eventID: host.eventID)) == nil, "mixed device and host event sequences accepted")
-        print("PASS: real FSEvents identity compatibility and host/device rejection")
+        let hostCheckpoint = StageCheckpoint(rootPath: "/", identity: host.identity, eventID: host.eventID)
+        try require(!sourceEvent.identity.contains("bootTraversal"), "child checkpoint identity was unnecessarily changed")
+        try checkBootTraversalUpgrade(base.appendingPathComponent("boot-upgrade"), current: hostCheckpoint)
+        DiskChangeMonitor.testReuseHistoryValidator = { _, _ in false }
+        try require(try DiskChangeMonitor.reuseCandidate(actualSaved, for: hostCheckpoint) == nil,
+                    "unverified mixed-stream source was accepted")
+        var validatedSource: (String, UInt64)?
+        DiskChangeMonitor.testReuseHistoryValidator = { url, cursor in validatedSource = (url.path, cursor); return true }
+        defer { DiskChangeMonitor.testReuseHistoryValidator = nil }
+        let hostCandidate = try DiskChangeMonitor.reuseCandidate(actualSaved, for: hostCheckpoint)
+        try require(try DiskChangeMonitor.reuseCandidate(actualSaved,
+            for: StageCheckpoint(rootPath: "/", identity: host.identity, eventID: UInt64.max)) == nil,
+            "future parent host checkpoint was accepted")
+        if sourceEvent.identity.contains("\"eventsUUID\""), try MappingCoverage.canReach(root: URL(fileURLWithPath: "/"), target: actualChild,
+            expectedRootIdentity: identity(URL(fileURLWithPath: "/"))) {
+            try require(hostCandidate?.checkpoint == hostCheckpoint
+                && hostCandidate?.historyValidation == .verifiedThroughParentCheckpoint
+                && validatedSource?.0 == actualChild.path && validatedSource?.1 == actualSaved.eventID,
+                "verified child did not retain the parent host checkpoint")
+        } else {
+            try require(hostCandidate == nil, "unreachable or unjournaled source bypassed history validation")
+        }
+        DiskChangeMonitor.testReuseHistoryValidator = nil
+        try require(try !DiskChangeMonitor.testReuseHistory(root: actualChild, since: sourceEvent.eventID, timeout: 0),
+                    "exhausted validation budget permitted reuse")
+        let history = FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone)
+        try require(DiskChangeMonitor.testReuseHistoryDecision(flags: [history], flushed: true), "quiet flushed history was rejected")
+        try require(!DiskChangeMonitor.testReuseHistoryDecision(flags: [], flushed: true)
+            && !DiskChangeMonitor.testReuseHistoryDecision(flags: [history], flushed: false)
+            && !DiskChangeMonitor.testReuseHistoryDecision(flags: [history], flushed: true, expired: true),
+            "incomplete, unflushed or expired history was accepted")
+        for change in [0, kFSEventStreamEventFlagMustScanSubDirs, kFSEventStreamEventFlagUserDropped,
+            kFSEventStreamEventFlagKernelDropped, kFSEventStreamEventFlagEventIdsWrapped,
+            kFSEventStreamEventFlagRootChanged, kFSEventStreamEventFlagMount, kFSEventStreamEventFlagUnmount] {
+            try require(!DiskChangeMonitor.testReuseHistoryDecision(flags: [FSEventStreamEventFlags(change), history], flushed: true),
+                        "changed or incomplete source history was accepted")
+        }
+        try require(!DiskChangeMonitor.testReuseHistoryDecision(flags: [history | FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged)], flushed: true),
+                    "combined history flags hid invalidation")
+        if candidate != nil {
+            // Newly created fixtures remain in the conservative timestamp cursor's replay window.
+            let quietRoot = URL(fileURLWithPath: files.currentDirectoryPath).appendingPathComponent("Sources/CSQLite")
+            var quiet = false
+            for _ in 0..<40 {
+                let checkpoint = try DiskChangeMonitor.capture(root: quietRoot)
+                if try DiskChangeMonitor.testReuseHistory(root: quietRoot, since: checkpoint.eventID) {
+                    quiet = true; break
+                }
+                usleep(250_000)
+            }
+            try require(quiet, "native verifier never accepted a quiet, flushed source")
+            try write(actualChild.appendingPathComponent("file"), 41)
+            var changed = false
+            for _ in 0..<40 {
+                if try !DiskChangeMonitor.testReuseHistory(root: actualChild, since: sourceEvent.eventID) { changed = true; break }
+                usleep(250_000)
+            }
+            try require(changed, "native verifier missed a journaled source change after its saved cursor")
+        }
+        if hostCandidate != nil {
+            let physicalAlias = "/System/Volumes/Data" + actualChild.path + "/deleted"
+            try require(try DiskChangeMonitor.testBatchDirectories(root: URL(fileURLWithPath: "/"), event: physicalAlias).contains(actualChild.path),
+                        "physical Data alias update did not reach its native map location")
+            let physicalOnly = "/System/Volumes/Data/OrbitMissingFixture/deleted"
+            let normalized = try DiskChangeMonitor.testNormalize(root: URL(fileURLWithPath: "/"), event: physicalOnly)
+            try require(normalized == physicalOnly && (try DiskChangeMonitor.testBatchDirectories(root: URL(fileURLWithPath: "/"), event: physicalOnly))
+                .contains(URL(fileURLWithPath: physicalOnly).deletingLastPathComponent().path),
+                "tracked physical Data update was discarded as a nested mount")
+        }
+        print("PASS: real FSEvents identities; cross-stream reuse needs verified source history and preserves host cursor")
     }
 }

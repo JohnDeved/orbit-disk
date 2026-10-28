@@ -39,16 +39,16 @@ Sparkle signatures authenticate the app archive and update feed. They do not rep
 
 Use Swift 6.3 or later command-line tools or Xcode, Python 3, and macOS. CI uses Swift 6.3.3 from Xcode 26.6. Publishing locally also needs an authenticated GitHub CLI with release access.
 
-`check-portable-core.sh` also runs on Linux. It compiles the production value types, removal projection, path ordering, collection membership and compact filename matcher without the macOS scanner. The session suite builds an optimized app-model test module once and shares it across its test programs. Its largest test harness uses `-Onone` to reduce compilation time; the app code and the timing-sensitive volume checks remain optimized.
+`scripts/checks/check-portable-core.sh` also runs on Linux. It compiles the production value types, removal projection, path ordering, collection membership and compact filename matcher without the macOS scanner. The session suite builds an optimized app-model test module once and shares it across its test programs. Its largest test harness uses `-Onone` to reduce compilation time; the app code and the timing-sensitive volume checks remain optimized.
 
 ```sh
 ./build-app.sh --universal
-./check-portable-core.sh
+./scripts/checks/check-portable-core.sh
 swift run -c release OrbitCoreChecks
-./check-app.sh
-./check-updater.sh
-./check-rendering.sh
-./check-layout.sh
+./scripts/checks/check-app.sh
+./scripts/checks/check-updater.sh
+./scripts/checks/check-rendering.sh
+./scripts/checks/check-layout.sh
 python3 scripts/test-release.py
 python3 Tests/test_update_copy.py
 python3 scripts/validate-release.py v0.9.1 --check-tags

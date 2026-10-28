@@ -22,15 +22,20 @@ public struct MappingCoverage: Sendable {
         var root = requested
         while true {
             try check(cancellation)
-            guard let info = directoryInfo(root), info.device == target.device, info.mount == target.mount else { return nil }
+            guard let info = directoryInfo(root) else { return nil }
+            let scope = VolumeTraversalScope(rootURL: root,
+                rootIdentity: DirectoryIdentity(device: info.device, inode: info.inode))
+            let eligible = scope.allowsIdentity(path: Data(requested.path.utf8),
+                identity: DirectoryIdentity(device: target.device, inode: target.inode))
+                && scope.allowsMount(path: Data(requested.path.utf8), mount: target.mount)
             var source: Source?
-            if let saved = store.savedSnapshot(for: root), saved.rootURL.path.utf8.elementsEqual(root.path.utf8),
+            if eligible, let saved = store.savedSnapshot(for: root), saved.rootURL.path.utf8.elementsEqual(root.path.utf8),
                let rootNode = try? store.node(path: root.path, snapshot: saved, cancellation: cancellation),
                rootNode.isDirectory, rootNode.fileIdentity == info.identity,
                let node = try? store.node(path: requested.path, snapshot: saved, cancellation: cancellation),
                node.isDirectory, node.id.utf8.elementsEqual(requested.path.utf8), node.fileIdentity == target.identity {
                 source = .saved
-            } else if try stagedCandidate(root: root, info: info, requested: requested, target: target,
+            } else if eligible, try stagedCandidate(root: root, info: info, requested: requested, target: target,
                                           staging: staging, locks: store.lockDirectory, cancellation: cancellation) {
                 source = .stage
             }
@@ -59,7 +64,10 @@ public struct MappingCoverage: Sendable {
         guard descriptor >= 0 else { return false }
         defer { close(descriptor) }
         guard let rootInfo = directoryInfo(descriptor), rootInfo.identity == expectedRootIdentity else { return false }
+        let scope = VolumeTraversalScope(rootURL: root,
+            rootIdentity: DirectoryIdentity(device: rootInfo.device, inode: rootInfo.inode))
         var current = descriptor
+        var currentPath = Data(rootBytes)
         defer { if current != descriptor { close(current) } }
         if targetBytes != rootBytes {
             for component in targetBytes.dropFirst(offset).split(separator: 47) {
@@ -69,7 +77,10 @@ public struct MappingCoverage: Sendable {
                 guard child >= 0 else { return false }
                 if current != descriptor { close(current) }
                 current = child
-                guard let info = directoryInfo(child), info.device == rootInfo.device, info.mount == rootInfo.mount else { return false }
+                currentPath = HardLinkPathOrder.path(currentPath, Data(component))
+                guard let info = directoryInfo(child),
+                      scope.allowsIdentity(path: currentPath, identity: DirectoryIdentity(device: info.device, inode: info.inode)),
+                      scope.allowsMount(path: currentPath, mount: info.mount) else { return false }
             }
         }
         try check(cancellation)

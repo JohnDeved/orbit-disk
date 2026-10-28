@@ -9,6 +9,8 @@
         let session = MappingSession(url: root.url, identity: root.fileIdentity,
                                      token: ScanCancellation(), preview: nil)
         session.finished = true
+        session.discoveredFileCount = root.fileCount
+        session.cachedFileCount = root.fileCount
         sessions = [root.id: session]
         activeSessionID = session.id
         showCollection = false
@@ -30,5 +32,6 @@
         session.collectionState = collectionState
         precondition(displayedCollection.map(\.id) == collected.map(\.id),
                      "Marketing fixture must display the requested collection")
+        refreshMappingProgress()
     }
 }

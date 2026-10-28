@@ -20,6 +20,8 @@ struct DirectoryComponent {
 final class SecureRoot {
     private let descriptor: Int32
     let identity: DirectoryIdentity
+    let scope: VolumeTraversalScope
+    let path: Data
 
     init(url: URL) throws {
         let fd = url.withUnsafeFileSystemRepresentation { path in
@@ -34,6 +36,9 @@ final class SecureRoot {
         }
         descriptor = fd
         identity = DirectoryIdentity(device: info.st_dev, inode: info.st_ino)
+        let rootURL = url.standardizedFileURL
+        path = Data(rootURL.path.utf8)
+        scope = VolumeTraversalScope(rootURL: rootURL, rootIdentity: identity)
     }
 
     deinit { close(descriptor) }
@@ -52,6 +57,7 @@ final class SecureRoot {
         var current = openat(descriptor, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         guard current >= 0 else { throw SecureTraversalError.filesystem(errno) }
         do {
+            var path = self.path
             for component in components {
                 guard !component.name.isEmpty, component.name != ".", component.name != "..",
                       !component.name.contains("/"), !component.name.utf8.contains(0) else {
@@ -63,10 +69,11 @@ final class SecureRoot {
                 guard next >= 0 else { throw SecureTraversalError.filesystem(errno) }
                 close(current)
                 current = next
+                path = HardLinkPathOrder.path(path, Data(component.name.utf8))
                 var info = stat()
                 guard fstat(current, &info) == 0 else { throw SecureTraversalError.filesystem(errno) }
-                guard info.st_dev == identity.device,
-                      DirectoryIdentity(device: info.st_dev, inode: info.st_ino) == component.expected else {
+                let actual = DirectoryIdentity(device: info.st_dev, inode: info.st_ino)
+                guard actual == component.expected, scope.allowsIdentity(path: path, identity: actual) else {
                     throw SecureTraversalError.identityChanged
                 }
             }
@@ -140,15 +147,18 @@ final class SecureDirectoryCursor {
             }
             discard(after: prefix)
             var parent = rootDescriptor
+            var path = root.path
             for offset in 0..<prefix {
                 let component = components[offset]
+                path = HardLinkPathOrder.path(path, Data(component.name.utf8))
                 var info = stat()
                 let status = component.name.withCString { fstatat(parent, $0, &info, AT_SYMLINK_NOFOLLOW) }
                 guard status == 0 else { throw SecureTraversalError.filesystem(errno) }
-                try validate(info, expected: component.expected)
+                try validate(info, path: path, expected: component.expected)
                 parent = cached[offset].descriptor
             }
             for component in components.dropFirst(prefix) {
+                path = HardLinkPathOrder.path(path, Data(component.name.utf8))
                 let next = component.name.withCString {
                     openat(parent, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                 }
@@ -156,7 +166,7 @@ final class SecureDirectoryCursor {
                 do {
                     var info = stat()
                     guard fstat(next, &info) == 0 else { throw SecureTraversalError.filesystem(errno) }
-                    try validate(info, expected: component.expected)
+                    try validate(info, path: path, expected: component.expected)
                 } catch {
                     Darwin.close(next)
                     throw error
@@ -174,9 +184,10 @@ final class SecureDirectoryCursor {
         }
     }
 
-    private func validate(_ info: stat, expected: DirectoryIdentity) throws {
-        guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR), info.st_dev == root.identity.device,
-              DirectoryIdentity(device: info.st_dev, inode: info.st_ino) == expected else {
+    private func validate(_ info: stat, path: Data, expected: DirectoryIdentity) throws {
+        let actual = DirectoryIdentity(device: info.st_dev, inode: info.st_ino)
+        guard info.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR), actual == expected,
+              root.scope.allowsIdentity(path: path, identity: actual) else {
             throw SecureTraversalError.identityChanged
         }
     }

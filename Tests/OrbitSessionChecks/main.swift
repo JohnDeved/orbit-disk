@@ -27,6 +27,15 @@ final class NthGate: @unchecked Sendable {
     func pause(){lock.lock();count+=1;let block=count == nth;if block{_waiting=true};lock.unlock();if block{gate.wait();lock.lock();_waiting=false;lock.unlock()}}
     func release(){gate.signal()}
 }
+final class ProgressStageProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var stage: ResumableStage?
+    func attach(_ value: ResumableStage) { lock.lock(); stage = value; lock.unlock() }
+    var discoveryFinished: Bool {
+        lock.lock(); let current = stage; lock.unlock()
+        return current?.testDiscoveryStatus?.finished == true
+    }
+}
 @main struct Test {
     @MainActor static func checkMapMembership(_ model: DiskModel) {
         guard let ids = model.mapChildIDs else {
@@ -39,12 +48,263 @@ final class NthGate: @unchecked Sendable {
             precondition(id.utf8.elementsEqual(child.id.utf8), "IDs refer to a different folder revision")
         }
     }
+    @MainActor static func checkProgress(_ model: DiskModel, root: URL, files: Int, complete: Bool = false) {
+        guard let progress = model.mappingProgress else { preconditionFailure("Missing progress for \(root.path)") }
+        precondition(progress.rootName == root.lastPathComponent, "Expected progress for \(root.lastPathComponent), got \(progress.rootName)")
+        precondition(progress.discoveredFiles == files, "Expected \(files) reachable files, got \(progress.discoveredFiles) for \(root.lastPathComponent)")
+        if complete {
+            precondition(progress.discoveryFraction == 1 && progress.cacheFraction == 1 && progress.cachedFiles == files,
+                         "Completed map has incomplete progress: \(progress)")
+            precondition(!progress.isDiscovering && !progress.isPaused)
+        }
+    }
+    @MainActor static func checkSavedProgress(_ model: DiskModel, root: URL, files: Int) async throws {
+        try await wait("saved progress for \(root.lastPathComponent)") { model.mappingProgress?.phase == .saved }
+        checkProgress(model, root: root, files: files, complete: true)
+        precondition(model.mappingProgress?.savedShare == 1)
+    }
+    static func checkKnownFileShares() {
+        var value = MappingProgressPresentation(rootName: "root", discoveredFiles: 10, cachedFiles: 10,
+            discoveryFraction: nil, discoveryState: "Estimating…", discoveryDetail: "",
+            cacheFraction: 1, cacheState: "Saving changes", cacheDetail: "", isDiscovering: true, isPaused: false)
+        precondition(value.savedShare == 1 && value.phase == .finding,
+                     "Saving every known file must not imply discovery or publication finished")
+        value.cachedFiles = 4
+        precondition(value.savedShare == 0.4)
+        value.cachedFiles = 11
+        precondition(value.savedShare == nil, "Counts from incompatible snapshots must not show false 100%")
+        value.discoveredFiles = 0; value.cachedFiles = 0
+        precondition(value.savedShare == nil, "Zero found files cannot claim completion while discovery runs")
+        value.phase = .saved; value.isDiscovering = false
+        precondition(value.savedShare == 1, "An actually published empty map is fully saved")
+        value.cachedFiles = nil
+        precondition(value.savedShare == nil, "An unknown saved count cannot be treated as zero")
+        value.cachedFiles = 1
+        precondition(value.savedShare == nil, "An ahead cached count cannot complete an empty map")
+    }
+
     @MainActor static func wait(_ name:String,_ f:()->Bool) async throws {
         for _ in 0..<500 {if f(){return};try await Task.sleep(nanoseconds:20_000_000)}
         throw NSError(domain:name,code:1)
     }
+    @MainActor static func checkBootTraversalPreview(_ base: URL) async throws {
+        let legacy = #"{"rootPath":"/","mode":"host"}"#
+        let v1 = #"{"rootPath":"/","mode":"host","bootTraversal":1}"#
+        let current = #"{"rootPath":"/","mode":"host","bootTraversal":2}"#
+        precondition(DiskModel.needsBootTraversalPreview(rootPath: "/", eventIdentity: legacy))
+        precondition(DiskModel.needsBootTraversalPreview(rootPath: "/", eventIdentity: v1))
+        for value in [current, #"{"rootPath":"/","mode":"host","bootTraversal":3}"#,
+                      #"{"rootPath":"/","mode":"device"}"#, #"{"rootPath":"/Users","mode":"host"}"#, "{}", "invalid"] {
+            precondition(!DiskModel.needsBootTraversalPreview(rootPath: "/", eventIdentity: value))
+        }
+        precondition(!DiskModel.needsBootTraversalPreview(rootPath: base.path, eventIdentity: legacy))
+
+        let rootURL = URL(fileURLWithPath: "/", isDirectory: true)
+        var info = stat()
+        precondition(lstat("/", &info) == 0)
+        let root = DiskNode(url: rootURL, name: "Macintosh HD", isDirectory: true,
+                            size: 0, allocatedSize: 0, fileCount: 0, fileIdentity: "\(info.st_dev):\(info.st_ino)")
+        for (name, eventIdentity, showsPreview, hasStage) in [
+            ("legacy", legacy, true, false), ("v1", v1, true, false), ("current", current, false, false),
+            ("legacy-stage", legacy, true, true)
+        ] {
+            let store = DiskIndexStore(directory: base.appendingPathComponent(name))
+            let saved = try store.save(ScanResult(root: root, elapsed: 0, skippedCount: 0, issues: []),
+                                       eventID: 0, eventIdentity: eventIdentity)
+            if hasStage {
+                let stage = try ResumableStage(cache: store.directory, root: rootURL,
+                    current: StageCheckpoint(rootPath: "/", identity: eventIdentity, eventID: 0))
+                withExtendedLifetime(stage) {}
+            }
+            let suite = "boot-preview-\(UUID())", preferences = UserDefaults(suiteName: suite)!
+            defer { preferences.removePersistentDomain(forName: suite) }
+            let model = DiskModel(cacheDirectory: store.directory, preferences: preferences)
+            model.testMonitorUnavailable = true
+            let beforeScan = ResolutionGate()
+            // Always stop before stage creation: the fixture must never enumerate the real boot volume.
+            model.testBeforeScannerStart = { beforeScan.pause() }
+            defer { model.cancelScan(); beforeScan.release() }
+            model.scan(rootURL)
+            if !hasStage {
+                try await wait("\(name) boot fixture opens saved map") {
+                    model.root?.id == "/" && !model.isScanning && !model.isRefreshing && !model.isOpeningFolder
+                }
+                precondition(!beforeScan.waiting)
+                model.scan(rootURL, force: true)
+            }
+            try await wait("\(name) boot rescan reaches held scanner") { beforeScan.waiting }
+            precondition(model.testPreviewRetained("/") == showsPreview && model.isPartialMap == showsPreview,
+                         "Legacy boot upgrades must expose live discovery; current maps retain their saved view")
+            precondition(model.isScanning == showsPreview && model.isRefreshing != showsPreview)
+            precondition(store.savedSnapshot(for: rootURL)?.id == saved.id,
+                         "Selecting a live preview must preserve the existing saved cache")
+            model.cancelScan(); beforeScan.release()
+        }
+        print("PASS: legacy boot upgrades expose live previews before enumeration; current maps keep their view and saved caches survive")
+    }
+    @MainActor static func checkOffscreenProgress(_ base: URL) async throws {
+        let fm = FileManager.default
+        let root = base.appendingPathComponent("original"), child = root.appendingPathComponent("child")
+        let other = base.appendingPathComponent("other"), cache = base.appendingPathComponent("index")
+        try fm.createDirectory(at: child, withIntermediateDirectories: true)
+        try fm.createDirectory(at: other, withIntermediateDirectories: true)
+        try Data([1]).write(to: root.appendingPathComponent("existing"))
+        try Data([2]).write(to: other.appendingPathComponent("other-file"))
+        let suite = "offscreen-progress-\(UUID())", prefs = UserDefaults(suiteName: suite)!
+        defer { prefs.removePersistentDomain(forName: suite) }
+        let model = DiskModel(cacheDirectory: cache, preferences: prefs)
+        model.scan(root)
+        try await wait("offscreen baseline") {model.root?.id == root.path && !model.isScanning && !model.isOpeningFolder}
+        let directoryGate = ResolutionGate(), writerGate = ResolutionGate(), probe = ProgressStageProbe()
+        ResumableStage.testBeforeDiscoveryDirectory = { path, _ in
+            if path == Data(child.path.utf8) { directoryGate.pause() }
+        }
+        defer { ResumableStage.testBeforeDiscoveryDirectory = nil; directoryGate.release(); writerGate.release(); model.cancelScan() }
+        model.testConfigureStage = { stage in if stage.checkpoint.rootPath == root.path { probe.attach(stage) } }
+        model.testAfterStageAttach = { writerGate.pause() }
+        model.rescan()
+        try await wait("offscreen discovery held") {directoryGate.waiting && writerGate.waiting && model.isRefreshing && model.mappingProgress?.discoveredFiles == 1}
+        ResumableStage.testBeforeDiscoveryDirectory = nil
+        try Data([3]).write(to: child.appendingPathComponent("arrived-after-start"))
+        model.scan(other)
+        try await wait("other active during hidden discovery") {model.root?.id == other.path && !model.isScanning && !model.isOpeningFolder}
+        try await checkSavedProgress(model, root: other, files: 1)
+        directoryGate.release()
+        try await wait("offscreen memory finished before writer") {probe.discoveryFinished}
+        precondition(writerGate.waiting)
+        try await checkSavedProgress(model, root: other, files: 1)
+        model.scan(root)
+        try await wait("return reads final memory without a new discovery event") {
+            model.root?.id == root.path && model.isRefreshing && !model.isOpeningFolder && model.mappingProgress?.discoveredFiles == 2
+        }
+        precondition(probe.discoveryFinished && writerGate.waiting && model.root?.fileCount == 1,
+                     "Returning must count finished memory while retaining the old displayed map")
+        writerGate.release()
+        try await wait("offscreen force map saved") {!model.isRefreshing && !model.isOpeningFolder && model.root?.fileCount == 2}
+        try await checkSavedProgress(model, root: root, files: 2)
+        print("PASS: reattached progress reads completed offscreen memory without waiting for another discovery event")
+    }
+
+    @MainActor static func checkDiscoveryCompletionDuringCacheBacklog(_ base: URL) async throws {
+        let fm = FileManager.default
+        let root = base.appendingPathComponent("root"), child = root.appendingPathComponent("child")
+        let first = root.appendingPathComponent("first"), nested = child.appendingPathComponent("nested")
+        try fm.createDirectory(at: child, withIntermediateDirectories: true)
+        try Data([1]).write(to: first)
+        try Data([2]).write(to: nested)
+        let suite = "writer-backlog-progress-\(UUID())", prefs = UserDefaults(suiteName: suite)!
+        defer { prefs.removePersistentDomain(forName: suite) }
+        let model = DiskModel(cacheDirectory: base.appendingPathComponent("index"),
+                              stagingDirectory: base.appendingPathComponent("staging"), preferences: prefs)
+        let directoryGate = ResolutionGate(), writerGate = ResolutionGate(), probe = ProgressStageProbe()
+        ResumableStage.testBeforeDiscoveryDirectory = { path, _ in
+            if path == Data(child.path.utf8) { directoryGate.pause() }
+        }
+        defer {
+            ResumableStage.testBeforeDiscoveryDirectory = nil
+            directoryGate.release(); writerGate.release(); model.cancelScan()
+        }
+        model.testMonitorUnavailable = true
+        model.testConfigureStage = { stage in probe.attach(stage) }
+        model.testAfterStageStep = { stage in
+            // The root file must reach SQLite before the writer is held; holding at attach misses ingestion state changes.
+            guard (try? stage.testUnprojectedNode(path: first.path)) != nil else { return }
+            writerGate.pause()
+        }
+        model.scan(root)
+        try await wait("writer held after committed root batch") {
+            directoryGate.waiting && writerGate.waiting && model.mappingProgress?.discoveredFiles == 1
+        }
+        precondition(!probe.discoveryFinished && model.mappingProgress?.phase == .finding,
+                     "A durable root batch must still report finding while child discovery is held")
+        directoryGate.release()
+        try await wait("memory completes independently of writer backlog") {
+            probe.discoveryFinished && model.mappingProgress?.discoveredFiles == 2
+                && model.mappingProgress?.discoveryFraction == 1 && model.mappingProgress?.isDiscovering == false
+        }
+        let progress = model.mappingProgress!
+        precondition(writerGate.waiting && model.isScanning && model.isPartialMap,
+                     "The completion signal must arrive before the writer resumes or publishes")
+        precondition(model.root?.fileCount == 2 && progress.rootName == root.lastPathComponent,
+                     "Completed memory must keep the root's exact reachable-file count")
+        precondition(progress.phase == .saving && progress.savedShare != nil && progress.savedShare! < 1,
+                     "Completed discovery with a held cache writer must show saving")
+        precondition(progress.cacheFraction != nil && progress.cacheFraction! < 1
+                     && progress.cachedFiles != nil && progress.cachedFiles! < progress.discoveredFiles,
+                     "Cache progress must still expose the held writer's backlog: \(progress)")
+        writerGate.release()
+        try await wait("writer backlog published") {
+            !model.isScanning && !model.isOpeningFolder && model.root?.fileCount == 2 && model.mappingProgress?.phase == .saved
+        }
+        try await checkSavedProgress(model, root: root, files: 2)
+        precondition(model.mappingProgress?.savedShare == 1)
+        print("PASS: memory completion remains visible after real ingestion while the cache writer is held")
+    }
+
+    @MainActor static func checkProgressLeaseTeardown(_ base: URL) async throws {
+        enum ExpectedFailure: Error { case listing }
+        let fm = FileManager.default
+        for fail in [false, true] {
+            let folder = base.appendingPathComponent(fail ? "failed" : "cancelled")
+            let root = folder.appendingPathComponent("root"), cache = folder.appendingPathComponent("index")
+            let staging = folder.appendingPathComponent("staging")
+            try fm.createDirectory(at: root, withIntermediateDirectories: true)
+            for index in 0..<(fail ? 520 : 2) { try Data().write(to: root.appendingPathComponent("file-\(index)")) }
+            let suite = "progress-teardown-\(UUID())", prefs = UserDefaults(suiteName: suite)!
+            defer { prefs.removePersistentDomain(forName: suite) }
+            var model: DiskModel? = DiskModel(cacheDirectory: cache, stagingDirectory: staging, preferences: prefs)
+            weak let releasedModel = model
+            let gate = ResolutionGate()
+            if fail {
+                model!.testScanner = DiskScanner(testBatch: { throw ExpectedFailure.listing }, testFallback: { throw ExpectedFailure.listing })
+            } else { model!.testAfterStageAttach = { gate.pause() } }
+            model!.scan(root)
+            if fail {
+                try await wait("progress failure published") {model?.errorMessage != nil && model?.isScanning == false}
+            } else {
+                try await wait("progress teardown stage attached") {gate.waiting}
+                model!.cancelScan()
+                gate.release()
+            }
+            model = nil
+            try await wait("progress model released") {releasedModel == nil}
+            let resumed = try await Task.detached { () throws -> Bool in
+                let checkpoint = try DiskChangeMonitor.capture(root: root)
+                let stage = try ResumableStage(cache: cache, stagingDirectory: staging, root: root,
+                    current: StageCheckpoint(rootPath: checkpoint.rootPath, identity: checkpoint.identity, eventID: checkpoint.eventID))
+                return stage.hasPriorCheckpoint
+            }.value
+            precondition(resumed, "Progress observation must release the stopped stage lease for reopening")
+        }
+        print("PASS: cancelled and failed mapping progress releases its model and durable stage lease")
+    }
+
     @MainActor static func main() async throws {
+        try await checkBootTraversalPreview(URL(fileURLWithPath: CommandLine.arguments[1]).appendingPathComponent("boot-preview"))
+        if CommandLine.arguments.dropFirst(2).contains("--boot-preview-only") { return }
+        checkKnownFileShares()
+        precondition(MappingProgressPresentation.estimatedDiscoveryState(0.00001) == "<1% estimated",
+                     "An advancing estimate below one percent must not appear stuck at zero")
+        precondition(MappingProgressPresentation.estimatedDiscoveryState(0) == "0% estimated")
+        precondition(MappingProgressPresentation.estimatedDiscoveryState(0.52) == "52% estimated")
+        precondition(MappingProgressPresentation.estimatedDiscoveryState(1) == "99% estimated",
+                     "An estimate cannot claim confirmed completion")
+        precondition(MappingProgressPresentation.estimatedDiscoveryState(.nan) == "Estimating…")
+        let newer = ScanProgress(itemCount: 20, bytesScanned: 200, currentPath: "newer",
+                                 mapping: MappingProgress(revision: 2, cachedFileCount: 12, cacheFraction: 0.6))
+        let older = ScanProgress(itemCount: 10, bytesScanned: 100, currentPath: "older",
+                                 mapping: MappingProgress(revision: 1, cachedFileCount: 4, cacheFraction: 0.4))
+        let coalesced = DiskModel.testCoalescedProgress([newer, older])
+        precondition(coalesced?.mapping == newer.mapping && coalesced?.itemCount == 20 && coalesced?.currentPath == "newer",
+                     "Late progress delivery must not replace a newer stage revision")
+        let retainedProgress = ScanProgress(itemCount: 20, bytesScanned: 200, currentPath: "retained")
+        let resumedProgress = ScanProgress(itemCount: 3, bytesScanned: 30, currentPath: "resumed", mapping: MappingProgress(revision: 0))
+        precondition(DiskModel.testCoalescedProgress([retainedProgress, resumedProgress])?.mapping?.revision == 0,
+                     "A resumed stage must accept its own revision sequence after retaining legacy counters")
         let dir=URL(fileURLWithPath:CommandLine.arguments[1],isDirectory:true)
+        try await checkOffscreenProgress(dir.appendingPathComponent("offscreen-progress"))
+        try await checkDiscoveryCompletionDuringCacheBacklog(dir.appendingPathComponent("writer-backlog-progress"))
+        try await checkProgressLeaseTeardown(dir.appendingPathComponent("progress-teardown"))
         let fm=FileManager.default, a=dir.appendingPathComponent("a"), b=dir.appendingPathComponent("b"), sub=a.appendingPathComponent("Downloads")
         try fm.createDirectory(at:sub,withIntermediateDirectories:true);try fm.createDirectory(at:b,withIntermediateDirectories:true)
         try Data([1]).write(to:sub.appendingPathComponent("inside"));try Data([2]).write(to:a.appendingPathComponent("first"));try Data([3, 3, 3]).write(to:b.appendingPathComponent("other"))
@@ -54,13 +314,18 @@ final class NthGate: @unchecked Sendable {
         checkMapMembership(model)
         model.scan(a); try await wait("preview a") {gate.waiting && model.current?.children.count == 2}
         checkMapMembership(model)
+        checkProgress(model, root: a, files: model.root!.fileCount)
+        let initialDiscovered = model.mappingProgress!.discoveredFiles
         precondition(model.collect([model.current!.children.first {$0.name == "first"}!]))
         try await wait("accepted collection") { !model.isValidatingCollection }
         model.scan(sub);try await wait("navigate partial") {model.current?.id == sub.path}
         checkMapMembership(model)
+        checkProgress(model, root: a, files: model.root!.fileCount)
+        precondition(model.mappingProgress!.discoveredFiles >= initialDiscovered, "Navigation must retain root-wide discovery")
         precondition(store.savedSnapshot(for:sub) == nil)
         model.scan(b);try await wait("scan b") {!model.isScanning && model.root?.id == b.path}
         checkMapMembership(model)
+        try await checkSavedProgress(model, root: b, files: 1)
         model.query = "other"; checkMapMembership(model)
         model.sortByName = true; checkMapMembership(model)
         model.query = ""; model.sortByName = false; checkMapMembership(model)
@@ -70,6 +335,8 @@ final class NthGate: @unchecked Sendable {
         model.scan(a);try await wait("reattach a") {model.root?.id == a.path && model.current?.id == sub.path}
         checkMapMembership(model)
         precondition(gate.waiting && model.isScanning && store.savedSnapshot(for:a) == nil)
+        checkProgress(model, root: a, files: model.root!.fileCount)
+        precondition(model.mappingProgress!.discoveredFiles >= initialDiscovered, "Reattachment must retain discovery progress")
         precondition(model.collection.count == 1 && model.collection[0].name == "first" && model.collectionSize == 1)
         model.scan(b);try await wait("reattach b") {!model.isScanning && model.root?.id == b.path}
         checkMapMembership(model)
@@ -77,19 +344,34 @@ final class NthGate: @unchecked Sendable {
         gate.release(); try await wait("detached a saves") {store.savedSnapshot(for:a) != nil}
         precondition(model.root?.id == b.path)
         try await wait("detached preview released") { !model.testPreviewRetained(a.path) }
+        try await checkSavedProgress(model, root: b, files: 1)
         let saved=store.savedSnapshot(for:a)!
         let checkpoint = try DiskChangeMonitor.capture(root:a)
         precondition(saved.eventIdentity == checkpoint.identity)
         model.scan(a); try await wait("saved a") {!model.isScanning && model.root?.id == a.path}
         precondition(store.savedSnapshot(for:a)?.id == saved.id)
+        try await checkSavedProgress(model, root: a, files: 2)
+        let discoveryStart = ResolutionGate()
+        model.testBeforeScannerStart = { discoveryStart.pause() }
         gate.arm(); model.rescan()
+        try await wait("force discovery not started") {discoveryStart.waiting && model.isRefreshing}
+        precondition(model.root?.fileCount == 2 && model.mappingProgress?.discoveredFiles == 0,
+                     "A retained old map is not newly discovered inventory")
+        try Data().write(to: a.appendingPathComponent("force-discovery-added"))
+        model.testBeforeScannerStart = {}; discoveryStart.release()
         try await wait("refresh a gated") {gate.waiting && model.isRefreshing}
+        try await wait("hidden force discovery count") {model.mappingProgress?.discoveredFiles == 3}
+        precondition(model.root?.fileCount == 2, "Hidden discovery must not replace the retained map before publication")
+        checkProgress(model, root: a, files: 3)
         model.scan(b); try await wait("switch during refresh") {model.root?.id == b.path && !model.isScanning}
         model.scan(a); try await wait("restore refreshing map") {model.root?.id == a.path && model.isRefreshing && !model.isOpeningFolder}
         precondition(model.current?.id == sub.path)
+        checkProgress(model, root: a, files: 3)
         gate.release(); try await wait("refreshed") {!model.isRefreshing && !model.isOpeningFolder}
+        try await checkSavedProgress(model, root: a, files: 3)
         try Data([9,9,9,9]).write(to:a.appendingPathComponent("after-refresh"))
         try await wait("incremental refresh") {model.root?.size == 6 && !model.isRefreshing && !model.isOpeningFolder}
+        try await checkSavedProgress(model, root: a, files: 4)
         let updated = store.savedSnapshot(for:a)!
         model.scan(b); try await wait("leave updated map") {model.root?.id == b.path && !model.isScanning}
         model.scan(a); try await wait("restore updated snapshot") {model.root?.id == a.path && !model.isScanning && !model.isOpeningFolder}
@@ -97,10 +379,26 @@ final class NthGate: @unchecked Sendable {
         let refreshGate=ResolutionGate();model.testBeforeRefreshSave={refreshGate.pause()}
         try Data([3]).write(to:a.appendingPathComponent("gated-refresh"))
         try await wait("incremental refresh gated") {refreshGate.waiting && model.isRefreshing}
+        precondition(model.mappingProgress?.discoveryState == "Checking changes" && model.mappingProgress?.cacheFraction == nil
+                     && model.mappingProgress?.discoveryFraction == 1 && model.mappingProgress?.isDiscovering == false,
+                     "Incremental refresh must retain completed memory without claiming a new discovery estimate")
+        precondition(model.mappingProgress?.phase == .updating && model.mappingProgress?.cachedFiles == nil
+                     && model.mappingProgress?.savedShare == nil, "Refresh must withhold an incompatible saved count")
+        model.updatesPaused = true
+        precondition(model.mappingProgress?.phase == .paused && model.mappingProgress?.isPaused == false,
+                     "A finished map with paused updates needs Refresh, not unfinished-stage Resume")
+        model.updatesPaused = false
+        precondition(model.mappingProgress?.phase == .updating)
         model.scan(b);try await wait("leave during incremental refresh") {model.root?.id == b.path && !model.isScanning}
         model.scan(a);try await wait("reattach while refreshing") {model.root?.id == a.path && model.isRefreshing && refreshGate.waiting}
         precondition(model.root?.size == 6)
-        refreshGate.release();try await wait("reattach after refresh") {model.root?.id == a.path && model.root?.size == 7 && !model.isScanning}
+        precondition(model.mappingProgress?.rootName == a.lastPathComponent && model.mappingProgress?.discoveryState == "Checking changes"
+                     && model.mappingProgress?.discoveryFraction == 1 && model.mappingProgress?.isDiscovering == false,
+                     "Returning during incremental refresh must retain the completed memory bar")
+        precondition(model.mappingProgress?.phase == .updating && model.mappingProgress?.cachedFiles == nil)
+        refreshGate.release();try await wait("reattach after refresh") {model.root?.id == a.path && model.root?.size == 7 && !model.isScanning && !model.isRefreshing && !model.isOpeningFolder}
+        try await checkSavedProgress(model, root: a, files: 5)
+        print("PASS: session-owned memory/cache progress, detached completion, retained-map discovery and incremental refresh")
         model.cancelScan()
         let cleared=DiskModel(cacheDirectory:dir.appendingPathComponent("clear-index"),preferences:prefs)
         cleared.scan(b); try await wait("clear fixture") {!cleared.isScanning && cleared.current?.id == b.path}
@@ -124,10 +422,22 @@ final class NthGate: @unchecked Sendable {
         let stop=dir.appendingPathComponent("stop")
         try fm.createDirectory(at:stop,withIntermediateDirectories:true);try Data([1]).write(to:stop.appendingPathComponent("x"))
         let sg=RootGate(stop.path), m3=DiskModel(cacheDirectory:dir.appendingPathComponent("stop-index"),preferences:prefs,scanProgressObserver:{sg.observe($0)})
-        m3.scan(stop); try await wait("stop gated") {sg.waiting && m3.isPartialMap}
+        m3.scan(stop); try await wait("stop gated") {sg.waiting && m3.isPartialMap && m3.root?.fileCount == 1}
+        checkProgress(m3, root: stop, files: 1)
         m3.cancelScan(); precondition(!m3.isScanning && m3.isPartialMap);sg.release()
+        checkProgress(m3, root: stop, files: 1)
+        precondition(m3.mappingProgress?.isPaused == true, "Stopped mapping must preserve its count and offer Resume")
         try await Task.sleep(nanoseconds:200_000_000)
         precondition(DiskIndexStore(directory:dir.appendingPathComponent("stop-index")).savedSnapshot(for:stop) == nil)
+        let resumeStart = ResolutionGate(); m3.testBeforeScannerStart = { resumeStart.pause() }
+        m3.resumeMapping()
+        try await wait("resume keeps count before scanner") {resumeStart.waiting && m3.isScanning}
+        checkProgress(m3, root: stop, files: 1)
+        m3.testBeforeScannerStart = {}; resumeStart.release()
+        try await wait("resumed progress complete") {!m3.isScanning && !m3.isOpeningFolder && m3.root?.fileCount == 1}
+        try await checkSavedProgress(m3, root: stop, files: 1)
+        m3.cancelScan()
+        print("PASS: stopped mapping retains counts and Resume continues its saved stage")
         let d=dir.appendingPathComponent("d"), inner=d.appendingPathComponent("one/two")
         try fm.createDirectory(at:inner,withIntermediateDirectories:true);try Data([7]).write(to:inner.appendingPathComponent("leaf"))
         let dg=RootGate(d.path), m4=DiskModel(cacheDirectory:dir.appendingPathComponent("nested-index"),preferences:prefs,scanProgressObserver:{dg.observe($0)})
@@ -172,15 +482,22 @@ final class NthGate: @unchecked Sendable {
         try await wait("accepted collection") { !m7.isValidatingCollection }
         m7.testBeforeRemoval = {deletionGate.pause()};m7.deleteCollectionPermanently()
         try await wait("removal gated") {deletionGate.waiting && m7.isRemoving}
+        precondition(m7.mappingProgress?.phase == .updating && m7.mappingProgress?.cachedFiles == nil
+                     && m7.mappingProgress?.savedShare == nil, "A held deletion must not display the old cache as fully saved")
         m7.scan(b);try await wait("switch during removal") {m7.root?.id == b.path && !m7.isScanning && !m7.isRemoving}
         precondition(m7.collection.isEmpty && m7.isRemovingAcrossSessions)
         m7.scan(rem);try await wait("reattach ongoing removal") {m7.root?.id == rem.path && m7.isRemoving && m7.statusMessage?.contains("Deleting collected items") == true}
+        precondition(m7.mappingProgress?.phase == .updating && m7.mappingProgress?.cachedFiles == nil,
+                     "Returning to a held deletion must preserve its updating phase")
         m7.scan(b);try await wait("leave ongoing removal again") {m7.root?.id == b.path && !m7.isRemoving}
         deletionGate.release();try await wait("detached removal") {!fm.fileExists(atPath:victim.path)}
         try await Task.sleep(nanoseconds:100_000_000)
         precondition(m7.root?.id == b.path && m7.collection.isEmpty)
         m7.scan(rem);try await wait("removed map refresh") {m7.root?.id == rem.path && !m7.isScanning && !m7.isRemoving && !m7.isRefreshing && m7.root?.fileCount == 0}
         precondition(m7.collection.isEmpty && m7.collectionSize == 0 && !m7.isRemovingAcrossSessions && m7.statusMessage?.contains("Deleted 1 item") == true)
+        try await wait("empty map saved after deletion") {m7.mappingProgress?.phase == .saved}
+        precondition(m7.mappingProgress?.discoveredFiles == 0 && m7.mappingProgress?.cachedFiles == 0
+                     && m7.mappingProgress?.savedShare == 1)
         m7.cancelScan()
         let multipleA=dir.appendingPathComponent("multiple-a"), multipleB=dir.appendingPathComponent("multiple-b")
         try fm.createDirectory(at:multipleA,withIntermediateDirectories:true);try fm.createDirectory(at:multipleB,withIntermediateDirectories:true)

@@ -38,6 +38,15 @@ public final class ResumableStage: @unchecked Sendable {
     private var lastProgressTime: TimeInterval = 0
     private var lastDiscoveryProgressTime: TimeInterval = 0
     private var progressItems = 0
+    private let mappingLock = NSLock()
+    private var mappingRevision: UInt64 = 0
+    private var mappingEstimator = DiscoveryEstimator()
+    private var cachedFileCount: Int?
+    private var reportedItems = 0
+    private var reportedBytes: Int64 = 0
+    private var mappingNeedsChecking = false
+    private var mappingFinished = false
+    private var mappingPublished = false
     private let searchPreparationLock = NSLock()
     private var searchPreparationTask: Task<Void, Never>?
     private var searchPreparationCancellation: ScanCancellation?
@@ -49,6 +58,10 @@ public final class ResumableStage: @unchecked Sendable {
     private var reuseSources: [StageReuseSource] = []
     private var consideredAsyncDiscovery = false
     #if ORBIT_TESTING
+    package static var testBeforeDiscoveryDirectory: ((Data, Int64) -> Void)? {
+        get { AsyncListingProducer.testBeforeDirectory }
+        set { AsyncListingProducer.testBeforeDirectory = newValue }
+    }
     package var testDisableAsyncDiscovery = false
     package var testDiscoveryStatus: (finished: Bool, finishedAt: TimeInterval?, pendingBytes: Int, peakPendingBytes: Int, deferredDirectories: Int)? {
         guard let inventory = crawler.asyncInventory else { return nil }
@@ -130,7 +143,7 @@ public final class ResumableStage: @unchecked Sendable {
                 throw Failure.alreadyPublished(completed.id)
             }
         }
-        let checkpoint: StageCheckpoint
+        var checkpoint: StageCheckpoint
         if let previous {
             checkpoint = StageCheckpoint(rootPath: root.path, identity: previous.identity, eventID: previous.eventID)
         } else {
@@ -144,6 +157,11 @@ public final class ResumableStage: @unchecked Sendable {
             originalExpectation = .absent
         }
         guard originalExpectation == expectedSnapshot else { throw SnapshotExpectation.Failure.changed }
+        if current.upgradesBootTraversal(from: checkpoint) {
+            let store = try ListingStage(path: lease.databasePath, mirror: true)
+            try store.upgradeBootTraversal(from: checkpoint, to: current)
+            checkpoint = current
+        }
         let crawler = try DurableCrawler(rootURL: root, database: lease.databasePath, checkpoint: checkpoint, cancellation: cancellation, mirror: true, expectedSnapshot: originalExpectation, generation: generation,
                                          excluding: [cache, lockDirectory, stagingDirectory,
                                                      stagingDirectory.appendingPathComponent(".orbit-stages"),
@@ -238,7 +256,9 @@ public final class ResumableStage: @unchecked Sendable {
                   Data(candidate.snapshot.rootURL.path.utf8) == directory.path,
                   Data(candidate.checkpoint.rootPath.utf8) == crawler.rootPath,
                   candidate.checkpoint.identity == current.identity,
-                  candidate.checkpoint.eventID <= min(current.eventID, candidate.snapshot.eventID) else { return nil }
+                  candidate.checkpoint.eventID <= current.eventID,
+                  candidate.historyValidation == .verifiedThroughParentCheckpoint
+                    || candidate.checkpoint.eventID <= candidate.snapshot.eventID else { return nil }
             let source = try StageReuseSource(candidate, cache: previewStore.directory, parentRoot: crawler.rootURL,
                 parentIdentity: "\(crawler.root.identity.device):\(crawler.root.identity.inode)", cancellation: crawler.cancellation)
             guard let listing = try source.listing(directory, allowSmall: true) else { return nil }
@@ -336,6 +356,21 @@ public final class ResumableStage: @unchecked Sendable {
         return result
     }
 
+    public func discoveredFileCount(removals: [ScanRemoval] = [], cancellation: ScanCancellation) throws -> Int? {
+        let state = removalReplay.viewState()
+        guard !state.blocked else { return nil }
+        let count: Int?
+        if crawler.asyncInventory != nil {
+            count = try crawler.liveInventory.fileCount(removals: removals + state.overlay, cancellation: cancellation)
+        } else {
+            count = try previewStore.stagedFileCount(snapshot: previewSnapshot, removals: removals + state.overlay,
+                                                    cancellation: cancellation)
+        }
+        let after = removalReplay.viewState()
+        guard !after.blocked, after.generation == state.generation else { throw CancellationError() }
+        return count
+    }
+
     public func confirmsMissingDirectory(_ path: String) -> Bool {
         let state = removalReplay.viewState()
         guard !state.blocked else { return false }
@@ -371,6 +406,48 @@ public final class ResumableStage: @unchecked Sendable {
         return result
     }
 
+    // Configure before discovery starts; partial saved stages are not a complete-map baseline.
+    public func configureProgress(previousFileCount: Int?) {
+        mappingLock.lock(); defer { mappingLock.unlock() }
+        mappingEstimator = DiscoveryEstimator(previousFileCount: previousFileCount)
+    }
+
+    private func progressSnapshot(path: String) -> ScanProgress {
+        mappingLock.lock(); defer { mappingLock.unlock() }
+        var work = crawler.asyncInventory?.progressSnapshot ?? DiscoveryProgress(uncertain: true)
+        work.cancelled = work.cancelled || crawler.cancellation.isCancelled
+        if mappingNeedsChecking { work.uncertain = true }
+        let complete = !work.cancelled && (mappingFinished || (work.finished && !work.uncertain))
+        let estimate = mappingEstimator.estimate(work, complete: complete, now: ProcessInfo.processInfo.systemUptime)
+        mappingRevision &+= 1
+        let cacheFraction = work.cancelled ? nil : mappingFinished ? 1 : work.cacheFraction
+        let mapping = MappingProgress(revision: mappingRevision, cachedFileCount: cachedFileCount,
+            discoveryFraction: estimate.fraction, discoveryComplete: complete, estimateBasis: estimate.basis,
+            cacheFraction: cacheFraction, cacheFinishing: !work.cancelled && mappingFinished && !mappingPublished)
+        return ScanProgress(itemCount: max(reportedItems, work.records), bytesScanned: max(reportedBytes, work.logicalSize),
+                            currentPath: path, mapping: mapping)
+    }
+
+    private func reportWriterProgress(_ progress: (ScanProgress) -> Void, path: String, force: Bool = false) throws {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard force || lastProgressTime == 0 || now - lastProgressTime >= 0.1 else { return }
+        lastProgressTime = now
+        let totals = try crawler.store.folderTotals(path: crawler.rootPath)
+        mappingLock.lock()
+        cachedFileCount = totals.map { Int($0.count) }
+        reportedItems = max(progressItems, cachedFileCount ?? 0)
+        reportedBytes = totals?.logical ?? 0
+        mappingLock.unlock()
+        progress(progressSnapshot(path: path))
+    }
+
+    private func checkingProgress() -> Bool {
+        mappingLock.lock(); defer { mappingLock.unlock() }
+        let changed = !mappingNeedsChecking || mappingFinished
+        mappingNeedsChecking = true; mappingFinished = false; mappingPublished = false
+        return changed
+    }
+
     public func startDiscovery(progress: @escaping @Sendable (ScanProgress) -> Void) throws {
         if !removalReplayPrepared { try prepareRemovalReplay() }
         if !consideredAsyncDiscovery {
@@ -394,11 +471,11 @@ public final class ResumableStage: @unchecked Sendable {
                     if publish { self.lastDiscoveryProgressTime = now }
                     self.revisionLock.unlock()
                     if publish {
-                        progress(ScanProgress(itemCount: inventory.discoveredRecordCount,
-                            bytesScanned: inventory.discoveredLogicalSize, currentPath: self.crawler.rootURL.path))
+                        progress(self.progressSnapshot(path: self.crawler.rootURL.path))
                     }
                 })
             }
+            try reportWriterProgress(progress, path: crawler.rootURL.path, force: true)
         }
     }
 
@@ -427,14 +504,7 @@ public final class ResumableStage: @unchecked Sendable {
                 }
             }
             #endif
-            let now = ProcessInfo.processInfo.systemUptime
-            guard lastProgressTime == 0 || now - lastProgressTime >= 0.1 else { return }
-            lastProgressTime = now
-            let totals = try crawler.store.folderTotals(path: Data(crawler.rootURL.path.utf8))
-            let discovered = crawler.asyncInventory
-            progress(ScanProgress(itemCount: max(progressItems, Int(totals?.count ?? 0), discovered?.discoveredRecordCount ?? 0),
-                                  bytesScanned: max(totals?.logical ?? 0, discovered?.discoveredLogicalSize ?? 0),
-                                  currentPath: String(decoding: path, as: UTF8.self)))
+            try reportWriterProgress(progress, path: String(decoding: path, as: UTF8.self))
             try removalReplay.refreshIfNeeded()
         }, onListingComplete: {
             #if ORBIT_TESTING
@@ -444,19 +514,37 @@ public final class ResumableStage: @unchecked Sendable {
             setActiveDirectory((path, identity))
         }, onListingEnd: { [self] in
             setActiveDirectory(nil)
+        }, onEnumerationStart: { [self] in
+            if checkingProgress() { progress(progressSnapshot(path: crawler.rootURL.path)) }
         })
         try removalReplay.refreshIfNeeded()
+        let replayBeforeSettlement = removalReplay.viewState().generation
         let stable = try removalReplay.settleIfPossible()
         if !advanced && !stable { usleep(50_000) }
-        if (advanced && crawler.asyncInventory == nil) || removalReplay.viewState().generation != replayGeneration { bumpRevision() }
+        let replayAfterSettlement = removalReplay.viewState().generation
+        let replayChanged = replayAfterSettlement != replayGeneration
+        // Successful settlement changes read fencing, not discovery coverage.
+        let replayInvalidated = replayBeforeSettlement != replayGeneration
+            || (!stable && replayAfterSettlement != replayBeforeSettlement)
+        mappingLock.lock()
+        let restarted = advanced && mappingFinished
+        mappingLock.unlock()
+        if restarted { _ = checkingProgress() }
+        if replayInvalidated { _ = checkingProgress() }
+        if (advanced && crawler.asyncInventory == nil) || replayChanged { bumpRevision() }
+        let finished = !advanced && stable
+        if finished {
+            mappingLock.lock(); mappingFinished = true; mappingLock.unlock()
+        }
+        try reportWriterProgress(progress, path: crawler.rootURL.path, force: finished || replayChanged || restarted)
         return advanced || !stable
     }
 
-    public func publish(elapsed: TimeInterval) throws -> IndexSnapshot {
-        try CloudStoragePolicy.withoutMaterialization { try publishLocal(elapsed: elapsed) }
+    public func publish(elapsed: TimeInterval, progress: @escaping @Sendable (ScanProgress) -> Void = { _ in }) throws -> IndexSnapshot {
+        try CloudStoragePolicy.withoutMaterialization { try publishLocal(elapsed: elapsed, progress: progress) }
     }
 
-    private func publishLocal(elapsed: TimeInterval) throws -> IndexSnapshot {
+    private func publishLocal(elapsed: TimeInterval, progress: @escaping @Sendable (ScanProgress) -> Void) throws -> IndexSnapshot {
         cancelSearchPreparation(suspend: true)
         var published = false
         defer {
@@ -471,10 +559,14 @@ public final class ResumableStage: @unchecked Sendable {
                     elapsed: elapsed, expected: expectedSnapshot, expectedGeneration: expectedGeneration,
                     publicationFence: { try self.removalReplay.fencePublication($0) })
                 published = true
+                mappingLock.lock(); mappingFinished = true; mappingPublished = true; mappingLock.unlock()
+                progress(progressSnapshot(path: crawler.rootURL.path))
                 return snapshot
             } catch StageRemovalReplay.Retry.journalChanged {
+                _ = checkingProgress()
+                progress(progressSnapshot(path: crawler.rootURL.path))
                 try prepareRemovalReplay()
-                while try advance(progress: { _ in }) { }
+                while try advance(progress: progress) { }
             }
         }
     }

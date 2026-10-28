@@ -45,6 +45,12 @@ public struct ScanProgress: Sendable {
     public let itemCount: Int
     public let bytesScanned: Int64
     public let currentPath: String
+    public let mapping: MappingProgress?
+
+    public init(itemCount: Int, bytesScanned: Int64, currentPath: String, mapping: MappingProgress? = nil) {
+        self.itemCount = itemCount; self.bytesScanned = bytesScanned; self.currentPath = currentPath
+        self.mapping = mapping
+    }
 }
 
 public struct ScanResult: Sendable {

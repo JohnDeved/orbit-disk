@@ -28,9 +28,17 @@ extension AsyncMappingChecks {
                 completion: complete ? PendingListingCompletion(issueCount: 0, issues: []) : nil, failure: nil))
         }
         func view() throws -> ScanPreviewView {
+            let count = try { () throws -> Int? in
+                let previous = PendingInventoryRead.testBeforeBuild
+                PendingInventoryRead.testBeforeBuild = { throw AsyncCheckFailure(description: "Count-only read built full metadata/hard-link aggregates") }
+                defer { PendingInventoryRead.testBeforeBuild = previous }
+                return try inventory.fileCount(removals: [], cancellation: token)
+            }()
             guard let result = try inventory.view(path: nil, removals: [], cancellation: token) else {
                 throw AsyncCheckFailure(description: "Live cache lost its root")
             }
+            try require(count == result.root.fileCount,
+                        "Count-only inventory disagreed after a listing, identity or reachability change")
             return result
         }
         func matching(_ query: String) throws -> Int {
@@ -44,6 +52,25 @@ extension AsyncMappingChecks {
         append(nestedPath, nestedIdentity, [record("old-nested", size: 50)], complete: true)
         let first = try view()
         try require(first.root.size == 60 && first.folder.children.first?.size == 60, "Live cache fixture totals differ")
+        let folderRemoval = ScanRemoval(path: String(decoding: folderPath, as: UTF8.self), identity: "1:2")
+        let nestedRemoval = ScanRemoval(path: String(decoding: nestedPath, as: UTF8.self), identity: "1:3")
+        let fileRemoval = ScanRemoval(path: String(decoding: folderPath, as: UTF8.self) + "/old-direct", identity: "1:10")
+        let staleRemoval = ScanRemoval(path: folderRemoval.path, identity: "1:4")
+        for removals in [[folderRemoval], [nestedRemoval], [fileRemoval, fileRemoval],
+                         [folderRemoval, nestedRemoval, fileRemoval], [staleRemoval, nestedRemoval]] {
+            let previous = PendingInventoryRead.testBeforeBuild
+            PendingInventoryRead.testBeforeBuild = { throw AsyncCheckFailure(description: "Removal-projected count built metadata/hard-link aggregates") }
+            let count: Int?
+            do { count = try inventory.fileCount(removals: removals, cancellation: token) }
+            catch { PendingInventoryRead.testBeforeBuild = previous; throw error }
+            PendingInventoryRead.testBeforeBuild = previous
+            let projected = try inventory.view(path: nil, removals: removals, cancellation: token)
+            try require(count == projected?.root.fileCount, "Count-only directory/file removals disagreed with the projected view")
+        }
+        try require(try inventory.fileCount(removals: [ScanRemoval(path: root.path, identity: "1:1")], cancellation: token) == nil,
+                    "Count-only root removal retained its tree")
+        try require(try inventory.fileCount(removals: [ScanRemoval(path: root.path, identity: "1:99")], cancellation: token) == 2,
+                    "Stale root identity removed the current count")
         try require(try matching("old-") == 2, "Live cache fixture must find both old descendants before restarting")
         try require(try view().revision == first.revision, "Unchanged live read changed its version")
         append(folderPath, oldIdentity, [record("partial", size: 7)])

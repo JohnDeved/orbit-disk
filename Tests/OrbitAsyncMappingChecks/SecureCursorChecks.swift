@@ -54,7 +54,57 @@ enum SecureCursorChecks {
         try cachedSymlinkReplacement(base)
         try rootReplacement(base)
         try offsetsDepthAndClose(base)
-        print("PASS: secure cursor validates cached ancestors/root, rejects symlinks, bounds deep traversal and closes independent descriptors")
+        try bootVolumeRoutes()
+        try scannerFallbackRejectsReplacement(base)
+        print("PASS: secure cursor validates cached ancestors/root, admits boot aliases, rejects duplicate routes/symlinks, and scanner fallback rejects replacement identities")
+    }
+
+    private static func bootVolumeRoutes() throws {
+        let rootURL = URL(fileURLWithPath: "/", isDirectory: true)
+        let root = try SecureRoot(url: rootURL)
+        let cursor = try SecureDirectoryCursor(root: root, rootURL: rootURL)
+        defer { cursor.close() }
+        let users = try components(rootURL, ["Users"])
+        let opened = try root.openDirectory(users)
+        close(opened)
+        try openAndClose(cursor, users)
+        try openAndClose(cursor, users)
+        let wrong = [DirectoryComponent(name: "Users", expected: DirectoryIdentity(
+            device: users[0].expected.device, inode: users[0].expected.inode &+ 1))]
+        try rejected { try root.openDirectory(wrong) }
+        try rejected { try cursor.openDirectory(wrong) }
+        let physicalUsers = Data("/System/Volumes/Data/Users".utf8)
+        if root.scope.excludes(path: physicalUsers) {
+            let data = try components(rootURL, ["System", "Volumes", "Data"])
+            try openAndClose(cursor, data)
+            let duplicate = try components(rootURL, ["System", "Volumes", "Data", "Users"])
+            try rejected { try root.openDirectory(duplicate) }
+            try rejected { try cursor.openDirectory(duplicate) }
+        }
+    }
+
+    private static func scannerFallbackRejectsReplacement(_ base: URL) throws {
+        let fixture = try AsyncFixture(base, "scanner-fallback-replacement")
+        try fixture.file("original", size: 17)
+        let source = fixture.root, moved = fixture.base.appendingPathComponent("original-root")
+        let swap = HookOutcome()
+        let scanner = DiskScanner(testBatch: {
+            swap.run {
+                try FileManager.default.moveItem(at: source, to: moved)
+                try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+                try Data(repeating: 1, count: 71).write(to: source.appendingPathComponent("replacement"))
+            }
+            throw ScanError.filesystem(source.path, EIO)
+        })
+        do {
+            _ = try scanner.scan(source)
+            throw AsyncCheckFailure(description: "Scanner fallback admitted a replacement root inode")
+        } catch ScanError.filesystem(_, let code) {
+            try require(code == ESTALE, "Scanner replacement must fail identity validation before fallback enumeration")
+        }
+        try swap.verify()
+        try require(try Data(contentsOf: source.appendingPathComponent("replacement")).count == 71,
+                    "Replacement fixture was modified during rejected traversal")
     }
 
     private static func cachedAncestorReplacement(_ base: URL) throws {

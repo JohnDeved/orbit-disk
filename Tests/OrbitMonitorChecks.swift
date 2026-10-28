@@ -19,6 +19,17 @@ private func real(_ path: String) throws -> String {
         try check(!DiskChangeMonitor.testOverflowExcluded("/root/cache\0/other", exclusions: ["/root/cache"]), "excluded NUL matched")
         try check(DiskChangeMonitor.testOverflowExcluded("relative/file", exclusions: [""]), "device root exclusion missed")
         let fm = FileManager.default
+        let bootRoot = URL(fileURLWithPath: "/"), boot = try DiskChangeMonitor.capture(root: URL(fileURLWithPath: "/"))
+        var oldBoot = try JSONSerialization.jsonObject(with: Data(boot.identity.utf8)) as! [String: Any]
+        try check(oldBoot.removeValue(forKey: "bootTraversal") as? Int == 2, "boot traversal fingerprint missing")
+        let oldBootIdentity = String(decoding: try JSONSerialization.data(withJSONObject: oldBoot, options: [.sortedKeys]), as: UTF8.self)
+        let bootMonitor = try DiskChangeMonitor(root: bootRoot)
+        var bootRefresh = false
+        let bootReplay = try await bootMonitor.start(sinceEventID: boot.eventID, eventIdentity: oldBootIdentity) { batch in
+            if batch.fullRefreshRequired && batch.directoryPaths.contains("/") && batch.checkpoint.identity == boot.identity { bootRefresh = true }
+        }
+        bootMonitor.stop()
+        try check(!bootReplay && bootRefresh, "old root scope did not automatically request full reconciliation")
         let home = fm.homeDirectoryForCurrentUser
         let homeCache = home.appendingPathComponent("Library/Caches", isDirectory: true)
         if fm.fileExists(atPath: homeCache.path) {

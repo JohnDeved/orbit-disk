@@ -266,6 +266,65 @@ final class SortGate: @unchecked Sendable {
             try await wait("root") { model.current?.id == root.id && !model.isOpeningFolder }
             install(AnyView(ContentView(model: model)), size: size)
             let baseline = try await capture(prefix + "/root")
+            if let title = baseline["metric-title:File size"], let value = baseline["metric-value:File size"],
+               let divider = baseline["metric-divider"] {
+                if abs(title.maxX - value.maxX) > 0.5 || abs(divider.minX - value.maxX - 24) > 0.5 {
+                    failures.append("File size metric is not aligned toward its divider at \(prefix)")
+                }
+            } else { failures.append("Missing File size alignment probes at \(prefix)") }
+            let originalProgress = model.mappingProgressState.value
+            let estimated = MappingProgressPresentation(rootName: "Home", discoveredFiles: 128_400, cachedFiles: 80_892,
+                discoveryFraction: 0.52, discoveryState: "52% estimated", discoveryDetail: "From this scan",
+                cacheFraction: 0.63, cacheState: "Saving changes", cacheDetail: "", isDiscovering: true, isPaused: false)
+            var estimating = estimated
+            estimating.discoveryFraction = nil; estimating.discoveryState = "Estimating…"
+            estimating.cachedFiles = nil; estimating.cacheFraction = nil; estimating.cacheState = "Reading cache"
+            var memoryUnknown = estimated
+            memoryUnknown.discoveryFraction = nil; memoryUnknown.discoveryState = "Estimating…"
+            var cacheAhead = estimated
+            cacheAhead.discoveryFraction = 0.28; cacheAhead.discoveryState = "28% estimated"
+            cacheAhead.cacheFraction = 0.82
+            var equalFractions = estimated
+            equalFractions.discoveryFraction = 0.5; equalFractions.discoveryState = "50% estimated"
+            equalFractions.cacheFraction = 0.5
+            var cacheCaughtUp = equalFractions
+            cacheCaughtUp.cacheFraction = 1; cacheCaughtUp.cachedFiles = cacheCaughtUp.discoveredFiles
+            var revised = estimated
+            revised.discoveryFraction = 0.47; revised.discoveryState = "47% estimated"
+            revised.discoveryDetail = "More files than expected"
+            var catchingUp = estimated
+            catchingUp.discoveredFiles = 360_000; catchingUp.cachedFiles = 272_400
+            catchingUp.discoveryFraction = 1; catchingUp.discoveryState = "Complete"; catchingUp.discoveryDetail = "Discovery complete"
+            catchingUp.cacheFraction = 0.76; catchingUp.isDiscovering = false; catchingUp.phase = .saving
+            var saved = catchingUp
+            saved.cachedFiles = 360_000; saved.cacheFraction = 1; saved.cacheState = "Saved"; saved.phase = .saved
+            var paused = estimated
+            paused.isDiscovering = false; paused.isPaused = true; paused.discoveryState = "Stopped"
+            paused.discoveryDetail = "Progress kept"; paused.cacheState = "Stopped"; paused.phase = .paused
+            var cacheError = estimated
+            cacheError.isDiscovering = false; cacheError.isPaused = true; cacheError.discoveryState = "Stopped"
+            cacheError.cacheState = "Interrupted"; cacheError.cacheDetail = "Retry mapping"; cacheError.phase = .interrupted
+            cacheError.rootName = "A very long map root name while browsing a deeply nested folder"
+            for (label, progress) in [("estimating", estimating), ("estimated", estimated),
+                                      ("memory-unknown", memoryUnknown), ("cache-ahead", cacheAhead), ("equal", equalFractions),
+                                      ("cache-caught-up", cacheCaughtUp), ("revised", revised),
+                                      ("cache-catchup", catchingUp), ("saved", saved), ("paused", paused), ("cache-error", cacheError)] {
+                model.mappingProgressState.value = progress
+                let frames = try await capture(prefix + "/progress-" + label)
+                compare(prefix + "/progress-" + label, baseline, frames)
+                if let footer = frames["footer"], abs(footer.height - (MappingProgressFooter.contentHeight + 12)) > 0.5 {
+                    failures.append("Progress footer changed height: \(label) \(footer.height)")
+                }
+                if label != "revised", let content = window.contentView,
+                   let bitmap = content.bitmapImageRepForCachingDisplay(in: content.bounds) {
+                    content.cacheDisplay(in: content.bounds, to: bitmap)
+                    try bitmap.representation(using: .png, properties: [:])?.write(to:
+                        reportDirectory.appendingPathComponent("progress-\(prefix)-\(label).png"))
+                }
+            }
+            model.mappingProgressState.value = nil
+            compare(prefix + "/progress-fallback", baseline, try await capture(prefix + "/progress-fallback"))
+            model.mappingProgressState.value = originalProgress
             let originalVolumes = model.volumes
             let fallback = DiskVolume(url: URL(fileURLWithPath: "/"), name: "Mac", capacity: 0, available: 0)
             model.isDiscoveringVolumes = true; model.volumes = [fallback]

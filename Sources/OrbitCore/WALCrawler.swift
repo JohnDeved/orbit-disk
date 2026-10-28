@@ -173,6 +173,9 @@ final class DurableCrawler {
             try store.acknowledgeAsync(commit)
         } catch { cancelAsyncDiscovery(); throw error }
         listing.batches += 1
+        if listing.skipped || (last.completion != nil && !completed) || last.failure != nil {
+            mailbox.requireReconciliation()
+        }
         asyncListing = ended ? nil : listing
         onRecordCount?(records.count)
         do {
@@ -191,6 +194,7 @@ final class DurableCrawler {
     }
 
     func markChanged(directory: String) throws {
+        asyncInventory?.requireReconciliation()
         var path = Data(directory.utf8)
         var rootPrefix = rootPath
         if rootPrefix.last != 47 { rootPrefix.append(47) }
@@ -212,17 +216,19 @@ final class DurableCrawler {
     func step(maxBatches: Int? = nil, beforeAccounting: (() throws -> Void)? = nil,
               onRecordCount: ((Int) -> Void)? = nil, onBatch: ((Data, Int) throws -> Void)? = nil,
               onListingComplete: (() -> Void)? = nil,
-              onListingStart: ((Data, String) -> Void)? = nil, onListingEnd: (() -> Void)? = nil) throws -> Bool {
+              onListingStart: ((Data, String) -> Void)? = nil, onListingEnd: (() -> Void)? = nil,
+              onEnumerationStart: (() -> Void)? = nil) throws -> Bool {
         try CloudStoragePolicy.withoutMaterialization {
             try stepLocal(maxBatches: maxBatches, beforeAccounting: beforeAccounting, onRecordCount: onRecordCount,
-                onBatch: onBatch, onListingComplete: onListingComplete, onListingStart: onListingStart, onListingEnd: onListingEnd)
+                onBatch: onBatch, onListingComplete: onListingComplete, onListingStart: onListingStart,
+                onListingEnd: onListingEnd, onEnumerationStart: onEnumerationStart)
         }
     }
 
     private func stepLocal(maxBatches: Int?, beforeAccounting: (() throws -> Void)?,
                            onRecordCount: ((Int) -> Void)?, onBatch: ((Data, Int) throws -> Void)?,
                            onListingComplete: (() -> Void)?, onListingStart: ((Data, String) -> Void)?,
-                           onListingEnd: (() -> Void)?) throws -> Bool {
+                           onListingEnd: (() -> Void)?, onEnumerationStart: (() -> Void)?) throws -> Bool {
         guard !cancellation.isCancelled else { asyncWriterCursor = nil; cancelAsyncDiscovery(); throw CancellationError() }
         if hasActiveAsyncDiscovery {
             if maxBatches != nil { cancelAsyncDiscovery() }
@@ -316,6 +322,7 @@ final class DurableCrawler {
                 if child.last != 47 { child.append(47) }
                 child.append(contentsOf: record.name.utf8)
                 return !excludedPaths.contains(child) && !excludedDirectories.contains(DirectoryIdentity(device: record.device, inode: record.inode))
+                    && !root.scope.excludes(path: child)
             }
         }
         func accountCommittedBatch(_ count: Int) throws {
@@ -337,6 +344,7 @@ final class DurableCrawler {
             try accountCommittedBatch(records.count)
         }
         func list(forceFallback: Bool, testFallback: (() -> Void)?) throws {
+            onEnumerationStart?()
             let observedIdentity = DirectoryIdentity(device: directory.device, inode: directory.inode)
             liveInventory.begin(directory.path, identity: observedIdentity)
             try StreamingBulkDirectory.stream(descriptor, url: URL(fileURLWithPath: path, isDirectory: true),

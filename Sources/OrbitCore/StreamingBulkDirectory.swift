@@ -31,11 +31,15 @@ package enum StreamingBulkDirectory {
         defer { withExtendedLifetime(ownedBuffer) {} }
         let capacity = ownedBuffer.capacity
         let buffer = ownedBuffer.storage
+        let firmlinks = BootFirmlinkMetadata.forDirectory(url)
         var entries: [FileMetadata] = []
         var bytes: Int64 = 0
         var itemCount = 0
         func accept(_ metadata: FileMetadata) throws {
-            entries.append(metadata)
+            let resolved: FileMetadata
+            do { resolved = try firmlinks?.normalize(metadata, descriptor: descriptor) ?? metadata }
+            catch { issue(error.localizedDescription); return }
+            entries.append(resolved)
             itemCount += 1
             bytes += metadata.size
             if entries.count == 128 {

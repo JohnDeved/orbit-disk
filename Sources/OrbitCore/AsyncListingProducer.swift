@@ -47,6 +47,7 @@ struct PendingInventorySnapshot {
     let batches: [PendingInventoryBatch]
     var inaccessibleDirectories: Set<Data> = []
     let current: () -> Bool
+    var traversalScope: VolumeTraversalScope? = nil
     func isCurrent() -> Bool { current() }
 }
 
@@ -55,6 +56,7 @@ final class PendingInventoryMailbox: @unchecked Sendable {
     let generation = UUID().uuidString
     let rootPath: Data
     let rootIdentity: DirectoryIdentity
+    private let traversalScope: VolumeTraversalScope?
     private let condition = NSCondition()
     private let cancellation: ScanCancellation
     private let onAccepted: () -> Void
@@ -77,11 +79,14 @@ final class PendingInventoryMailbox: @unchecked Sendable {
     private var finished = false
     private var finishedAt: TimeInterval?
     private var cancelled = false
+    private var progress = DiscoveryProgress()
 
     init(rootPath: Data, rootIdentity: DirectoryIdentity,
          cancellation: ScanCancellation, onAccepted: @escaping () -> Void,
+         traversalScope: VolumeTraversalScope? = nil,
          onBatch: @escaping (PendingInventoryBatch) -> Void = { _ in }) {
         self.rootPath = rootPath; self.rootIdentity = rootIdentity
+        self.traversalScope = traversalScope
         self.cancellation = cancellation; self.onAccepted = onAccepted; self.onBatch = onBatch
     }
 
@@ -105,6 +110,14 @@ final class PendingInventoryMailbox: @unchecked Sendable {
     var peakFrontierBytes: Int { read { peakFrontierBytesValue } }
     var isCancelled: Bool { read { cancelled } || cancellation.isCancelled }
     var isDrained: Bool { read { finished && committed == sequence } }
+    var progressSnapshot: DiscoveryProgress {
+        read {
+            var value = progress
+            value.finished = finished
+            value.cancelled = cancelled || cancellation.isCancelled
+            return value
+        }
+    }
 
     func capture() -> PendingInventorySnapshot {
         condition.lock()
@@ -114,15 +127,20 @@ final class PendingInventoryMailbox: @unchecked Sendable {
         // Readers copy page references under the lock; flattening cannot hold up discovery.
         return PendingInventorySnapshot(generation: generation, revision: revision, rootPath: rootPath,
             rootIdentity: rootIdentity, batches: retained.sorted { $0.key < $1.key }.flatMap { $0.value.compactMap { $0 } },
-            current: { [weak self] in self.map { !$0.isCancelled } ?? false })
+            current: { [weak self] in self.map { !$0.isCancelled } ?? false }, traversalScope: traversalScope)
     }
 
-    fileprivate func observe(_ batch: PendingInventoryBatch) throws {
+    func observe(_ batch: PendingInventoryBatch, save: Bool = true, needsImport: Bool = false) throws {
         guard !isCancelled else { throw CancellationError() }
         onBatch(batch)
         condition.lock()
         guard !cancelled && !cancellation.isCancelled else { condition.unlock(); throw CancellationError() }
         discoveredRecords += batch.records.count; discoveredBytes += batch.logicalSize; revision &+= 1
+        progress.files += Int(batch.fileCount); progress.records += batch.records.count
+        progress.logicalSize += batch.logicalSize
+        if save { progress.acceptedSaveWork += Int64(batch.records.count) + 1 }
+        if needsImport { progress.cacheUncertain = true }
+        if batch.failure != nil { progress.uncertain = true }
         condition.unlock()
     }
 
@@ -163,7 +181,10 @@ final class PendingInventoryMailbox: @unchecked Sendable {
         while committed < end {
             let index = committed
             let page = index / Int64(Self.pageSize), offset = Int(index % Int64(Self.pageSize))
-            if let batch = pages[page]?[offset] { bytes -= batch.byteCount }
+            if let batch = pages[page]?[offset] {
+                bytes -= batch.byteCount
+                progress.settledSaveWork += Int64(batch.records.count) + 1
+            }
             pages[page]?[offset] = nil
             committed += 1
             if offset == Self.pageSize - 1 { pages.removeValue(forKey: page) }
@@ -177,22 +198,28 @@ final class PendingInventoryMailbox: @unchecked Sendable {
         return pages[index / Int64(Self.pageSize)]?[Int(index % Int64(Self.pageSize))]
     }
 
-    func updateFrontier(count: Int, bytes: Int) {
+    func updateFrontier(count: Int, bytes: Int, active: Int = 0, completed: Int = 0, recentChildren: Double = 0) {
         condition.lock()
         guard !cancelled else { condition.unlock(); return }
         frontier = count; frontierBytes = bytes
+        progress.queuedDirectories = count; progress.activeDirectories = active
+        progress.completedDirectories = completed; progress.recentChildren = recentChildren
         peakFrontier = max(peakFrontier, count); peakFrontierBytesValue = max(peakFrontierBytesValue, bytes)
         condition.unlock()
     }
 
     fileprivate func deferredDirectoriesForReuse(_ count: Int) {
         condition.lock()
-        if !cancelled { reuseDeferred += count }
+        if !cancelled { reuseDeferred += count; progress.uncertain = true }
         condition.unlock()
     }
 
     fileprivate func deferRetries(_ count: Int) {
-        condition.lock(); if !cancelled { retryDeferred += count }; condition.unlock()
+        condition.lock(); if !cancelled { retryDeferred += count; progress.uncertain = true }; condition.unlock()
+    }
+
+    func requireReconciliation() {
+        condition.lock(); progress.uncertain = true; condition.unlock()
     }
 
     func finish() {
@@ -257,7 +284,8 @@ final class AsyncListingProducer: @unchecked Sendable {
         self.seedPath = seedPath; self.reuse = reuse; self.forceFallback = forceFallback
         self.workerCount = max(1, min(workerCount, 4))
         mailbox = PendingInventoryMailbox(rootPath: Data(rootURL.path.utf8), rootIdentity: rootIdentity,
-            cancellation: cancellation, onAccepted: onAccepted, onBatch: { live?.append($0, notify: false) })
+            cancellation: cancellation, onAccepted: onAccepted, traversalScope: root.scope,
+            onBatch: { live?.append($0, notify: false) })
         scheduler = DiscoveryScheduler(root: DiscoveryDirectory(path: Data(rootURL.path.utf8),
             identity: rootIdentity, components: []), mailbox: mailbox)
         spool = DiscoveryListingSpool(mailbox: mailbox)
@@ -302,8 +330,8 @@ final class AsyncListingProducer: @unchecked Sendable {
         live?.onChange()
     }
 
-    private func publish(_ batch: PendingInventoryBatch, ticket: Int64, save: Bool = true) throws {
-        try withPublication { try mailbox.observe(batch) }
+    private func publish(_ batch: PendingInventoryBatch, ticket: Int64, save: Bool = true, needsImport: Bool = false) throws {
+        try withPublication { try mailbox.observe(batch, save: save, needsImport: needsImport) }
         live?.onChange()
         mailbox.notifyAccepted()
         if save { spool.append(batch, ticket: ticket) }
@@ -368,14 +396,14 @@ final class AsyncListingProducer: @unchecked Sendable {
                     if !record.isDirectory { accepted?.append(record); continue }
                     let path = HardLinkPathOrder.path(directory.path, Data(record.name.utf8))
                     let identity = DirectoryIdentity(device: record.device, inode: record.inode)
-                    if excludedPaths.contains(path) || excludedDirectories.contains(identity) {
+                    if excludedPaths.contains(path) || excludedDirectories.contains(identity) || root.scope.excludes(path: path) {
                         if accepted == nil {
                             accepted = Array(observations[..<offset]); accepted?.reserveCapacity(observations.count)
                         }
                         continue
                     }
                     accepted?.append(record)
-                    if !record.isMountPoint && record.device == root.identity.device {
+                    if root.scope.allows(path: path, device: record.device, isMountPoint: record.isMountPoint) {
                         if deferDirectory?(path) == true { deferred += 1; continue }
                         children.append(DiscoveryDirectory(path: path, identity: identity,
                             components: directory.components + [DirectoryComponent(name: record.name, expected: identity)]))
@@ -405,7 +433,7 @@ final class AsyncListingProducer: @unchecked Sendable {
                 do {
                     let accepted = try accept(cachedRecords)
                     let observed = batch(accepted, completion: PendingListingCompletion(issueCount: 0, issues: []))
-                    if let reused { try reused.source.commit { try publish(observed, ticket: job.ticket, save: false) } }
+                    if let reused { try reused.source.commit { try publish(observed, ticket: job.ticket, save: false, needsImport: true) } }
                     else { try publish(observed, ticket: job.ticket, save: false) }
                     return children
                 } catch {

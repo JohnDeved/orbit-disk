@@ -15,6 +15,7 @@ package enum BulkDirectory {
         let capacity = 256 * 1024
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: capacity, alignment: 8)
         defer { buffer.deallocate() }
+        let firmlinks = BootFirmlinkMetadata.forDirectory(url)
         var entries: [FileMetadata] = []
         var bytes: Int64 = 0
         while true {
@@ -63,7 +64,7 @@ package enum BulkDirectory {
                     let childURL = url.appendingPathComponent(name, isDirectory: false)
                     do {
                         let metadata = try FileMetadata.read(childURL)
-                        entries.append(metadata)
+                        entries.append(try firmlinks?.normalize(metadata, descriptor: descriptor) ?? metadata)
                         bytes += metadata.size
                     }
                     catch { issue(error.localizedDescription) }
@@ -72,14 +73,16 @@ package enum BulkDirectory {
                 // Darwin omits the entire file/dir group for other object types, even with PACK_INVAL_ATTRS.
                 guard nameStart >= (isDirectory ? 56 : 72) else { throw ScanError.filesystem(url.path, EIO) }
                 let mount = isDirectory ? record.loadUnaligned(fromByteOffset: 52, as: UInt32.self) : 0
-                entries.append(FileMetadata(
+                let metadata = FileMetadata(
                     name: name, device: record.loadUnaligned(fromByteOffset: 36, as: Int32.self),
                     inode: record.loadUnaligned(fromByteOffset: 44, as: UInt64.self),
                     isDirectory: isDirectory, isSymbolicLink: kind == VLNK.rawValue,
                     isMountPoint: isDirectory && mount & UInt32(DIR_MNTSTATUS_MNTPOINT) != 0,
                     linkCount: isDirectory ? 1 : record.loadUnaligned(fromByteOffset: 52, as: UInt32.self),
                     size: isDirectory ? 0 : max(0, record.loadUnaligned(fromByteOffset: 64, as: Int64.self)),
-                    allocatedSize: isDirectory ? 0 : max(0, record.loadUnaligned(fromByteOffset: 56, as: Int64.self))))
+                    allocatedSize: isDirectory ? 0 : max(0, record.loadUnaligned(fromByteOffset: 56, as: Int64.self)))
+                do { entries.append(try firmlinks?.normalize(metadata, descriptor: descriptor) ?? metadata) }
+                catch { issue(error.localizedDescription); continue }
                 bytes += entries[entries.count - 1].size
             }
             try batch(entries)

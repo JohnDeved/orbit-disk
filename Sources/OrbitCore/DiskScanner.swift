@@ -55,7 +55,13 @@ public struct DiskScanner: Sendable {
             throw ScanError.excluded(reason)
         }
         let excluding = excluding + cloudRoots
-        let state = ScanState(cancellation: cancellation, progress: progress, useBulk: useBulkEnumeration, preview: preview)
+        if cancellation.isCancelled { throw CancellationError() }
+        let metadata = try FileMetadata.read(rootURL)
+        guard metadata.isDirectory, !metadata.isSymbolicLink else { throw ScanError.notDirectory(rootURL.path) }
+        let scope = VolumeTraversalScope(rootURL: rootURL,
+                                        rootIdentity: DirectoryIdentity(device: metadata.device, inode: metadata.inode))
+        let state = ScanState(cancellation: cancellation, progress: progress, useBulk: useBulkEnumeration,
+                              preview: preview, scope: scope)
         state.excludedDirectories = Set(excluding.compactMap { url in
             var info = stat()
             guard lstat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR else { return nil }
@@ -63,14 +69,11 @@ public struct DiskScanner: Sendable {
         })
         state.excludedPaths = IndexLocations.exclusionPaths(excluding)
         try state.checkCancellation()
-        let metadata = try FileMetadata.read(rootURL)
-        guard metadata.isDirectory, !metadata.isSymbolicLink else { throw ScanError.notDirectory(rootURL.path) }
         #if ORBIT_TESTING
         state.testBatch = testBatch
         state.testFallback = testFallback
         state.testAfterListing = testAfterListing
         #endif
-        state.rootDevice = metadata.device
         if let preview { preview.begin(state.previewNode(rootURL, metadata: metadata, scanState: .scanning)) }
         state.report(rootURL.path, force: true)
         let root = try state.walk(rootURL, metadata: metadata, isRoot: true)
@@ -117,13 +120,13 @@ private final class ScanState {
     let progress: @Sendable (ScanProgress) -> Void
     let useBulk: Bool
     let preview: DiskScanPreview?
+    let scope: VolumeTraversalScope
     let started = ProcessInfo.processInfo.systemUptime
     #if ORBIT_TESTING
     var testBatch: (@Sendable () throws -> Void)?
     var testFallback: (@Sendable () throws -> Void)?
     var testAfterListing: (@Sendable () -> Void)?
     #endif
-    var rootDevice: Int32 = 0
     var itemCount = 0
     var bytesScanned: Int64 = 0
     var skippedCount = 0
@@ -134,11 +137,12 @@ private final class ScanState {
     var lastProgress: TimeInterval = 0
 
     init(cancellation: ScanCancellation, progress: @escaping @Sendable (ScanProgress) -> Void,
-         useBulk: Bool, preview: DiskScanPreview?) {
+         useBulk: Bool, preview: DiskScanPreview?, scope: VolumeTraversalScope) {
         self.cancellation = cancellation
         self.progress = progress
         self.useBulk = useBulk
         self.preview = preview
+        self.scope = scope
     }
 
     func checkCancellation() throws {
@@ -167,14 +171,17 @@ private final class ScanState {
 
         var children: [DiskNode] = []
         var isAccessible = true
-        if !isRoot && (metadata.isMountPoint || metadata.device != rootDevice) {
+        if !isRoot && !scope.allows(path: Data(url.path.utf8), device: metadata.device, isMountPoint: metadata.isMountPoint) {
             isAccessible = false
             skip("\(url.path): nested volume skipped")
         } else {
             do {
-                let entries = try readDirectory(url).filter {
-                    !$0.isDirectory || (!excludedPaths.contains(Data(url.appendingPathComponent($0.name).path.utf8)) &&
-                        !excludedDirectories.contains(FileIdentity(device: $0.device, inode: $0.inode)))
+                let expected = DirectoryIdentity(device: metadata.device, inode: metadata.inode)
+                let entries = try readDirectory(url, expected: expected).filter {
+                    guard $0.isDirectory else { return true }
+                    let path = Data(url.appendingPathComponent($0.name).path.utf8)
+                    return !scope.excludes(path: path) && !excludedPaths.contains(path) &&
+                        !excludedDirectories.contains(FileIdentity(device: $0.device, inode: $0.inode))
                 }
                 itemCount += entries.count
                 bytesScanned += entries.reduce(0) { $0 + $1.size }
@@ -261,7 +268,7 @@ private final class ScanState {
                         fileIdentity: "\(metadata.device):\(metadata.inode)")
     }
 
-    func readDirectory(_ url: URL) throws -> [FileMetadata] {
+    func readDirectory(_ url: URL, expected: DirectoryIdentity) throws -> [FileMetadata] {
         let descriptor = url.withUnsafeFileSystemRepresentation {
             open($0!, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         }
@@ -269,7 +276,12 @@ private final class ScanState {
         defer { close(descriptor) }
         var info = stat()
         guard fstat(descriptor, &info) == 0 else { throw ScanError.filesystem(url.path, errno) }
-        guard info.st_dev == rootDevice else { throw ScanError.filesystem(url.path, EXDEV) }
+        guard DirectoryIdentity(device: info.st_dev, inode: info.st_ino) == expected else {
+            throw ScanError.filesystem(url.path, ESTALE)
+        }
+        guard scope.allowsIdentity(path: Data(url.path.utf8), identity: expected) else {
+            throw ScanError.filesystem(url.path, EXDEV)
+        }
 
         if useBulk {
             do {
@@ -285,8 +297,11 @@ private final class ScanState {
                             for (index, entry) in entries.prefix(512).enumerated() {
                                 if index & 127 == 0 { try self.checkCancellation() }
                                 let childURL = url.appendingPathComponent(entry.name, isDirectory: entry.isDirectory)
-                                if entry.isDirectory && (self.excludedPaths.contains(Data(childURL.path.utf8)) ||
-                                    self.excludedDirectories.contains(FileIdentity(device: entry.device, inode: entry.inode))) { continue }
+                                if entry.isDirectory {
+                                    let path = Data(childURL.path.utf8)
+                                    if self.scope.excludes(path: path) || self.excludedPaths.contains(path) ||
+                                        self.excludedDirectories.contains(FileIdentity(device: entry.device, inode: entry.inode)) { continue }
+                                }
                                 nodes.append(self.previewNode(childURL, metadata: entry, scanState: .pending))
                             }
                             preview.appendListing(url.path, children: nodes)
@@ -304,10 +319,10 @@ private final class ScanState {
                 // A fresh descriptor restarts enumeration, avoiding double counts after a partial bulk read.
             }
         }
-        return try readDirectoryFallback(url)
+        return try readDirectoryFallback(url, expected: expected)
     }
 
-    func readDirectoryFallback(_ url: URL) throws -> [FileMetadata] {
+    func readDirectoryFallback(_ url: URL, expected: DirectoryIdentity) throws -> [FileMetadata] {
         let descriptor = url.withUnsafeFileSystemRepresentation {
             open($0!, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
         }
@@ -318,7 +333,11 @@ private final class ScanState {
             close(descriptor)
             throw ScanError.filesystem(url.path, code)
         }
-        if info.st_dev != rootDevice {
+        if DirectoryIdentity(device: info.st_dev, inode: info.st_ino) != expected {
+            close(descriptor)
+            throw ScanError.filesystem(url.path, ESTALE)
+        }
+        if !scope.allowsIdentity(path: Data(url.path.utf8), identity: expected) {
             close(descriptor)
             throw ScanError.filesystem(url.path, EXDEV)
         }

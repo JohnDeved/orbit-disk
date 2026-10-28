@@ -520,6 +520,19 @@ public struct DiskIndexStore: Sendable {
         return (result, count, revision, false)
     }
 
+    func stagedFileCount(snapshot: IndexSnapshot, removals: [ScanRemoval], cancellation: ScanCancellation) throws -> Int? {
+        try check(cancellation)
+        let db = try open(snapshot, cancellation: cancellation)
+        try db.execute("BEGIN")
+        defer { try? db.execute("ROLLBACK") }
+        guard let root = try readNode(snapshot.rootURL.path, db: db) else { return nil }
+        let sources = try stagedRemovalSources(removals, db: db, cancellation: cancellation)
+        let projection = try DiskRemovalProjection(removals: removals, source: sources, cancellation: cancellation)
+        let count = try projection.apply(root, cancellation: cancellation)?.fileCount
+        try check(cancellation)
+        return count
+    }
+
     // All rows in the returned partial view come from one read transaction.
     public func stagedView(path: String?, snapshot: IndexSnapshot, revision: UInt64,
                            activeDirectory: (path: Data, identity: String)? = nil, removals: [ScanRemoval] = [], cancellation: ScanCancellation? = nil) throws -> ScanPreviewView? {

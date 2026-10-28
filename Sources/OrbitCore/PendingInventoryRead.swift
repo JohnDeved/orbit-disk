@@ -40,6 +40,9 @@ struct PendingInventoryBatchIndex {
 }
 
 final class PendingInventoryRead {
+    #if ORBIT_TESTING
+    static var testBeforeBuild: (() throws -> Void)?
+    #endif
     struct Delta {
         var size: Int64 = 0
         var allocated: Int64 = 0
@@ -55,18 +58,23 @@ final class PendingInventoryRead {
     private var allocations: [Data: Int64] = [:]
     private var hasAllocationChanges = false
     private let root: Data
-    private let rootDevice: Int32
+    private let scope: VolumeTraversalScope
     var isEmpty: Bool { batches.isEmpty && !hasAllocationChanges }
 
     init(snapshot: PendingInventorySnapshot, committedSequence: Int64,
          durableLinks: (DirectoryIdentity) throws -> [DiskNode], check: () throws -> Void) throws {
+        #if ORBIT_TESTING
+        try Self.testBeforeBuild?()
+        #endif
         guard snapshot.isCurrent() else { throw CancellationError() }
         self.snapshot = snapshot
         self.batches = snapshot.batches.filter { $0.sequence > committedSequence && $0.failure == nil }
         self.byParent = Dictionary(grouping: batches, by: \.parentPath)
         self.completed = Set(batches.lazy.filter { $0.completion != nil }.map(\.parentPath))
         self.root = snapshot.rootPath
-        self.rootDevice = snapshot.rootIdentity.device
+        self.scope = snapshot.traversalScope ?? VolumeTraversalScope(
+            rootURL: URL(fileURLWithPath: String(decoding: snapshot.rootPath, as: UTF8.self)),
+            rootIdentity: snapshot.rootIdentity)
         var links: [DirectoryIdentity: [(Data, FileMetadata)]] = [:]
         for (offset, batch) in snapshot.batches.enumerated() {
             if offset & 63 == 0 { try check() }
@@ -159,7 +167,7 @@ final class PendingInventoryRead {
         var state = durable?.scanState ?? .complete
         var accessible = durable?.isAccessible ?? true
         if let record {
-            accessible = !directory || (!record.isMountPoint && record.device == rootDevice)
+            accessible = !directory || scope.allows(path: key, device: record.device, isMountPoint: record.isMountPoint)
             state = !directory || !accessible ? .complete : .pending
         }
         if directory, byParent[key] != nil {

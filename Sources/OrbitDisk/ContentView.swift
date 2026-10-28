@@ -84,6 +84,7 @@ struct ContentView: View {
                 .contentShape(Rectangle())
                 .onDrop(of: [UTType.fileURL.identifier], delegate: FolderPlacesDrop(places: places,
                     collectionType: DiskModel.collectionDragType.rawValue, isTargeted: $contentDropTargeted))
+                scanFooter
                 Divider()
                 collectionBar
             }
@@ -304,7 +305,7 @@ struct ContentView: View {
                                  beginInteraction: model.beginMapInteraction)
                         .padding(.horizontal, 16).frame(maxWidth: .infinity, maxHeight: .infinity)
                     HStack(spacing: 24) {
-                        metric(node.isScanComplete ? "File size" : "File size so far", value: model.isUpdatingRemovalSize(of: node) ? "Updating…" : node.scanState == .pending ? "Waiting" : formatBytes(node.size))
+                        metric(node.isScanComplete ? "File size" : "File size so far", value: model.isUpdatingRemovalSize(of: node) ? "Updating…" : node.scanState == .pending ? "Waiting" : formatBytes(node.size), alignment: .trailing)
                         Rectangle().fill(.white.opacity(0.14)).frame(width: 1, height: 30)
                         metric(node.isScanComplete ? "Allocated" : "Allocated so far", value: model.isUpdatingRemovalSizes ? "Updating…" : node.scanState == .pending ? "Waiting" : formatBytes(node.allocatedSize))
                     }.padding(.bottom, 12)
@@ -317,15 +318,16 @@ struct ContentView: View {
                 }
                 filePanel(node).frame(width: 340)
             }.frame(maxHeight: .infinity)
-            scanFooter
         }
     }
 
-    private func metric(_ title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.system(size: 11)).foregroundStyle(OrbitStyle.muted).lineLimit(1).frame(height: 14)
-            Text(value).font(.system(size: 18, weight: .medium)).monospacedDigit().lineLimit(1).frame(height: 22)
-        }.frame(width: 130, alignment: .leading)
+    private func metric(_ title: String, value: String, alignment: Alignment = .leading) -> some View {
+        VStack(spacing: 4) {
+            Text(title).font(.system(size: 11)).foregroundStyle(OrbitStyle.muted).lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: alignment).frame(height: 14)
+            Text(value).font(.system(size: 18, weight: .medium)).monospacedDigit().lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: alignment).frame(height: 22)
+        }.frame(width: 130)
     }
 
     private func filePanel(_ node: DiskNode) -> some View {
@@ -513,52 +515,7 @@ struct ContentView: View {
     }
 
     private var scanFooter: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 7) {
-                ZStack {
-                    if model.isScanning || model.isRefreshing { ProgressView().controlSize(.mini) }
-                    else { Image(systemName: model.isPartialMap || model.updatesPaused ? "pause.circle" : "checkmark.circle") }
-                }.frame(width: 14, height: 14)
-                if model.isPartialMap {
-                    Text(model.isScanning ? model.scanTitle : "Partial map · Not saved")
-                        .fontWeight(.medium).foregroundStyle(.white).lineLimit(1)
-                        .frame(width: 172, alignment: .leading)
-                    let found = model.root?.fileCount ?? 0
-                    Text(model.isUpdatingRemovalSizes ? "Updating sizes…" : "\(found.formatted()) \(found == 1 ? "file" : "files") found").monospacedDigit().lineLimit(1)
-                        .frame(width: 140, alignment: .leading)
-                } else if let result = model.scanResult {
-                    HStack(spacing: 4) {
-                        if let date = model.indexedAt {
-                            Text(model.isSavedMap ? "Saved map" : "Indexed")
-                            Text(date, style: .relative)
-                            Text("ago")
-                        }
-                    }.lineLimit(1).frame(width: 172, alignment: .leading)
-                    if result.skippedCount > 0 {
-                        Button("\(result.skippedCount.formatted()) skipped") { model.showIssues = true }
-                            .buttonStyle(.link).pointingCursor().fixedSize()
-                    }
-                }
-                Spacer(minLength: 8)
-                if model.isScanning {
-                    Button(action: model.cancelScan) { Text("Stop Mapping").frame(width: 110) }
-                        .pointingCursor().keyboardShortcut(.cancelAction)
-                        .frame(width: 130, alignment: .trailing)
-                } else if model.isPartialMap {
-                    Button(action: model.rescan) { Text("Restart Mapping").frame(width: 110) }
-                        .pointingCursor().frame(width: 130, alignment: .trailing)
-                } else if model.isRefreshing {
-                    Button(action: model.cancelScan) { Text("Pause").frame(width: 110) }
-                        .pointingCursor().frame(width: 130, alignment: .trailing)
-                }
-            }.controlSize(.small).frame(height: 26)
-            Text(model.isPartialMap ? (model.statusMessage ?? (model.isScanning ? model.scanPath : "Restart mapping to finish.")) : model.statusMessage ?? (model.isScanning ? model.scanTitle : ""))
-                .lineLimit(1).truncationMode(.middle)
-                .frame(maxWidth: .infinity, alignment: .leading).frame(height: 14, alignment: .top)
-        }
-        .font(.system(size: 11)).foregroundStyle(OrbitStyle.muted)
-        .padding(.horizontal, 28).frame(height: 44, alignment: .top)
-        .padding(.bottom, 12)
+        MappingProgressFooter(model: model, progressState: model.mappingProgressState)
     }
 
     private var collectionBar: some View {
@@ -625,7 +582,6 @@ struct ContentView: View {
             }
             Text(model.scanPath).font(.system(size: 11)).foregroundStyle(OrbitStyle.muted)
                 .lineLimit(1).truncationMode(.middle).frame(maxWidth: 520)
-            Button("Cancel Scan", action: model.cancelScan).pointingCursor().keyboardShortcut(.cancelAction)
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 

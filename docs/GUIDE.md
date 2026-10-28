@@ -66,11 +66,11 @@ Install Apple's Swift command-line tools or Xcode with Swift 6.3 or later, plus 
 ```sh
 ./build-app.sh
 swift run OrbitCoreChecks
-./check-app.sh
-./check-session.sh
-./check-updater.sh
-./check-rendering.sh
-./check-layout.sh
+./scripts/checks/check-app.sh
+./scripts/checks/check-session.sh
+./scripts/checks/check-updater.sh
+./scripts/checks/check-rendering.sh
+./scripts/checks/check-layout.sh
 python3 scripts/test-release.py
 python3 Tests/test_update_copy.py
 swift run -c release OrbitScan /path/to/folder
@@ -81,9 +81,26 @@ The build script creates `../Orbit Disk.app`, includes the Night app icon and pi
 
 GitHub Actions builds and checks pushes to `main` and pull requests. Version tags create universal GitHub releases. See [RELEASING.md](../RELEASING.md) for the version, signing, and publishing steps.
 
-`OrbitCoreChecks` is a dependency-free test executable so the tests run with Command Line Tools alone, even when XCTest is unavailable. It creates temporary fixtures and checks metadata, bulk/fallback parity, resource forks, sparse files, hard links, Unicode, cancellation, unreadable roots, cleanup policy, persistent indexes, incremental updates, stale revisions, and cancellation during index writes. Progressive checks cover discovery states, preview bounds and exact completed totals. `check-app.sh` checks the app model with real filesystem events, including live changes, cached relaunch, offline replay, and navigation/collection retention. It also checks partial browsing, stop/restart, save failures, gesture-held updates, linked hover, private drag tokens, grouped collection, duplicate prevention, stale identities, large-drop validation/cancellation, and native chart hit testing and gesture thresholds.
+Test sources live in `Tests/`; their shell runners live in `scripts/checks/`. Each runner finds the repository from its own location, so it can also be invoked by absolute path from another directory. Build, packaging, and release tools remain in `build-app.sh` and `scripts/`.
 
-`check-session.sh` exercises background location switching, partial collection and removal, and reconciliation after scan and refresh races. `check-app.sh` also checks list-hover suppression through wheel input, scrollbar dragging and momentum, including pointer restoration and teardown. `check-rendering.sh` checks native graph pixels through hover, selection, and collection changes, plus drawing-cache invalidation. The layout suite checks stable frames through navigation and interaction, native toolbar alignment and resizing.
+To run one CI suite locally, use `./scripts/checks/check-ci.sh SUITE`:
+
+| Suite | Coverage |
+|---|---|
+| `core` | Scanner, indexes, updater, and bundled CLI |
+| `native` | App model, native interaction, and automation |
+| `search` | Prepared, preview, and saved search |
+| `sessions` | Background maps and collection queue |
+| `mapping` | Discovery, cache reuse, and interrupted mapping |
+| `staging` | Durable staging and removal journal |
+| `removal` | File removal and folder transactions |
+| `rendering` | Graph, layout, Places, and cache reset |
+
+The standalone `./scripts/checks/check-portable-core.sh` also runs on Linux. The other suites require macOS; native interaction and rendering checks need a desktop session.
+
+`OrbitCoreChecks` is a dependency-free test executable so the tests run with Command Line Tools alone, even when XCTest is unavailable. It creates temporary fixtures and checks metadata, bulk/fallback parity, resource forks, sparse files, hard links, Unicode, cancellation, unreadable roots, cleanup policy, persistent indexes, incremental updates, stale revisions, and cancellation during index writes. Progressive checks cover discovery states, preview bounds and exact completed totals. `scripts/checks/check-app.sh` checks the app model with real filesystem events, including live changes, cached relaunch, offline replay, and navigation/collection retention. It also checks partial browsing, stop/restart, save failures, gesture-held updates, linked hover, private drag tokens, grouped collection, duplicate prevention, stale identities, large-drop validation/cancellation, and native chart hit testing and gesture thresholds.
+
+`scripts/checks/check-session.sh` exercises background location switching, partial collection and removal, and reconciliation after scan and refresh races. `scripts/checks/check-app.sh` also checks list-hover suppression through wheel input, scrollbar dragging and momentum, including pointer restoration and teardown. `scripts/checks/check-rendering.sh` checks native graph pixels through hover, selection, and collection changes, plus drawing-cache invalidation. The layout suite checks stable frames through navigation and interaction, native toolbar alignment and resizing.
 
 ## Scope and limits
 

@@ -113,7 +113,20 @@ final class DiscoveryReuse {
         init(_ lookup: @escaping (URL, StageCheckpoint) throws -> StageReuseCandidate?) { self.lookup = lookup }
 
         func candidate(for path: Data, root: Data, checkpoint: StageCheckpoint) throws -> StageReuseCandidate? {
+            lock.lock()
+            let cached = cachedCandidate(for: path, root: root)
+            lock.unlock()
+            if let cached { return cached }
+            guard path != root, let text = String(data: path, encoding: .utf8),
+                  let candidate = try lookup(URL(fileURLWithPath: text, isDirectory: true), checkpoint),
+                  Data(candidate.snapshot.rootURL.path.utf8) == path else { return nil }
             lock.lock(); defer { lock.unlock() }
+            if let cached = cachedCandidate(for: path, root: root) { return cached }
+            candidates[path] = candidate
+            return candidate
+        }
+
+        private func cachedCandidate(for path: Data, root: Data) -> StageReuseCandidate? {
             var ancestor = path
             while ancestor != root {
                 if let candidate = candidates[ancestor] { return candidate }
@@ -121,11 +134,7 @@ final class DiscoveryReuse {
                 if parent == ancestor { break }
                 ancestor = parent
             }
-            guard path != root, let text = String(data: path, encoding: .utf8),
-                  let candidate = try lookup(URL(fileURLWithPath: text, isDirectory: true), checkpoint),
-                  Data(candidate.snapshot.rootURL.path.utf8) == path else { return nil }
-            candidates[path] = candidate
-            return candidate
+            return nil
         }
     }
 
@@ -166,7 +175,9 @@ final class DiscoveryReuse {
         guard let candidate = try provider.candidate(for: directory.path, root: rootPath, checkpoint: checkpoint),
               Data(candidate.checkpoint.rootPath.utf8) == rootPath,
               candidate.checkpoint.identity == checkpoint.identity,
-              candidate.checkpoint.eventID <= min(checkpoint.eventID, candidate.snapshot.eventID) else { return nil }
+              candidate.checkpoint.eventID <= checkpoint.eventID,
+              candidate.historyValidation == .verifiedThroughParentCheckpoint
+                || candidate.checkpoint.eventID <= candidate.snapshot.eventID else { return nil }
         let source = try StageReuseSource(candidate, cache: cache, parentRoot: root,
                                           parentIdentity: identity, cancellation: cancellation, waitForLocks: false)
         guard let listing = try source.listing(directory, allowSmall: true) else { return nil }

@@ -15,7 +15,7 @@ jobs:
       - name: Show Swift toolchain
         run: swift --version
       - name: Check portable core logic
-        run: ./check-portable-core.sh
+        run: ./scripts/checks/check-portable-core.sh
       - name: Check release validation
         run: python3 scripts/test-release.py
   check:
@@ -53,4 +53,4 @@ jobs:
           xcodebuild -version
           swift --version
       - name: Run ${{ matrix.name }} checks
-        run: ./scripts/check-ci.sh '${{ matrix.suite }}'
+        run: ./scripts/checks/check-ci.sh '${{ matrix.suite }}'

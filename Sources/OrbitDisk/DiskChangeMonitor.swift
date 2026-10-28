@@ -67,17 +67,46 @@ final class DiskChangeMonitor {
         let source = try DiskEventPlan.inspect(root: snapshot.rootURL)
         let parent = try DiskEventPlan.inspect(root: URL(fileURLWithPath: checkpoint.rootPath, isDirectory: true))
         guard source.supportsReplay, parent.supportsReplay,
-              source.relativePath != nil, parent.relativePath != nil,
-              source.device == parent.device, source.mountPath == parent.mountPath,
               source.checkpoint.identity == snapshot.eventIdentity,
               parent.checkpoint.identity == checkpoint.identity,
-              snapshot.eventID <= source.checkpoint.eventID,
-              try JSONDecoder().decode(EventStream.self, from: Data(source.checkpoint.identity.utf8))
-                  == JSONDecoder().decode(EventStream.self, from: Data(parent.checkpoint.identity.utf8)) else { return nil }
-        return StageReuseCandidate(snapshot: snapshot,
-            checkpoint: StageCheckpoint(rootPath: checkpoint.rootPath, identity: checkpoint.identity,
-                                        eventID: min(checkpoint.eventID, snapshot.eventID)))
+              snapshot.eventID <= source.checkpoint.eventID else { return nil }
+        let sourceStream = try JSONDecoder().decode(EventStream.self, from: Data(source.checkpoint.identity.utf8))
+        let parentStream = try JSONDecoder().decode(EventStream.self, from: Data(parent.checkpoint.identity.utf8))
+        if source.relativePath != nil, parent.relativePath != nil,
+           source.device == parent.device, source.mountPath == parent.mountPath, sourceStream == parentStream {
+            return StageReuseCandidate(snapshot: snapshot,
+                checkpoint: StageCheckpoint(rootPath: checkpoint.rootPath, identity: checkpoint.identity,
+                                            eventID: min(checkpoint.eventID, snapshot.eventID)))
+        }
+        guard parent.rootPath == "/", parent.relativePath == nil, source.relativePath != nil,
+              checkpoint.eventID <= parent.checkpoint.eventID,
+              source.mountPath == "/System/Volumes/Data", sourceStream.volumes.count == 1,
+              parentStream.volumes.contains(sourceStream.volumes[0]),
+              try MappingCoverage.canReach(root: URL(fileURLWithPath: "/"), target: snapshot.rootURL,
+                  expectedRootIdentity: "\(parent.device):\(parent.rootFileID)"),
+              validateReuseHistory(source, since: snapshot.eventID),
+              try DiskEventPlan.inspect(root: snapshot.rootURL).checkpoint.identity == snapshot.eventIdentity,
+              try DiskEventPlan.inspect(root: URL(fileURLWithPath: "/")).checkpoint.identity == checkpoint.identity else { return nil }
+        // Device and host cursors are never compared; the child's history has already been checked.
+        return StageReuseCandidate(snapshot: snapshot, checkpoint: checkpoint, historyValidation: .verifiedThroughParentCheckpoint)
     }
+
+    nonisolated private static func validateReuseHistory(_ plan: DiskEventPlan, since: UInt64) -> Bool {
+        #if ORBIT_TESTING
+        if let testReuseHistoryValidator { return testReuseHistoryValidator(URL(fileURLWithPath: plan.rootPath), since) }
+        #endif
+        return ReuseHistoryProbe.validate(plan: plan, since: since, timeout: 0.2)
+    }
+
+    #if ORBIT_TESTING
+    nonisolated(unsafe) static var testReuseHistoryValidator: ((URL, UInt64) -> Bool)?
+    nonisolated static func testReuseHistory(root: URL, since: UInt64, timeout: TimeInterval = 0.2) throws -> Bool {
+        ReuseHistoryProbe.validate(plan: try DiskEventPlan.inspect(root: root), since: since, timeout: timeout)
+    }
+    nonisolated static func testReuseHistoryDecision(flags: [FSEventStreamEventFlags], flushed: Bool, expired: Bool = false) -> Bool {
+        ReuseHistoryProbe.testDecision(flags: flags, flushed: flushed, expired: expired)
+    }
+    #endif
     #endif
 
     init(root: URL, excluding: [URL] = []) throws {
@@ -213,6 +242,102 @@ final class DiskChangeMonitor {
                                  historyFinished: result.historyFinished, checkpoint: checkpoint))
     }
 
+}
+
+private final class ReuseHistoryProbe: @unchecked Sendable {
+    private static let slots = DispatchSemaphore(value: 2)
+    private let lock = NSLock()
+    private let completion = DispatchSemaphore(value: 0)
+    private let historyCompletion = DispatchSemaphore(value: 0)
+    private var active = true
+    private var historyFinished = false
+    private var changed = false
+    private var accepted = false
+
+    private var pending: Bool { lock.lock(); defer { lock.unlock() }; return active }
+
+    private func receive(_ flags: UnsafeBufferPointer<FSEventStreamEventFlags>) {
+        lock.lock(); defer { lock.unlock() }
+        guard active else { return }
+        for flag in flags {
+            let history = FSEventStreamEventFlags(kFSEventStreamEventFlagHistoryDone)
+            if flag == history {
+                if !historyFinished { historyCompletion.signal() }
+                historyFinished = true
+            }
+            else { changed = true }
+        }
+    }
+
+    private func finish(_ valid: Bool) {
+        lock.lock()
+        guard active else { lock.unlock(); return }
+        accepted = valid && historyFinished && !changed
+        active = false
+        lock.unlock()
+        completion.signal()
+    }
+
+    private func wait(timeout: TimeInterval) -> Bool {
+        let signalled = completion.wait(timeout: .now() + timeout) == .success
+        lock.lock(); defer { lock.unlock() }
+        active = false
+        return signalled && accepted
+    }
+
+    #if ORBIT_TESTING
+    static func testDecision(flags: [FSEventStreamEventFlags], flushed: Bool, expired: Bool) -> Bool {
+        let probe = ReuseHistoryProbe()
+        if expired { _ = probe.wait(timeout: 0) }
+        flags.withUnsafeBufferPointer { probe.receive($0) }
+        probe.finish(flushed)
+        return probe.wait(timeout: 0)
+    }
+    #endif
+
+    static func validate(plan: DiskEventPlan, since: UInt64, timeout: TimeInterval) -> Bool {
+        guard timeout > 0, plan.relativePath != nil, plan.supportsReplay,
+              since != UInt64(kFSEventStreamEventIdSinceNow), since <= plan.checkpoint.eventID,
+              slots.wait(timeout: .now()) == .success else { return false }
+        let probe = ReuseHistoryProbe()
+        let deadline = DispatchTime.now() + timeout
+        // Stream creation and flushing may block; discovery gives up after its small replay budget.
+        DispatchQueue.global(qos: .utility).async {
+            defer { probe.finish(false); slots.signal() }
+            guard probe.pending else { return }
+            var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(probe).toOpaque(),
+                retain: { pointer in
+                    guard let pointer else { return nil }
+                    _ = Unmanaged<ReuseHistoryProbe>.fromOpaque(pointer).retain()
+                    return pointer
+                }, release: { pointer in
+                    if let pointer { Unmanaged<ReuseHistoryProbe>.fromOpaque(pointer).release() }
+                }, copyDescription: nil)
+            let callback: FSEventStreamCallback = { _, info, count, _, flags, _ in
+                guard let info else { return }
+                Unmanaged<ReuseHistoryProbe>.fromOpaque(info).takeUnretainedValue()
+                    .receive(UnsafeBufferPointer(start: flags, count: count))
+            }
+            let options = FSEventStreamCreateFlags(kFSEventStreamCreateFlagUseCFTypes
+                | kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagWatchRoot | kFSEventStreamCreateFlagNoDefer)
+            guard let stream = FSEventStreamCreateRelativeToDevice(nil, callback, &context, plan.device,
+                [plan.relativePath!] as CFArray, since, 0, options) else { return }
+            var started = false
+            defer {
+                if started { FSEventStreamStop(stream) }
+                FSEventStreamInvalidate(stream); FSEventStreamRelease(stream)
+            }
+            let callbacks = DispatchQueue(label: "OrbitDisk.ReuseHistory", qos: .utility)
+            FSEventStreamSetDispatchQueue(stream, callbacks)
+            guard probe.pending, FSEventStreamStart(stream) else { return }
+            started = true
+            guard probe.historyCompletion.wait(timeout: deadline) == .success, probe.pending else { return }
+            // A history sentinel alone does not prove that latency-buffered live events were delivered.
+            FSEventStreamFlushSync(stream)
+            probe.finish(plan.rootIdentityIsValid())
+        }
+        return probe.wait(timeout: timeout)
+    }
 }
 
 private struct EventOverflow {
@@ -530,6 +655,7 @@ private struct DiskEventPlan: Sendable {
         let mode: String
         let hostID: String?
         let volumes: [Volume]
+        let bootTraversal: Int?
     }
 
     let rootPath: String
@@ -583,15 +709,22 @@ private struct DiskEventPlan: Sendable {
                 .map(volume).filter { $0.volumeUUID != nil || $0.eventsUUID != nil }
                 .sorted { $0.mountPath < $1.mountPath }
         }
-        // The scanner skips mounted subtrees; boot helper volumes have no journals to replay.
+        // Boot helper volumes have no journals; the verified Data volume is part of whole-Mac mapping.
         let supportsReplay = !volumes.isEmpty && volumes.allSatisfy { $0.volumeUUID != nil }
             && (relative != nil ? volumes[0].eventsUUID != nil
                 : hostID != nil && volumes.contains { $0.eventsUUID != nil })
-        let untrackedMounts = relative == nil && rootPath == "/"
+        var untrackedMounts = relative == nil && rootPath == "/"
             ? volumes.map(\.mountPath).filter { $0 != "/" } : []
+        #if canImport(OrbitCore)
+        if rootPath == "/", (try? MappingCoverage.canReach(root: root,
+            target: URL(fileURLWithPath: "/System/Volumes/Data"),
+            expectedRootIdentity: "\(metadata.st_dev):\(metadata.st_ino)")) == true {
+            untrackedMounts.removeAll { $0 == "/System/Volumes/Data" }
+        }
+        #endif
         let fingerprint = Identity(rootPath: rootPath, canonicalRoot: canonicalRoot,
                                    rootFileID: metadata.st_ino, mode: relative == nil ? "host" : "device",
-                                   hostID: hostID, volumes: volumes)
+                                   hostID: hostID, volumes: volumes, bootTraversal: rootPath == "/" ? 2 : nil)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         let identity = String(decoding: try encoder.encode(fingerprint), as: UTF8.self)
@@ -867,6 +1000,11 @@ extension DiskChangeMonitor {
             untrackedMounts: [], device: p.device, rootFileID: p.rootFileID,
             supportsReplay: p.supportsReplay, checkpoint: p.checkpoint) : p
         return NormalizedEventBatch.prepare(plan: plan, excluded: [], paths: [event], flags: [0], ids: [1], isCurrent: { true })!.fullRefresh
+    }
+
+    nonisolated static func testBatchDirectories(root: URL, event: String) throws -> Set<String> {
+        NormalizedEventBatch.prepare(plan: try DiskEventPlan.inspect(root: root), excluded: [],
+            paths: [event], flags: [0], ids: [1], isCurrent: { true })!.directories
     }
 
     nonisolated static func testNormalizeBatch(root: URL, events: [String]) throws -> [String?] {

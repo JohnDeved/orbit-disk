@@ -3,10 +3,12 @@ import Darwin
 import Foundation
 
 public struct StageReuseCandidate: Sendable {
+    public enum HistoryValidation: Sendable { case sharedStream, verifiedThroughParentCheckpoint }
     public let snapshot: IndexSnapshot
     public let checkpoint: StageCheckpoint
-    public init(snapshot: IndexSnapshot, checkpoint: StageCheckpoint) {
-        self.snapshot = snapshot; self.checkpoint = checkpoint
+    public let historyValidation: HistoryValidation
+    public init(snapshot: IndexSnapshot, checkpoint: StageCheckpoint, historyValidation: HistoryValidation = .sharedStream) {
+        self.snapshot = snapshot; self.checkpoint = checkpoint; self.historyValidation = historyValidation
     }
 }
 

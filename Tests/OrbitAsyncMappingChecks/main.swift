@@ -27,6 +27,7 @@ import Foundation
         let base = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
         try SecureCursorChecks.run(base)
         try DiscoveryHotPathChecks.run(base)
+        try MappingProgressChecks.run(base)
         try MetadataBookkeepingChecks.run(base)
         try BoundedChildrenChecks.run(base)
         try automaticSelection(base)

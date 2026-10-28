@@ -17,6 +17,8 @@ final class DiscoveryScheduler: @unchecked Sendable {
     private var frontier: [DiscoveryDirectory]
     private var frontierBytes: Int
     private var active = 0
+    private var completed = 0
+    private var recentChildren: Double = 0
     private var nextTicket: Int64 = 0
     private var cancelled = false
     private var lastPreference: Data?
@@ -45,7 +47,8 @@ final class DiscoveryScheduler: @unchecked Sendable {
         let directory = frontier.remove(at: selected)
         frontierBytes -= directory.byteCount; active += 1
         let job = Job(ticket: nextTicket, directory: directory); nextTicket += 1
-        mailbox.updateFrontier(count: frontier.count, bytes: frontierBytes)
+        mailbox.updateFrontier(count: frontier.count, bytes: frontierBytes, active: active,
+                               completed: completed, recentChildren: recentChildren)
         return job
     }
 
@@ -53,9 +56,12 @@ final class DiscoveryScheduler: @unchecked Sendable {
         condition.lock(); defer { condition.unlock() }
         active -= 1
         if !cancelled {
+            completed += 1
+            recentChildren = completed == 1 ? Double(children.count) : recentChildren * 0.875 + Double(children.count) * 0.125
             frontier.append(contentsOf: children)
             frontierBytes += children.reduce(0) { $0 + $1.byteCount }
-            mailbox.updateFrontier(count: frontier.count, bytes: frontierBytes)
+            mailbox.updateFrontier(count: frontier.count, bytes: frontierBytes, active: active,
+                                   completed: completed, recentChildren: recentChildren)
         }
         condition.broadcast()
     }

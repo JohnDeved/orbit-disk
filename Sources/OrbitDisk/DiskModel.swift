@@ -11,6 +11,39 @@ struct DiskVolume: Identifiable, Sendable {
     var id: String { url.path }
 }
 
+struct MappingProgressPresentation: Equatable {
+    enum Phase: Equatable { case finding, saving, finishing, saved, updating, paused, interrupted }
+
+    var rootName: String
+    var discoveredFiles: Int
+    var cachedFiles: Int?
+    var discoveryFraction: Double?
+    var discoveryState: String
+    var discoveryDetail: String
+    var cacheFraction: Double?
+    var cacheState: String
+    var cacheDetail: String
+    var isDiscovering: Bool
+    var isPaused: Bool
+    var phase: Phase = .finding
+
+    var savedShare: Double? {
+        guard discoveredFiles >= 0, let cachedFiles, cachedFiles >= 0, cachedFiles <= discoveredFiles else { return nil }
+        guard discoveredFiles > 0 else { return phase == .saved ? 1 : nil }
+        return min(1, max(0, Double(cachedFiles) / Double(discoveredFiles)))
+    }
+
+    static func estimatedDiscoveryState(_ fraction: Double) -> String {
+        guard fraction.isFinite else { return "Estimating…" }
+        if fraction > 0, fraction < 0.01 { return "<1% estimated" }
+        return "\(Int(min(0.99, max(0, fraction)) * 100))% estimated"
+    }
+}
+
+@MainActor final class MappingProgressState: ObservableObject {
+    @Published var value: MappingProgressPresentation?
+}
+
 private struct IndexedFolder: Sendable {
     let root: DiskNode
     let folder: DiskNode
@@ -84,7 +117,22 @@ private final class CollectionEditQueue {
 private final class SessionProgress: @unchecked Sendable {
     private let lock = NSLock()
     private var value: ScanProgress?
-    func set(_ next: ScanProgress) { lock.lock(); value = next; lock.unlock() }
+    private var deliveryPending = false
+    @discardableResult func set(_ next: ScanProgress) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if let prior = value?.mapping, let incoming = next.mapping, prior.revision > incoming.revision { return false }
+        value = next
+        return true
+    }
+    func requestDelivery() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !deliveryPending else { return false }
+        deliveryPending = true; return true
+    }
+    func takeDelivery() -> ScanProgress? {
+        lock.lock(); defer { lock.unlock() }
+        deliveryPending = false; return value
+    }
     func read() -> ScanProgress? { lock.lock(); defer { lock.unlock() }; return value }
 }
 private struct RemovalKey: Hashable {
@@ -149,6 +197,10 @@ private final class MappingSession {
     let token: ScanCancellation
     var preview: DiskScanPreview?
     let progress = SessionProgress()
+    var discoveredFileCount = 0
+    var cachedFileCount: Int?
+    var progressPreview: DiskScanPreview?
+    var progressPreviewTask: Task<Void, Never>?
     var lastRoute: String?
     var rememberedFolder: RememberedFolder?
     var savedSnapshot: IndexSnapshot?
@@ -517,6 +569,11 @@ final class DiskModel: ObservableObject {
     private var statusMessageRevision: UInt64 = 0
     private var errorMessageRevision: UInt64 = 0
     #if ORBIT_TESTING
+    static func testCoalescedProgress(_ values: [ScanProgress]) -> ScanProgress? {
+        let cell = SessionProgress()
+        for value in values { cell.set(value) }
+        return cell.takeDelivery()
+    }
     var testBeforeSessionReopen: @Sendable () async -> Void = {}
     var testForceCollectionFailure = false
     func testSetTransferFeedback(_ url: URL) {
@@ -570,19 +627,143 @@ final class DiskModel: ObservableObject {
         }
     }
     var selectedID: String? { willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 } }
-    var isScanning = false { willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 } }
+    var isScanning = false {
+        willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 }
+        didSet { if !atomicFolderInstall { refreshMappingProgress() } }
+    }
     private(set) var isPartialMap = false { willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 } }
-    var isRefreshing = false { willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 } }
+    var isRefreshing = false {
+        willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 }
+        didSet { if !atomicFolderInstall { refreshMappingProgress() } }
+    }
     var isOpeningFolder = false { willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 } }
     @Published var scanTitle = "Mapping your files…"
-    @Published var scanPath = ""
-    @Published var progressCount = 0
-    @Published var progressBytes: Int64 = 0
+    var scanPath = ""
+    var progressCount = 0
+    var progressBytes: Int64 = 0
+    let mappingProgressState = MappingProgressState()
+    var mappingProgress: MappingProgressPresentation? { mappingProgressState.value }
     var scanResult: ScanResult? { willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 } }
     var indexedAt: Date? { willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 } }
     var isSavedMap = false { willSet { if !atomicFolderInstall { objectWillChange.send() }; folderStateVersion &+= 1 } }
     private var updatesPausedRevision: UInt64 = 0
-    var updatesPaused = false { willSet { if !atomicFolderInstall { objectWillChange.send() }; updatesPausedRevision &+= 1 } }
+    var updatesPaused = false {
+        willSet { if !atomicFolderInstall { objectWillChange.send() }; updatesPausedRevision &+= 1 }
+        didSet { if !atomicFolderInstall { refreshMappingProgress() } }
+    }
+
+    private func receiveProgress(_ progress: ScanProgress, session: MappingSession) {
+        guard activeSessionID == session.id, sessions[session.url.path] === session,
+              !session.token.isCancelled, !session.finished else { return }
+        // Once the explorer is visible, only the small progress view observes these ticks.
+        if root == nil { objectWillChange.send() }
+        guard activeSessionID == session.id, sessions[session.url.path] === session,
+              !session.token.isCancelled, !session.finished else { return }
+        progressCount = progress.itemCount; progressBytes = progress.bytesScanned; scanPath = progress.currentPath
+        refreshMappingProgress()
+    }
+
+    private func refreshMappingProgress() {
+        guard !atomicFolderInstall else { return }
+        guard let session = sessions.values.first(where: { $0.id == activeSessionID }) else {
+            if mappingProgressState.value != nil { mappingProgressState.value = nil }
+            return
+        }
+        let progress = session.progress.read()?.mapping
+        if let cached = progress?.cachedFileCount, !session.finished { session.cachedFileCount = cached }
+        let checking = session.finished && isRefreshing
+        let pendingRemoval = session.isRemoving || session.durableRecoveryPending || session.durableRecoveryConflict
+            || session.durablePreviewBlocked || !session.removals.isEmpty || !session.removalParents.isEmpty
+        let pendingRefresh = session.finished && (checking || pendingFullRefresh || !pendingDirectories.isEmpty
+            || session.pendingFullRefresh || !session.pendingDirectories.isEmpty)
+        let updating = pendingRemoval || pendingRefresh
+        let paused = !session.finished && (session.token.isCancelled || session.scanFailed)
+        let complete = session.finished || progress?.discoveryComplete == true
+        let phase: MappingProgressPresentation.Phase
+        if session.scanFailed { phase = .interrupted }
+        else if paused || (updatesPaused && updating) { phase = .paused }
+        else if !complete { phase = .finding }
+        else if updating { phase = .updating }
+        else if session.finished { phase = .saved }
+        else if progress?.cacheFinishing == true { phase = .finishing }
+        else { phase = .saving }
+        let shownCachedFiles = updating || (session.cachedFileCount.map { $0 > session.discoveredFileCount } ?? false)
+            ? nil : session.cachedFileCount
+        let fraction = complete ? 1 : progress?.discoveryFraction
+        let discoveryState: String
+        let detail: String
+        if checking {
+            discoveryState = "Checking changes"; detail = "Saved map available"
+        } else if complete {
+            discoveryState = "Complete"; detail = "Discovery complete"
+        } else if paused {
+            discoveryState = "Stopped"; detail = "Progress kept"
+        } else if let fraction, fraction.isFinite {
+            discoveryState = MappingProgressPresentation.estimatedDiscoveryState(fraction)
+            switch progress?.estimateBasis {
+            case .previousMap: detail = "From previous map"
+            case .revised: detail = "More files than expected"
+            default: detail = "From this scan"
+            }
+        } else {
+            discoveryState = "Estimating…"; detail = "Discovering files"
+        }
+        let cacheState: String
+        let cacheFraction: Double?
+        if checking {
+            cacheState = "Updating cache"; cacheFraction = nil
+        } else if session.finished {
+            cacheState = "Saved"; cacheFraction = 1
+        } else if session.scanFailed {
+            cacheState = "Interrupted"; cacheFraction = progress?.cacheFraction
+        } else if paused {
+            cacheState = "Stopped"; cacheFraction = progress?.cacheFraction
+        } else if progress?.cacheFinishing == true {
+            cacheState = "Finishing cache"; cacheFraction = progress?.cacheFraction
+        } else {
+            cacheState = session.cachedFileCount == nil ? "Reading cache" : "Saving changes"
+            cacheFraction = progress?.cacheFraction
+        }
+        let presentation = MappingProgressPresentation(
+            rootName: session.url == FileManager.default.homeDirectoryForCurrentUser ? "Home"
+                : volumes.first(where: { $0.url.path == session.url.path })?.name ?? session.url.lastPathComponent,
+            discoveredFiles: session.discoveredFileCount, cachedFiles: shownCachedFiles,
+            discoveryFraction: fraction, discoveryState: discoveryState, discoveryDetail: detail,
+            cacheFraction: cacheFraction, cacheState: cacheState,
+            cacheDetail: session.scanFailed ? "Retry mapping" : (!session.finished && !paused && cacheFraction != nil ? "Known changes" : ""),
+            isDiscovering: !complete && !paused, isPaused: paused, phase: phase)
+        if mappingProgressState.value != presentation { mappingProgressState.value = presentation }
+    }
+
+    private func observeMappingCount(_ preview: DiskScanPreview, session: MappingSession) {
+        session.progressPreviewTask?.cancel()
+        session.progressPreviewTask = nil
+        session.progressPreview = preview
+        guard activeSessionID == session.id, !session.finished, !session.token.isCancelled else { return }
+        let updates = preview.updates
+        session.progressPreviewTask = Task { [weak self, weak session] in
+            var lastRead: TimeInterval = 0
+            for await _ in updates {
+                guard !Task.isCancelled, let self, let session,
+                      self.sessions[session.url.path] === session, !session.finished, !session.token.isCancelled else { return }
+                // The visible preview already supplies this count; retained maps need only a root read.
+                guard self.activeSessionID == session.id, session.preview == nil else { continue }
+                let delay = 0.5 - (ProcessInfo.processInfo.systemUptime - lastRead)
+                if delay > 0 { do { try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) } catch { return } }
+                guard !Task.isCancelled, !session.finished, !session.token.isCancelled else { return }
+                lastRead = ProcessInfo.processInfo.systemUptime
+                let removals = session.removals, epoch = session.removalEpoch, token = session.token
+                let count = try? await Task.detached(priority: .utility) {
+                    try preview.discoveredFileCount(removals: removals, cancellation: token)
+                }.value
+                guard !Task.isCancelled, self.sessions[session.url.path] === session,
+                      !session.finished, !token.isCancelled, session.removalEpoch == epoch,
+                      self.activeSessionID == session.id, session.preview == nil, let count else { continue }
+                session.discoveredFileCount = count
+                if self.activeSessionID == session.id { self.refreshMappingProgress() }
+            }
+        }
+    }
     private var suppressCollectionFeedbackInvalidation = false
     private func activeFeedbackSession() -> MappingSession? {
         guard !suppressCollectionFeedbackInvalidation, let root, let session = sessions[root.id], session.id == activeSessionID,
@@ -796,7 +977,9 @@ final class DiskModel: ObservableObject {
         willSet { if !atomicFolderInstall { objectWillChange.send() } }
         didSet { if !showCollection { collectionConfirmation = nil } }
     }
-    @Published var isRemoving = false
+    @Published var isRemoving = false {
+        didSet { if !atomicFolderInstall { refreshMappingProgress() } }
+    }
     @Published private(set) var isRemovingAcrossSessions = false
     private var activeRemovalIDs = Set<UUID>()
     private var removalReceipts: [UUID: AutomationRemovalReceipt] = [:]
@@ -874,7 +1057,20 @@ final class DiskModel: ObservableObject {
     private var scanCancellation: ScanCancellation?
     private var searchCancellation: ScanCancellation?
     private var sessions: [String: MappingSession] = [:]
-    private var activeSessionID: UUID?
+    private var activeSessionID: UUID? {
+        didSet {
+            if oldValue != activeSessionID {
+                if let previous = sessions.values.first(where: { $0.id == oldValue }) {
+                    previous.progressPreviewTask?.cancel(); previous.progressPreviewTask = nil
+                }
+                if let session = sessions.values.first(where: { $0.id == activeSessionID }),
+                   let preview = session.progressPreview {
+                    observeMappingCount(preview, session: session)
+                }
+            }
+            refreshMappingProgress()
+        }
+    }
     private var resolutionID = UUID()
     private var resolutionWorker: Task<(URL, String?, String?, Bool, String?), Never>?
     private var generation = UUID()
@@ -958,8 +1154,12 @@ final class DiskModel: ObservableObject {
     private var monitor: DiskChangeMonitor?
     private var monitorTask: Task<Void, Never>?
     private var removalJournalTask: Task<Void, Never>?
-    private var pendingDirectories = Set<String>()
-    private var pendingFullRefresh = false
+    private var pendingDirectories = Set<String>() {
+        didSet { if !atomicFolderInstall { refreshMappingProgress() } }
+    }
+    private var pendingFullRefresh = false {
+        didSet { if !atomicFolderInstall { refreshMappingProgress() } }
+    }
     private var pendingCheckpoint: DiskChangeCheckpoint?
     private var nodesByID: [String: DiskNode] = [:]
     private var searchNodesByID: [String: DiskNode] = [:]
@@ -1017,7 +1217,7 @@ final class DiskModel: ObservableObject {
               preview?.removalReplayReadiness()?.generation == readiness?.generation,
               preview?.removalReplayReadiness()?.blocked == readiness?.blocked else { return false }
         atomicFolderInstall = true
-        defer { atomicFolderInstall = false }
+        defer { atomicFolderInstall = false; refreshMappingProgress() }
         root = nil; navigation = []; nodesByID.removeAll()
         if clearSelection { selectedID = nil; searchNodesByID.removeAll(); childColorIndices.removeAll(); colorMappingRevision = UUID() }
         return true
@@ -1040,7 +1240,7 @@ final class DiskModel: ObservableObject {
               preview?.removalReplayReadiness()?.generation == readiness?.generation,
               preview?.removalReplayReadiness()?.blocked == readiness?.blocked else { return false }
         atomicFolderInstall = true
-        defer { atomicFolderInstall = false }
+        defer { atomicFolderInstall = false; refreshMappingProgress() }
         action()
         return true
     }
@@ -1422,6 +1622,13 @@ final class DiskModel: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url { scan(url) }
     }
 
+    nonisolated static func needsBootTraversalPreview(rootPath: String, eventIdentity: String) -> Bool {
+        guard rootPath == "/",
+              let identity = try? JSONSerialization.jsonObject(with: Data(eventIdentity.utf8)) as? [String: Any],
+              identity["rootPath"] as? String == "/", identity["mode"] as? String == "host" else { return false }
+        return identity["bootTraversal"] == nil || identity["bootTraversal"] as? Int == 1
+    }
+
     func scan(_ url: URL, force: Bool = false) {
         let requestedURL = url.standardizedFileURL
         if root?.id != requestedURL.path { clearCollectionDrag() }
@@ -1627,7 +1834,10 @@ final class DiskModel: ObservableObject {
         if let prior { prior.token.cancel(); prior.worker?.cancel(); sessions.removeValue(forKey: url.path) }
         let token = ScanCancellation()
         scanCancellation = token
-        let keepMap = sameRoot && snapshot != nil && !isPartialMap
+        let upgradingBootTraversal = sameRoot && snapshot.map {
+            Self.needsBootTraversalPreview(rootPath: $0.rootURL.path, eventIdentity: $0.eventIdentity)
+        } == true
+        let keepMap = sameRoot && snapshot != nil && !isPartialMap && !upgradingBootTraversal
         isScanning = !keepMap
         isRefreshing = keepMap
         updatesPaused = false
@@ -1667,7 +1877,10 @@ final class DiskModel: ObservableObject {
             session.removalEpoch = prior.removalEpoch; session.removalStatus = prior.removalStatus
             session.rememberedFolder = prior.rememberedFolder
             if !force, let progress = prior.progress.read() {
-                session.progress.set(progress)
+                session.progress.set(ScanProgress(itemCount: progress.itemCount, bytesScanned: progress.bytesScanned,
+                                                  currentPath: progress.currentPath))
+                session.discoveredFileCount = prior.discoveredFileCount
+                session.cachedFileCount = prior.cachedFileCount
                 progressCount = progress.itemCount; progressBytes = progress.bytesScanned; scanPath = progress.currentPath
             }
             session.removalError = prior.removalError
@@ -1684,7 +1897,7 @@ final class DiskModel: ObservableObject {
         pendingCheckpoint = session.pendingCheckpoint; session.pendingCheckpoint = nil
         pendingFullRefresh = session.pendingFullRefresh; session.pendingFullRefresh = false
         showCollection = false
-        if keepMap { session.savedSnapshot = snapshot; session.lastRoute = desiredPath }
+        if keepMap || upgradingBootTraversal { session.savedSnapshot = snapshot; session.lastRoute = desiredPath }
         if let prior, prior.collectionValidation != nil {
             prior.collectionValidation?.token.cancel()
             prior.collectionValidation?.task?.cancel()
@@ -1822,8 +2035,11 @@ final class DiskModel: ObservableObject {
                     if token.isCancelled { throw CancellationError() }
                 }
             }
+            let upgradesCachedBootTraversal = existing.map {
+                Self.needsBootTraversalPreview(rootPath: $0.0.rootURL.path, eventIdentity: $0.0.eventIdentity)
+            } == true
             if !force, !hasStage, let existing { return (existing.0, existing.1, true) }
-            if let existing, hasStage, !keepMap, !force {
+            if let existing, hasStage, !keepMap, !force, !upgradesCachedBootTraversal {
                 await MainActor.run {
                     guard model.sessions[url.path] === session else { return }
                     session.savedSnapshot = existing.0
@@ -1853,7 +2069,8 @@ final class DiskModel: ObservableObject {
                 stage = try ResumableStage(cache: store.directory, stagingDirectory: stagingDirectory, root: url, current: checkpoint, cancellation: token)
             }
             if let stage {
-                if !force {
+                stage.configureProgress(previousFileCount: existing?.1.root.fileCount)
+                if !force || upgradingBootTraversal || upgradesCachedBootTraversal {
                     stage.configureReuse { directory, checkpoint in
                         guard let saved = store.savedSnapshot(for: directory, waitForLocks: false) else { return nil }
                         return try DiskChangeMonitor.reuseCandidate(saved, for: checkpoint)
@@ -1863,18 +2080,19 @@ final class DiskModel: ObservableObject {
                 stage.configureTestScanner(scanner)
                 #endif
                 stageConfigurer(stage)
-                let reportProgress: @Sendable (ScanProgress) -> Void = { [weak model] progress in
-                    progressCell.set(progress)
-                    Task { @MainActor [weak model] in
-                        guard let model, model.activeSessionID == sessionID, !token.isCancelled else { return }
-                        model.progressCount = progress.itemCount
-                        model.progressBytes = progress.bytesScanned
-                        model.scanPath = progress.currentPath
+                let reportProgress: @Sendable (ScanProgress) -> Void = { [weak model, weak session] progress in
+                    guard progressCell.set(progress), progressCell.requestDelivery() else { return }
+                    Task { @MainActor [weak model, weak session] in
+                        guard let latest = progressCell.takeDelivery(), let model, let session else { return }
+                        model.receiveProgress(latest, session: session)
                     }
                 }
                 try stage.startDiscovery(progress: reportProgress)
-                preview?.attach(stage: stage)
+                let countPreview = preview ?? DiskScanPreview()
+                countPreview.attach(stage: stage)
                 await MainActor.run {
+                    guard model.sessions[url.path] === session, !token.isCancelled else { return }
+                    model.observeMappingCount(countPreview, session: session)
                     guard model.activeSessionID == sessionID, !token.isCancelled else { return }
                     model.scanTitle = "Mapping your files…"
                     if let preview, session.preview != nil, model.scanPreview !== preview {
@@ -1896,13 +2114,18 @@ final class DiskModel: ObservableObject {
                     }
                 }, onCancel: { token.cancel() })
                 if let preview { await model.readPreview(preview, scanID: await model.generation, token: token, force: true) }
-                let saved = try stage.publish(elapsed: ProcessInfo.processInfo.systemUptime - started)
+                let saved = try stage.publish(elapsed: ProcessInfo.processInfo.systemUptime - started, progress: reportProgress)
                 return (saved, try indexedFolder(desiredPath, store: store, snapshot: saved, colors: colors, cancellation: token), false)
             }
             throw DiskIndexError.invalid("The resumable mapping stage is unavailable.")
             } catch {
                 await MainActor.run {
-                    if model.sessions[url.path] === session { session.scanFailed = true }
+                    if model.sessions[url.path] === session {
+                        session.scanFailed = true
+                        session.progressPreviewTask?.cancel(); session.progressPreviewTask = nil
+                        session.progressPreview = nil
+                        if model.activeSessionID == session.id { model.refreshMappingProgress() }
+                    }
                 }
                 throw error
             }
@@ -1913,8 +2136,13 @@ final class DiskModel: ObservableObject {
                   self.sessions[url.path] === session, !token.isCancelled else { return }
             session.savedSnapshot = result.0
             session.finished = true
+            session.progressPreviewTask?.cancel(); session.progressPreviewTask = nil
+            session.progressPreview = nil
+            session.cachedFileCount = result.1.root.fileCount
+            if session.removals.isEmpty { session.discoveredFileCount = result.1.root.fileCount }
             if session.removals.isEmpty && !session.isRemoving { session.preview = nil }
             session.worker = nil
+            if self.activeSessionID == session.id { self.refreshMappingProgress() }
         }
         observeSession(worker, scanID: scanID, token: token)
         if let preview, activeSessionID == session.id, generation == scanID, scanPreview !== preview {
@@ -1985,7 +2213,7 @@ final class DiskModel: ObservableObject {
                       self.root.map({ Data($0.id.utf8) }) == rootPath, self.root?.fileIdentity == rootIdentity else { return }
                 self.previewTask?.cancel(); self.previewTask = nil
                 self.atomicFolderInstall = true
-                defer { self.atomicFolderInstall = false }
+                defer { self.atomicFolderInstall = false; self.refreshMappingProgress() }
                 self.isScanning = false; self.isRefreshing = false
                 if self.resolutionWorker == nil { self.isOpeningFolder = false }
                 if self.errorMessageRevision == errorRevision { self.errorMessage = error.localizedDescription }
@@ -2355,6 +2583,11 @@ final class DiskModel: ObservableObject {
         if let url = root?.url ?? fallback { scan(url, force: true) }
     }
 
+    func resumeMapping() {
+        guard let session = sessions.values.first(where: { $0.id == activeSessionID }) else { return }
+        scan(session.url)
+    }
+
     private func beginRemovalJournalMonitoring(_ session: MappingSession) {
         removalJournalTask?.cancel()
         guard session.durableRecoveryCursor != nil else { return }
@@ -2661,7 +2894,7 @@ final class DiskModel: ObservableObject {
               scanPreview === preview, preview?.removalReplayReadiness()?.generation == replayGeneration,
               preview?.removalReplayReadiness()?.blocked != true, folderStateVersion == stateVersion else { return false }
         atomicFolderInstall = true
-        defer { atomicFolderInstall = false }
+        defer { atomicFolderInstall = false; refreshMappingProgress() }
         if needsReset { largeListIdentity &+= 1 }
         let preservesHover = current?.id == view.folder.id && root?.id == view.root.id
             && root?.fileIdentity == view.root.fileIdentity
@@ -2764,6 +2997,12 @@ final class DiskModel: ObservableObject {
         }
         if let session, session.id == activeSessionID,
            root.map({ Data($0.id.utf8) }) == Data(session.url.path.utf8), root?.fileIdentity == session.identity {
+            if isPartialMap, scanPreview === session.preview { session.discoveredFileCount = view.root.fileCount }
+            if completedScan != nil { session.finished = true }
+            if publishedSnapshot != nil, session.finished {
+                session.discoveredFileCount = view.root.fileCount
+                if session.removals.isEmpty { session.cachedFileCount = view.root.fileCount }
+            }
             session.rememberedFolder = RememberedFolder(folder: view, removalEpoch: session.removalEpoch, selection: selectedID)
             if let publishedSnapshot { session.savedSnapshot = publishedSnapshot }
             if statusMessage == nil, let status = session.collectionStatus {
