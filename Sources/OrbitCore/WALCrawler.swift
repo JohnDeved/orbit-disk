@@ -141,8 +141,7 @@ final class DurableCrawler {
                directory.device == first.parentIdentity.device, directory.inode == first.parentIdentity.inode {
                 do {
                     if asyncWriterCursor == nil { asyncWriterCursor = try SecureDirectoryCursor(root: root, rootURL: rootURL) }
-                    let descriptor = try asyncWriterCursor!.openDirectory(first.components)
-                    close(descriptor)
+                    try asyncWriterCursor!.validateDirectory(first.components)
                 }
                 catch { skipped = true }
             } else { skipped = true }
@@ -216,8 +215,7 @@ final class DurableCrawler {
                   try store.canCompleteFreshListing(parent: leaf.parentPath) else { break }
             do {
                 if asyncWriterCursor == nil { asyncWriterCursor = try SecureDirectoryCursor(root: root, rootURL: rootURL) }
-                let descriptor = try asyncWriterCursor!.openDirectory(leaf.components)
-                close(descriptor)
+                try asyncWriterCursor!.validateDirectory(leaf.components)
             } catch { break }
             listings.append(ListingStage.FreshLeafListing(directory: directory, records: leaf.records,
                 expectedRevision: leaf.expectedRevision, expectedFullGeneration: leaf.expectedFullGeneration,

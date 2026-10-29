@@ -85,7 +85,7 @@ final class SecureRoot {
     }
 }
 
-// Confined to one discovery worker. Cached descriptors are never trusted without
+// Confined to one worker. Cached descriptors are never trusted without
 // checking their current parent/name link against the queued directory identity.
 final class SecureDirectoryCursor {
     private struct Cached {
@@ -124,6 +124,24 @@ final class SecureDirectoryCursor {
     }
 
     func openDirectory(_ components: [DirectoryComponent]) throws -> Int32 {
+        let directory = try prepareDirectory(components)
+        if directory.owned { return directory.descriptor }
+        // dup() would share the cached descriptor's enumeration offset.
+        let result = openat(directory.descriptor, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard result >= 0 else {
+            let failure = errno
+            discard(after: 0)
+            throw SecureTraversalError.filesystem(failure)
+        }
+        return result
+    }
+
+    func validateDirectory(_ components: [DirectoryComponent]) throws {
+        let directory = try prepareDirectory(components)
+        if directory.owned { Darwin.close(directory.descriptor) }
+    }
+
+    private func prepareDirectory(_ components: [DirectoryComponent]) throws -> (descriptor: Int32, owned: Bool) {
         guard rootDescriptor >= 0 else { throw SecureTraversalError.filesystem(EBADF) }
         do {
             try root.validate(url: rootURL)
@@ -131,7 +149,7 @@ final class SecureDirectoryCursor {
                 #if ORBIT_TESTING
                 testFallbackCount += 1
                 #endif
-                return try root.openDirectory(components)
+                return (try root.openDirectory(components), true)
             }
             for component in components {
                 guard !component.name.isEmpty, component.name != ".", component.name != "..",
@@ -174,10 +192,7 @@ final class SecureDirectoryCursor {
                 cached.append(Cached(component: component, descriptor: next))
                 parent = next
             }
-            // dup() would share the cached descriptor's enumeration offset.
-            let result = openat(parent, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-            guard result >= 0 else { throw SecureTraversalError.filesystem(errno) }
-            return result
+            return (parent, false)
         } catch {
             discard(after: 0)
             throw error

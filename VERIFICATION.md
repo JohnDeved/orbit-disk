@@ -325,7 +325,7 @@ The v0.9.13 release gate caught a saved-state race after deleting the last file 
 - PASS: a synchronous progress observer reproduces premature completion against the tagged v0.9.13 model and passes with the fix. The full session harness also passes, including detached removal, navigation, interrupted mapping and progress ownership. This comparison used the same optimized core module, generated files and an unoptimized app-model harness.
 - PASS: 13 release-metadata checks, two updater-copy checks and version/build validation. v0.9.13 was blocked before publication; v0.9.14 includes the same changes plus this handoff fix.
 
-## Batched durable indexing (unreleased)
+## Batched durable indexing (0.9.15)
 
 - PASS, durable writer: all 57 checks cover grouped leaf commits, generation changes, queue traversal, staging locks, publication crashes and removal replay. Groups enforce folder, record and metadata limits plus a soft time budget. Stale identities, revisions, failures and cancellation roll back the group. Process termination before and after COMMIT preserves the matching record and mailbox watermark prefix. Hardlinks retain a single allocation charge. Four grouped listings prepare the record upsert once, and writer-owned reads are released before commit.
 - PASS, asynchronous mapping: the complete suite covers bounded group selection, a held writer, discovery beyond 131,072 entries in one listing, live browsing/removal while writes lag, cancellation, deletion during a group, reopened stages, identity replacement and crash recovery. Refresh generation changes no longer cause a second enumeration of every directory.
@@ -334,3 +334,15 @@ The v0.9.13 release gate caught a saved-state race after deleting the last file 
 - PASS, local app: the unreleased indexing build compiles and passes strict deep ad-hoc signature verification. It has not replaced the installed app or cleared its caches.
 
 These checks use isolated generated files and databases. They preserve SQLite FULL synchronization and the existing cache format. Performance measurements, raw samples, source hashes and reproduction commands are recorded in [the durable indexing benchmark](docs/benchmarks/durable-indexing.md). No whole-Mac throughput or rendered input-latency improvement is claimed.
+
+### Final fresh-file writer (0.9.15)
+
+- PASS, final durable core: all 59 checks pass, including duplicate names, stable row identities, file/directory replacement, hardlink accounting, mid-batch rollback, stale generations, cancellation, and process termination before and after empty-trim commit. The compact INSERT follows the existing transactional lookup; existing names retain the original UPSERT. Empty trims reuse the totals query rather than adding another scan.
+- PASS, final asynchronous core: all 30 checks pass, including live browsing and removal while the writer is held, backlog, restart recovery and secure cursor validation. Loader traces from the parent and four subprocesses verify the final core library; its SHA-256 is unchanged before and after execution.
+- PASS, final app model: session, resumable, app, large-collection and collection-removal checks pass. Durable removal passes its standard run and all eleven additional modes. Reused app-model clients load the final core explicitly; the app-model sources are unchanged.
+- PASS, cached-relaunch regression: a deterministic gate reproduces the previous test's premature saved-state assertion. The corrected test verifies that the cached map is visible and usable while its retained stage reopens, then waits for reopening to settle before checking saved state. No production model behavior changed.
+- PASS, local production bundle: 0.9.15/build 27 builds and passes strict deep ad-hoc signature verification. The installed application and personal caches were not changed.
+- PASS, release metadata: 13 validation tests, two updater-copy tests, version/build progression and whitespace checks pass.
+- PASS, independent review: no correctness findings in compact inserts, empty-trim acknowledgement or secure cursor descriptor ownership. FULL synchronization, identity validation, transaction caps and the cache format remain unchanged.
+
+All 71 final benchmark samples pass exact totals and their pipeline-specific verification. The [paired evidence](docs/benchmarks/fresh-file-indexing.md) records a 16.5% incremental reduction for million-file indexing and 2.29× cumulative improvement over 0.9.14 in the real-folder pipeline. A stale-removal control showed no regression. The validation-only cursor has no convincing standalone timing gain. These are local generated fixtures, not cold whole-Mac scans or rendered latency measurements.

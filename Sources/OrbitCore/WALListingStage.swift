@@ -744,22 +744,8 @@ final class ListingStage {
             sqlite3_reset(sequence)
             guard previousID >= 0, previousID < Int64.max else { throw Failure.sqlite("node ID sequence exhausted") }
             var nextNodeID = previousID + 1
-            let insert = try prepareListingStatement("""
-                INSERT INTO nodes(id,parent,name,search_name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,
-                    dev,inode,is_mount,links,epoch)
-                VALUES(?15,?1,CAST(?2 AS TEXT),CAST(?14 AS TEXT),?5,?6,
-                    COALESCE(?16,CASE WHEN ?5=1 AND (?7=1 OR ?3<>(SELECT device FROM directories WHERE path=(SELECT root FROM scan LIMIT 1))) THEN 0 ELSE 1 END),
-                    CASE WHEN ?5=1 THEN COALESCE((SELECT logical FROM directories WHERE path=?12),0) ELSE ?8 END,
-                    CASE WHEN ?5=1 THEN COALESCE((SELECT allocated FROM directories WHERE path=?12),0) ELSE ?13 END,
-                    CASE WHEN ?5=1 THEN COALESCE((SELECT files FROM directories WHERE path=?12),0) ELSE 1 END,
-                    CASE WHEN ?5=1 THEN 0 ELSE ?9 END,?3,?4,?7,?10,?11)
-                ON CONFLICT(parent,name) DO UPDATE SET
-                    dev=excluded.dev,inode=excluded.inode,is_mount=excluded.is_mount,links=excluded.links,epoch=excluded.epoch,
-                    name=excluded.name,search_name=excluded.search_name,is_dir=excluded.is_dir,is_link=excluded.is_link,
-                    accessible=excluded.accessible,size=excluded.size,
-                    allocated=CASE WHEN excluded.is_dir=1 THEN excluded.allocated WHEN nodes.dev=excluded.dev AND nodes.inode=excluded.inode AND nodes.is_dir=excluded.is_dir THEN nodes.allocated ELSE 0 END,
-                    file_count=excluded.file_count,raw_alloc=excluded.raw_alloc
-                """)
+            var genericInsert: OpaquePointer?, freshFileInsert: OpaquePointer?
+            defer { releaseListingStatement(genericInsert); releaseListingStatement(freshFileInsert) }
             let existing = try prepareListingStatement("SELECT dev,inode,is_dir,size,allocated,raw_alloc,id FROM nodes WHERE parent=? AND name=CAST(? AS TEXT)")
             let dirtyLink = try prepareListingStatement("INSERT OR IGNORE INTO dirty_links VALUES(?,?)")
             let rebuildLink = try prepareListingStatement("INSERT OR IGNORE INTO link_rebuild VALUES(?,?)")
@@ -767,7 +753,7 @@ final class ListingStage {
             let singleOwner = try prepareListingStatement("INSERT OR IGNORE INTO owners VALUES(?,?,?)")
             let clearIssue = try prepareListingStatement("DELETE FROM stage_issues WHERE path=?")
             let mountIssue = try prepareListingStatement("INSERT OR REPLACE INTO stage_issues(path,message) VALUES(?,?)")
-            defer { for statement in [insert,existing,dirtyLink,rebuildLink,candidate,singleOwner,clearIssue,mountIssue] { releaseListingStatement(statement) } }
+            defer { for statement in [existing,dirtyLink,rebuildLink,candidate,singleOwner,clearIssue,mountIssue] { releaseListingStatement(statement) } }
             var registerInsert: OpaquePointer?, registerCheck: OpaquePointer?, directoryPathInsert: OpaquePointer?, directoryPathRemove: OpaquePointer?
             defer { for statement in [registerInsert,registerCheck,directoryPathInsert,directoryPathRemove] { releaseListingStatement(statement) } }
             let hasIssuesQuery = try prepareListingStatement("SELECT 1 FROM stage_issues LIMIT 1")
@@ -833,6 +819,37 @@ final class ListingStage {
                 var fullPath = parent
                 if fullPath.last != 47 { fullPath.append(47) }
                 fullPath.append(name)
+                let insert: OpaquePointer
+                if old == SQLITE_DONE && !record.isDirectory {
+                    if freshFileInsert == nil {
+                        freshFileInsert = try prepareListingStatement("""
+                            INSERT INTO nodes(id,parent,name,search_name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,
+                                dev,inode,is_mount,links,epoch)
+                            VALUES(?15,?1,CAST(?2 AS TEXT),CAST(?14 AS TEXT),?5,?6,?16,?8,?13,1,?9,?3,?4,?7,?10,?11)
+                            """)
+                    }
+                    insert = freshFileInsert!
+                } else {
+                    if genericInsert == nil {
+                        genericInsert = try prepareListingStatement("""
+                            INSERT INTO nodes(id,parent,name,search_name,is_dir,is_link,accessible,size,allocated,file_count,raw_alloc,
+                                dev,inode,is_mount,links,epoch)
+                            VALUES(?15,?1,CAST(?2 AS TEXT),CAST(?14 AS TEXT),?5,?6,
+                                COALESCE(?16,CASE WHEN ?5=1 AND (?7=1 OR ?3<>(SELECT device FROM directories WHERE path=(SELECT root FROM scan LIMIT 1))) THEN 0 ELSE 1 END),
+                                CASE WHEN ?5=1 THEN COALESCE((SELECT logical FROM directories WHERE path=?12),0) ELSE ?8 END,
+                                CASE WHEN ?5=1 THEN COALESCE((SELECT allocated FROM directories WHERE path=?12),0) ELSE ?13 END,
+                                CASE WHEN ?5=1 THEN COALESCE((SELECT files FROM directories WHERE path=?12),0) ELSE 1 END,
+                                CASE WHEN ?5=1 THEN 0 ELSE ?9 END,?3,?4,?7,?10,?11)
+                            ON CONFLICT(parent,name) DO UPDATE SET
+                                dev=excluded.dev,inode=excluded.inode,is_mount=excluded.is_mount,links=excluded.links,epoch=excluded.epoch,
+                                name=excluded.name,search_name=excluded.search_name,is_dir=excluded.is_dir,is_link=excluded.is_link,
+                                accessible=excluded.accessible,size=excluded.size,
+                                allocated=CASE WHEN excluded.is_dir=1 THEN excluded.allocated WHEN nodes.dev=excluded.dev AND nodes.inode=excluded.inode AND nodes.is_dir=excluded.is_dir THEN nodes.allocated ELSE 0 END,
+                                file_count=excluded.file_count,raw_alloc=excluded.raw_alloc
+                            """)
+                    }
+                    insert = genericInsert!
+                }
                 sqlite3_reset(insert); sqlite3_clear_bindings(insert)
                 sqlite3_bind_int64(insert, 1, parentID); bind(name, 2, insert); sqlite3_bind_int64(insert, 15, nodeID)
                 sqlite3_bind_int64(insert, 3, Int64(record.device)); sqlite3_bind_int64(insert, 4, Int64(bitPattern: record.inode))
@@ -981,6 +998,17 @@ final class ListingStage {
                 try exec("COMMIT")
                 return true
             }
+            func acknowledgeTrim() throws {
+                let ack = try prepare("UPDATE dirty SET pending=0 WHERE parent=? AND revision=?")
+                defer { sqlite3_finalize(ack) }
+                bind(parent, 1, ack); sqlite3_bind_int64(ack, 2, revision); try step(ack)
+                let completed = try prepare("UPDATE directories SET pending=0 WHERE path=?")
+                defer { sqlite3_finalize(completed) }
+                bind(parent, 1, completed); try step(completed)
+                let clear = try prepare("DELETE FROM trim WHERE parent=?")
+                defer { sqlite3_finalize(clear) }
+                bind(parent, 1, clear); try step(clear)
+            }
             let stale = try prepare("SELECT CAST(name AS BLOB) FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(? AS TEXT)) AND epoch<>? AND is_dir=1 LIMIT 1")
             defer { sqlite3_finalize(stale) }
             bind(parent, 1, stale); sqlite3_bind_int64(stale, 2, epoch)
@@ -997,16 +1025,27 @@ final class ListingStage {
                 return true
             }
             guard staleResult == SQLITE_DONE else { throw Failure.sqlite("stale directory query") }
-            let dirty = try prepare("INSERT OR IGNORE INTO dirty_links SELECT dev,inode FROM nodes WHERE id IN (SELECT id FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(? AS TEXT)) AND epoch<>? AND is_dir=0 ORDER BY name LIMIT 128)")
-            defer { sqlite3_finalize(dirty) }
-            bind(parent, 1, dirty); sqlite3_bind_int64(dirty, 2, epoch); try step(dirty)
-            try exec("INSERT OR IGNORE INTO link_rebuild SELECT dev,inode FROM dirty_links")
             let sums = try prepare("SELECT COALESCE(SUM(size),0),COALESCE(SUM(allocated),0),COUNT(*) FROM (SELECT size,allocated FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(? AS TEXT)) AND epoch<>? AND is_dir=0 ORDER BY name LIMIT 128)")
             defer { sqlite3_finalize(sums) }
             bind(parent, 1, sums); sqlite3_bind_int64(sums, 2, epoch)
             guard sqlite3_step(sums) == SQLITE_ROW else { throw Failure.sqlite("trim totals") }
             let removedSize = sqlite3_column_int64(sums, 0), removedCharge = sqlite3_column_int64(sums, 1), removedFiles = sqlite3_column_int64(sums, 2)
             sqlite3_reset(sums)
+            if removedFiles == 0 {
+                try acknowledgeTrim()
+                #if ORBIT_TESTING
+                Self.testListingCommit?("trim-empty-written")
+                #endif
+                try exec("COMMIT")
+                #if ORBIT_TESTING
+                Self.testListingCommit?("trim-empty-committed")
+                #endif
+                return true
+            }
+            let dirty = try prepare("INSERT OR IGNORE INTO dirty_links SELECT dev,inode FROM nodes WHERE id IN (SELECT id FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(? AS TEXT)) AND epoch<>? AND is_dir=0 ORDER BY name LIMIT 128)")
+            defer { sqlite3_finalize(dirty) }
+            bind(parent, 1, dirty); sqlite3_bind_int64(dirty, 2, epoch); try step(dirty)
+            try exec("INSERT OR IGNORE INTO link_rebuild SELECT dev,inode FROM dirty_links")
             let remove = try prepare("DELETE FROM nodes WHERE id IN (SELECT id FROM nodes WHERE parent=(SELECT id FROM directory_paths WHERE path=CAST(? AS TEXT)) AND epoch<>? AND is_dir=0 ORDER BY name LIMIT 128)")
             defer { sqlite3_finalize(remove) }
             bind(parent, 1, remove); sqlite3_bind_int64(remove, 2, epoch)
@@ -1014,15 +1053,7 @@ final class ListingStage {
             if sqlite3_changes(db) > 0 {
                 try adjustAncestors(parent: parent, logical: -removedSize, allocated: -removedCharge, files: -removedFiles)
             } else {
-                let ack = try prepare("UPDATE dirty SET pending=0 WHERE parent=? AND revision=?")
-                defer { sqlite3_finalize(ack) }
-                bind(parent, 1, ack); sqlite3_bind_int64(ack, 2, revision); try step(ack)
-                let completed = try prepare("UPDATE directories SET pending=0 WHERE path=?")
-                defer { sqlite3_finalize(completed) }
-                bind(parent, 1, completed); try step(completed)
-                let clear = try prepare("DELETE FROM trim WHERE parent=?")
-                defer { sqlite3_finalize(clear) }
-                bind(parent, 1, clear); try step(clear)
+                try acknowledgeTrim()
             }
             try exec("COMMIT")
             return true

@@ -1,6 +1,16 @@
 # Orbit Disk: scan and search design
 
-## Index writer batching (unreleased)
+## Fresh-file indexing (0.9.15)
+
+After the existing lookup proves a file name absent inside the writer transaction, the writer uses a compact INSERT. Existing names and directories retain the original UPSERT, including identity replacement and hardlink accounting. Both statements remain scoped to the current batch or group.
+
+At listing completion, the writer reads stale-file totals before scheduling removal work. A folder with no stale entries can acknowledge its trim marker immediately, avoiding redundant dirty-link and delete scans. Changed generations and revisions still reject the completion before this work, and the acknowledgement remains atomic. A tested alternative added an extra existence query; it slowed deletion-heavy refreshes and was rejected.
+
+The writer also validates queued directory identities through the secure cursor without opening an extra descriptor for enumeration. Discovery still obtains an independent enumeration descriptor. Root and component identities, volume boundaries, symlinks and descriptor cleanup retain the same checks.
+
+[Follow-up measurements](docs/benchmarks/fresh-file-indexing.md) compare these changes with the first batching pass and with v0.9.14 in the same measurement windows.
+
+## Index writer batching (0.9.15)
 
 The asynchronous writer can commit several already-discovered, complete leaf folders together. Each group contains at most 32 folders, 1,024 records and 256 KiB of metadata; each folder contains fewer than 128 records. A 5 ms soft budget is checked between folders. Partial listings, folders containing subdirectories, stale identities and previously indexed listings retain the ordinary writer path. Discovery does not wait to form a group.
 
@@ -12,7 +22,7 @@ Writer-owned SELECT statements release their results before COMMIT so they no lo
 
 The writer checkpoints at 16,384 WAL pages, approximately 64 MiB with 4 KiB pages. Commits still use FULL synchronization; this changes how often durable journal pages are copied back into the database. The default 1,000-page interval made the corrected writer slower on a million-file folder, while the final interval restored roughly equal total time to the release and kept the small-folder gains. External readers and large transactions can exceed the interval, so it is not a hard disk-space limit. [Paired measurements and reproduction commands](docs/benchmarks/durable-indexing.md) include the unsuccessful intermediate configurations.
 
-Against v0.9.14, three alternating trials over 100,000 in-memory file records in 10,000 small folders reduced median ingestion through publication from 3.814 to 1.370 seconds (2.78×), and from 5.803 to 1.163 seconds after a refresh generation change (4.99×). A real 10,000-file mapping fixture fell from 0.346 to 0.154 seconds (2.24×). The million-file single-folder control remained roughly equal. These local fixtures exclude rendered UI latency and do not establish whole-Mac or cold-disk throughput.
+In the first batching comparison against v0.9.14, three alternating trials over 100,000 in-memory file records in 10,000 small folders reduced median ingestion through publication from 3.814 to 1.370 seconds (2.78×), and from 5.803 to 1.163 seconds after a refresh generation change (4.99×). A real 10,000-file mapping fixture fell from 0.346 to 0.154 seconds (2.24×). The million-file single-folder control remained roughly equal. These local fixtures exclude rendered UI latency and do not establish whole-Mac or cold-disk throughput.
 
 ## Resumable mapping
 

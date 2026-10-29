@@ -1318,9 +1318,19 @@ final class CollectionGate: @unchecked Sendable {
                      "Pause must finish the search on the retained map without restarting mapping")
         let prior = store.savedSnapshot(for: root)!
         let reopened = DiskModel(cacheDirectory: cache, preferences: prefs)
+        let reopenGate = PreviewGate()
+        defer { reopenGate.release() }
+        reopened.testBeforeScannerStart = { reopenGate.pauseOnce() }
         let began = Date()
         reopened.restoreLastLocation()
-        try await wait("cached relaunch") { reopened.root != nil && !reopened.isScanning }
+        try await wait("cached relaunch before stage reopen") { reopenGate.isWaiting && reopened.root != nil }
+        precondition(!reopened.isScanning && reopened.isRefreshing && !reopened.isSavedMap,
+                     "A cached map must be usable before its retained stage has finished reopening")
+        precondition(reopened.root?.size == model.root?.size && reopened.current != nil)
+        reopenGate.release()
+        try await wait("cached relaunch") {
+            reopened.root != nil && !reopened.isScanning && !reopened.isRefreshing && !reopened.isOpeningFolder
+        }
         precondition(reopened.isSavedMap)
         precondition(store.savedSnapshot(for: root)!.id == prior.id, "Relaunch must reuse saved index")
         print(String(format: "Cached model reopened in %.3fs", Date().timeIntervalSince(began)))
