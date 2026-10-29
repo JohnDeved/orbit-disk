@@ -305,7 +305,7 @@ The bar is a saved share of the known inventory, not an estimate of completion t
 - PASS, completion timestamp: the installed app reopens Downloads with “Indexed · updated … ago”, preserving the saved index date. The progress counts are absent from its accessibility tree. The nil-date fixture shows only “Indexed”.
 - PASS, local delivery: the final release build passes strict deep ad-hoc signature verification, and the installed executable UUID matches the compiled executable. The new build is open on Downloads. No cache was cleared or personal files deleted.
 
-## Whole-drive coverage and Places reuse (unreleased)
+## Whole-drive coverage and Places reuse (0.9.14)
 
 - PASS, native boot-volume traversal: bulk, streaming and fallback enumeration normalize verified firmlink identities before secure opening. Checks cover Home/Documents and nested System/Library/Caches coverage, stale identities, ordinary volume boundaries and duplicate physical alias rejection.
 - PASS, totals and durable queueing: a generated inventory using actual boot identities counts native and unique Data-volume files once in live views, count-only reads and SQLite. The Data mount remains accessible and queued; mirrored physical folders do not enter the queue.
@@ -317,3 +317,10 @@ The bar is a saved share of the known inventory, not an estimate of completion t
 - PASS, installed app: the release build and strict deep signature verification pass; installed and compiled executable UUIDs match. Clicking Macintosh HD exposes accessible Users and Applications while mapping continues. Opening Home retains `/` as the mapping root and reports no error; returning to Macintosh HD retains that session. The app is left open on the drive. No personal files were removed or caches cleared.
 
 These checks use generated fixtures and native metadata. They do not claim a new whole-Mac throughput measurement. README images were not regenerated.
+
+### Published-map progress handoff (0.9.14)
+
+The v0.9.13 release gate caught a saved-state race after deleting the last file while switching Places. The index had published, but the displayed counts still belonged to the preceding map. The model now keeps the updating phase until the installed folder and session snapshot match the published revision.
+
+- PASS: a synchronous progress observer reproduces premature completion against the tagged v0.9.13 model and passes with the fix. The full session harness also passes, including detached removal, navigation, interrupted mapping and progress ownership. This comparison used the same optimized core module, generated files and an unoptimized app-model harness.
+- PASS: 13 release-metadata checks, two updater-copy checks and version/build validation. v0.9.13 was blocked before publication; v0.9.14 includes the same changes plus this handoff fix.

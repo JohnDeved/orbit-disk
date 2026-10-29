@@ -478,6 +478,13 @@ final class ProgressStageProbe: @unchecked Sendable {
         try fm.createDirectory(at:rem,withIntermediateDirectories:true);try Data([6]).write(to:victim)
         let deletionGate=ResolutionGate(), m7=DiskModel(cacheDirectory:dir.appendingPathComponent("removal-index"),preferences:prefs)
         m7.scan(rem);try await wait("removal initial save") {m7.root?.id == rem.path && !m7.isScanning}
+        var prematureEmptyCompletion = false
+        let completionObserver = m7.mappingProgressState.$value.dropFirst().sink { progress in
+            if m7.root?.id == rem.path, m7.root?.fileCount == 0, progress?.phase == .saved,
+               progress?.discoveredFiles != 0 || progress?.cachedFiles != 0 || progress?.savedShare != 1 {
+                prematureEmptyCompletion = true
+            }
+        }
         precondition(m7.collect([m7.current!.children[0]]))
         try await wait("accepted collection") { !m7.isValidatingCollection }
         m7.testBeforeRemoval = {deletionGate.pause()};m7.deleteCollectionPermanently()
@@ -498,6 +505,8 @@ final class ProgressStageProbe: @unchecked Sendable {
         try await wait("empty map saved after deletion") {m7.mappingProgress?.phase == .saved}
         precondition(m7.mappingProgress?.discoveredFiles == 0 && m7.mappingProgress?.cachedFiles == 0
                      && m7.mappingProgress?.savedShare == 1)
+        precondition(!prematureEmptyCompletion, "Indexed appeared before the deleted map's counts were installed")
+        completionObserver.cancel()
         m7.cancelScan()
         let multipleA=dir.appendingPathComponent("multiple-a"), multipleB=dir.appendingPathComponent("multiple-b")
         try fm.createDirectory(at:multipleA,withIntermediateDirectories:true);try fm.createDirectory(at:multipleB,withIntermediateDirectories:true)

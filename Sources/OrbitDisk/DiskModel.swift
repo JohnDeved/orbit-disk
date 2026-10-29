@@ -676,7 +676,8 @@ final class DiskModel: ObservableObject {
             || session.durablePreviewBlocked || !session.removals.isEmpty || !session.removalParents.isEmpty
         let pendingRefresh = session.finished && (checking || pendingFullRefresh || !pendingDirectories.isEmpty
             || session.pendingFullRefresh || !session.pendingDirectories.isEmpty)
-        let updating = pendingRemoval || pendingRefresh
+        let pendingPresentation = session.finished && snapshot != nil && snapshot?.id != session.savedSnapshot?.id
+        let updating = pendingRemoval || pendingRefresh || pendingPresentation
         let paused = !session.finished && (session.token.isCancelled || session.scanFailed)
         let complete = session.finished || progress?.discoveryComplete == true
         let phase: MappingProgressPresentation.Phase
