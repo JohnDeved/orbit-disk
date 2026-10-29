@@ -35,6 +35,9 @@ import Foundation
         try resumedLiveDiscovery(base)
         try sharedLiveDiscovery(base)
         try refreshedLiveDiscovery(base)
+        try freshLeafGroups(base)
+        try cancelledLeafGroup(base)
+        try removalDuringLeafGroup(base)
         try liveCacheInvalidation(base)
         try ParallelDiscoveryChecks.run(base)
         try pendingNavigationAndSearch(base)
@@ -344,7 +347,9 @@ import Foundation
         try signals.until("crash child discovery") { mailbox.discoveryFinished }
         if boundary == "before-write" { kill(getpid(), SIGKILL) }
         ListingStage.testListingCommit = { observed in
-            if observed == "batch-committed" { kill(getpid(), SIGKILL) }
+            let expected = boundary == "group-before-commit" ? "fresh-group-written"
+                : boundary == "group-after-commit" ? "fresh-group-committed" : "batch-committed"
+            if observed == expected { kill(getpid(), SIGKILL) }
         }
         try finish(stage)
         throw AsyncCheckFailure(description: "Missed async crash boundary")
@@ -352,10 +357,14 @@ import Foundation
 
     static func crashResume(_ base: URL) throws {
         let crashBase = base.appendingPathComponent("crashes")
-        for boundary in ["before-write", "after-commit"] {
+        for boundary in ["before-write", "after-commit", "group-before-commit", "group-after-commit"] {
             let fixture = try AsyncFixture(crashBase, boundary)
-            for index in 0..<260 { try fixture.file("root-file-\(index)", size: index + 1) }
-            try fixture.file("child/nested/file", size: 1024)
+            if boundary.hasPrefix("group-") {
+                for index in 0..<8 { try fixture.file("leaf-\(index)/file", size: index + 1) }
+            } else {
+                for index in 0..<260 { try fixture.file("root-file-\(index)", size: index + 1) }
+                try fixture.file("child/nested/file", size: 1024)
+            }
             let process = Process()
             process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
             process.arguments = ["crash-child", crashBase.path, boundary]
@@ -366,6 +375,11 @@ import Foundation
             try require(stage.hasPriorCheckpoint, "Crash lost the durable root checkpoint")
             let rows = try scalar(stage.crawler.store.databasePath, "SELECT COUNT(*) FROM nodes")
             try require(boundary == "before-write" ? rows == 1 : rows > 1, "Crash boundary did not preserve the expected committed prefix")
+            if boundary.hasPrefix("group-") {
+                let files = try scalar(stage.crawler.store.databasePath, "SELECT COUNT(*) FROM nodes WHERE is_dir=0")
+                try require(boundary == "group-before-commit" ? files == 0 : files > 0,
+                            "Group crash exposed an uncommitted or lost a committed prefix")
+            }
             try finish(stage)
             try require(stage.crawler.asyncInventory != nil, "Resumed discovery fell back to the serial writer")
             try verifyTree(stage, fixture: fixture)

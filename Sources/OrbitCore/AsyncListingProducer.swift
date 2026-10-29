@@ -175,6 +175,25 @@ final class PendingInventoryMailbox: @unchecked Sendable {
         return result
     }
 
+    func nextFreshLeaves() -> [PendingInventoryBatch] {
+        condition.lock(); defer { condition.unlock() }
+        guard !cancelled, committed < sequence else { return [] }
+        var result: [PendingInventoryBatch] = []
+        var records = 0, bytes = 0
+        var parents: Set<Data> = []
+        for sequence in (committed + 1)...sequence {
+            guard let batch = batch(at: sequence), batch.completion != nil, batch.failure == nil,
+                  batch.expectedRevision == 0, batch.records.count < 128,
+                  batch.records.allSatisfy({ !$0.isDirectory }),
+                  result.first.map({ $0.expectedFullGeneration == batch.expectedFullGeneration }) ?? true,
+                  records + batch.records.count <= 1024, bytes + batch.byteCount <= 256 * 1024,
+                  parents.insert(batch.parentPath).inserted else { break }
+            result.append(batch); records += batch.records.count; bytes += batch.byteCount
+            if result.count == 32 { break }
+        }
+        return result
+    }
+
     func acknowledge(through sequence: Int64) {
         condition.lock()
         let end = min(sequence, self.sequence)

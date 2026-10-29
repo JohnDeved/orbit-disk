@@ -159,6 +159,7 @@ extension AsyncMappingChecks {
     static func refreshedLiveDiscovery(_ base: URL) throws {
         let fixture = try AsyncFixture(base, "full-refresh-live")
         try fixture.file("existing/old", size: 3)
+        for index in 0..<130 { try fixture.directory("existing/empty-\(index)") }
         do {
             let stage = try fixture.stage()
             try finish(stage)
@@ -169,13 +170,23 @@ extension AsyncMappingChecks {
         let stage = try fixture.stage(), signals = Signals()
         let mailbox = try start(stage, signals: signals)
         defer { stage.crawler.cancelAsyncDiscovery() }
+        var serialListings = 0
+        stage.crawler.testBeforeListing = { serialListings += 1 }
         try signals.until("resumed full refresh with writer held") { mailbox.discoveryFinished }
         try require(try stage.view(path: folder.path, removals: [], cancellation: ScanCancellation())?.folder.children.count == 1,
                     "Full refresh waited for durable directory registration")
+        try require(try stage.crawler.store.fullRefreshState().pending, "Fixture lost pending full-refresh marking")
+        let savedSequence = try scalar(stage.crawler.store.databasePath, "SELECT COALESCE(MAX(sequence),0) FROM orbit_async_progress")
+        _ = try stage.advance(progress: { _ in })
+        try require(try stage.crawler.store.fullRefreshState().pending,
+                    "Full-refresh preparation did not stay within its bounded directory chunk")
+        try require(try scalar(stage.crawler.store.databasePath, "SELECT COALESCE(MAX(sequence),0) FROM orbit_async_progress") == savedSequence,
+                    "Writer consumed discovered listings before marking the old directory queue")
         try finish(stage)
+        try require(serialListings == 0, "Full refresh repeated asynchronous discovery in the serial crawler")
         try require(stage.crawler.asyncInventory != nil, "A newly discovered directory invalidated the refresh generation")
         try verifyTree(stage, fixture: fixture)
-        print("PASS: full-refresh discovery preserves its generation for directories not yet registered by the writer")
+        print("PASS: bounded full-refresh preparation preserves live discovery without enumerating directories twice")
     }
 
     static func sharedLiveDiscovery(_ base: URL) throws {

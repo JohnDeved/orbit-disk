@@ -1,7 +1,6 @@
 import Darwin
 import Foundation
 
-// The directory queue and each listing batch are committed independently.
 final class DurableCrawler {
     let rootURL: URL
     let rootPath: Data
@@ -112,6 +111,18 @@ final class DurableCrawler {
                               onListingStart: ((Data, String) -> Void)?, onListingEnd: (() -> Void)?) throws -> Bool {
         guard !cancellation.isCancelled else { cancelAsyncDiscovery(); throw CancellationError() }
         guard hasActiveAsyncDiscovery, let mailbox = asyncInventory else { return false }
+        try root.validate(url: rootURL)
+        // Finish marking the old directory queue before accepting this generation's listings.
+        // Otherwise their completions are rejected and every discovered folder is walked again.
+        if try store.markFullRefreshChunk() { return true }
+        if asyncListing == nil {
+            let leaves = mailbox.nextFreshLeaves()
+            if leaves.count > 1, try consumeFreshLeaves(leaves, mailbox: mailbox,
+                beforeAccounting: beforeAccounting, onRecordCount: onRecordCount, onBatch: onBatch,
+                onListingComplete: onListingComplete, onListingStart: onListingStart, onListingEnd: onListingEnd) {
+                return true
+            }
+        }
         let pending = mailbox.next(maxRecords: asyncListing == nil ? 128 : writeChunkSize)
         guard let first = pending.first, let last = pending.last else {
             if mailbox.isDrained || mailbox.isCancelled {
@@ -121,7 +132,6 @@ final class DurableCrawler {
             }
             return true
         }
-        try root.validate(url: rootURL)
         onListingStart?(first.parentPath, "\(first.parentIdentity.device):\(first.parentIdentity.inode)")
         defer { onListingEnd?() }
         guard try store.fullRefreshState().generation == first.expectedFullGeneration else { cancelAsyncDiscovery(); return true }
@@ -190,6 +200,51 @@ final class DurableCrawler {
             return true
         } catch { cancelAsyncDiscovery(); throw error }
         if completed { onListingComplete?() }
+        return true
+    }
+
+    private func consumeFreshLeaves(_ leaves: [PendingInventoryBatch], mailbox: PendingInventoryMailbox,
+                                    beforeAccounting: (() throws -> Void)?, onRecordCount: ((Int) -> Void)?,
+                                    onBatch: ((Data, Int) throws -> Void)?, onListingComplete: (() -> Void)?,
+                                    onListingStart: ((Data, String) -> Void)?, onListingEnd: (() -> Void)?) throws -> Bool {
+        var listings: [ListingStage.FreshLeafListing] = []
+        for leaf in leaves {
+            guard !cancellation.isCancelled else { throw CancellationError() }
+            guard let directory = try store.directory(path: leaf.parentPath),
+                  directory.device == leaf.parentIdentity.device, directory.inode == leaf.parentIdentity.inode,
+                  let completion = leaf.completion,
+                  try store.canCompleteFreshListing(parent: leaf.parentPath) else { break }
+            do {
+                if asyncWriterCursor == nil { asyncWriterCursor = try SecureDirectoryCursor(root: root, rootURL: rootURL) }
+                let descriptor = try asyncWriterCursor!.openDirectory(leaf.components)
+                close(descriptor)
+            } catch { break }
+            listings.append(ListingStage.FreshLeafListing(directory: directory, records: leaf.records,
+                expectedRevision: leaf.expectedRevision, expectedFullGeneration: leaf.expectedFullGeneration,
+                issueCount: completion.issueCount, issues: completion.issues,
+                asyncCommit: AsyncInventoryCommit(generation: mailbox.generation, sequence: leaf.sequence)))
+        }
+        guard listings.count > 1 else { return false }
+        let committed = try store.completeFreshLeafListings(listings, rootDevice: root.identity.device, cancellation: cancellation)
+        guard committed > 0 else { return false }
+        let saved = leaves.prefix(committed)
+        onRecordCount?(saved.reduce(0) { $0 + $1.records.count })
+        try beforeAccounting?()
+        while try store.reconcileLinksChunk(cancellation: cancellation) {}
+        mailbox.acknowledge(through: leaves[committed - 1].sequence)
+        for leaf in saved {
+            guard !cancellation.isCancelled else { throw CancellationError() }
+            onListingStart?(leaf.parentPath, "\(leaf.parentIdentity.device):\(leaf.parentIdentity.inode)")
+            do {
+                defer { onListingEnd?() }
+                try onBatch?(leaf.parentPath, 1)
+                onListingComplete?()
+            } catch StreamingBulkDirectory.Failure.needsFallback {
+                cancelAsyncDiscovery()
+                try store.markDirty(parent: leaf.parentPath)
+                return true
+            }
+        }
         return true
     }
 
@@ -310,7 +365,7 @@ final class DurableCrawler {
         var listingIssueCount = 0
         var lastCommit = ProcessInfo.processInfo.systemUptime
         var bufferingFreshListing = false
-        if maxBatches == nil && revision == 0 && fullGeneration == 0,
+        if maxBatches == nil && revision == 0,
            directory.path != rootPath, preferredDirectory?() != directory.path {
             bufferingFreshListing = try store.canCompleteFreshListing(parent: directory.path)
         }

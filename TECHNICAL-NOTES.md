@@ -1,5 +1,19 @@
 # Orbit Disk: scan and search design
 
+## Index writer batching (unreleased)
+
+The asynchronous writer can commit several already-discovered, complete leaf folders together. Each group contains at most 32 folders, 1,024 records and 256 KiB of metadata; each folder contains fewer than 128 records. A 5 ms soft budget is checked between folders. Partial listings, folders containing subdirectories, stale identities and previously indexed listings retain the ordinary writer path. Discovery does not wait to form a group.
+
+The group uses the existing record writer and SQLite FULL synchronization. Secure traversal checks filesystem identities before writing; the transaction rechecks stored identities, listing revisions and refresh generations. It stores the last committed mailbox sequence atomically with those records. Cancellation or invalid input rolls the transaction back. Memory entries are retired only after commit and hard-link accounting; removal replay and progress callbacks run outside the transaction. A crash can repeat an uncommitted group, while committed progress remains recoverable.
+
+The group reuses its prepared insert and lookup statements across folders, resetting bindings between listings and finalizing the statements before commit or rollback. Ordinary listings retain their existing statement ownership. This avoids repeatedly compiling the same SQL without retaining a connection-wide statement cache.
+
+Writer-owned SELECT statements release their results before COMMIT so they no longer block the writer's automatic WAL checkpoint. Long-running readers on other connections can still delay checkpoints. Full-refresh queue marking now advances through the directory primary key instead of repeatedly scanning its completed prefix. Marking finishes before asynchronous listings are consumed, avoiding a second enumeration of directories whose completion previously arrived too early. New directories retain the atomic fresh-listing path after a refresh generation changes.
+
+The writer checkpoints at 16,384 WAL pages, approximately 64 MiB with 4 KiB pages. Commits still use FULL synchronization; this changes how often durable journal pages are copied back into the database. The default 1,000-page interval made the corrected writer slower on a million-file folder, while the final interval restored roughly equal total time to the release and kept the small-folder gains. External readers and large transactions can exceed the interval, so it is not a hard disk-space limit. [Paired measurements and reproduction commands](docs/benchmarks/durable-indexing.md) include the unsuccessful intermediate configurations.
+
+Against v0.9.14, three alternating trials over 100,000 in-memory file records in 10,000 small folders reduced median ingestion through publication from 3.814 to 1.370 seconds (2.78×), and from 5.803 to 1.163 seconds after a refresh generation change (4.99×). A real 10,000-file mapping fixture fell from 0.346 to 0.154 seconds (2.24×). The million-file single-folder control remained roughly equal. These local fixtures exclude rendered UI latency and do not establish whole-Mac or cold-disk throughput.
+
 ## Resumable mapping
 
 Each location has a private SQLite staging database. Directory listings and traversal progress are committed as mapping proceeds, and the partial map is available for browsing, search and eligible removal. Switching locations leaves mapping running; stopping or reopening the app resumes from committed progress. An interrupted listing may need to be read again, and an incompatible filesystem identity or event history can require reconciliation or a new baseline. An existing saved map remains available while a replacement is built.

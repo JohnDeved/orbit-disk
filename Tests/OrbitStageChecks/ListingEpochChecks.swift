@@ -7,7 +7,8 @@ private final class Database {
     init(_ path: String) {
         precondition(sqlite3_open_v2(path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK)
     }
-    deinit { sqlite3_close(handle) }
+    deinit { close() }
+    func close() { sqlite3_close(handle); handle = nil }
     func execute(_ sql: String) {
         precondition(sqlite3_exec(handle, sql, nil, nil, nil) == SQLITE_OK)
     }
@@ -63,6 +64,8 @@ enum ListingEpochChecks {
         try checkCrashes(base.appendingPathComponent("crashes"))
         try checkRollback(base.appendingPathComponent("rollback"))
         try checkFreshGuards(base.appendingPathComponent("fresh-guards"))
+        try checkFreshGeneration(base.appendingPathComponent("fresh-generation"))
+        try FullRefreshQueueChecks.run(base.appendingPathComponent("refresh-queue"))
         try checkFreshVisibility(base.appendingPathComponent("fresh-visibility"))
         try checkEmptyRelisting(base.appendingPathComponent("relist"))
         try checkStaleFinish(base.appendingPathComponent("stale"))
@@ -317,7 +320,7 @@ enum ListingEpochChecks {
                 let currentGeneration = try store.fullRefreshState().generation
                 let current = try store.completeFreshListing(parent: parent, records: records, rootDevice: device,
                     expectedRevision: currentRevision, expectedFullGeneration: currentGeneration)
-                precondition(!current, "refresh work must not use fresh completion")
+                precondition(!current, "dirty or pending full-refresh work must not use fresh completion")
             }
             precondition(database.scalar("SELECT COUNT(*) FROM nodes") == 1)
             precondition(database.scalar("SELECT COALESCE(MAX(value),0) FROM epochs") == beforeEpoch)
@@ -328,6 +331,43 @@ enum ListingEpochChecks {
             precondition(view.scanState == .complete && view.fileCount == 0)
         }
         print("PASS: dirty, full-refresh, prior-epoch, completed, oversized and over-budget listings reject fresh completion without mutation")
+    }
+
+    static func checkFreshGeneration(_ base: URL) throws {
+        let stage = try makeStage(base), store = stage.crawler.store
+        let parent = stage.crawler.rootPath, device = stage.crawler.root.identity.device
+        let database = Database(store.databasePath)
+        try Data([1, 2, 3]).write(to: stage.crawler.rootURL.appendingPathComponent("file"))
+        try fm.createDirectory(at: stage.crawler.rootURL.appendingPathComponent("child"), withIntermediateDirectories: true)
+        let records = try fm.contentsOfDirectory(at: stage.crawler.rootURL, includingPropertiesForKeys: nil).map(FileMetadata.read)
+        try store.markFullRefresh()
+        let pending = try store.completeFreshListing(parent: parent, records: records, rootDevice: device,
+            expectedRevision: 0, expectedFullGeneration: 1)
+        precondition(!pending && database.scalar("SELECT COUNT(*) FROM epochs") == 0)
+        while try store.markFullRefreshChunk() {}
+        let stale = try store.completeFreshListing(parent: parent, records: records, rootDevice: device,
+            expectedRevision: 0, expectedFullGeneration: 0)
+        precondition(!stale && database.scalar("SELECT COUNT(*) FROM nodes") == 1)
+        let completed = try store.completeFreshListing(parent: parent, records: records, rootDevice: device,
+            expectedRevision: 0, expectedFullGeneration: 1)
+        precondition(completed && database.scalar("SELECT COUNT(*) FROM trim") == 0)
+        precondition(database.scalar("SELECT COUNT(*) FROM directories WHERE pending=1") == 1,
+                     "Fresh completion in a refresh generation lost the child queue")
+        database.close()
+        var serialFreshCompletion = false
+        ListingStage.testListingCommit = { boundary in
+            if boundary == "empty-committed" {
+                precondition(Database(store.databasePath).scalar("SELECT COUNT(*) FROM trim") == 0,
+                             "Serial refresh fallback missed fresh atomic completion")
+                serialFreshCompletion = true
+            }
+        }
+        defer { ListingStage.testListingCommit = nil }
+        try finish(stage)
+        precondition(serialFreshCompletion)
+        let snapshot = try stage.publish(elapsed: 0)
+        precondition(Database(snapshot.databaseURL.path).scalar("SELECT COUNT(*) FROM nodes WHERE is_dir=0") == 1)
+        print("PASS: fresh listings complete atomically after refresh marking; pending and stale generations reject without mutation")
     }
 
     static func checkFreshVisibility(_ base: URL) throws {

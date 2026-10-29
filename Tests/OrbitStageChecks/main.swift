@@ -106,12 +106,18 @@ func checkLookupPreflight(_ base: URL) throws {
 @main struct Check {
  static func main() throws {
   let args = CommandLine.arguments
+  if args.count == 4 && args[1] == "fresh-leaf-group-child" {
+   try FreshLeafGroupChecks.crashChild(URL(fileURLWithPath: args[2], isDirectory: true), boundary: args[3])
+   return
+  }
   if args.count == 4 && args[1] == "listing-epoch-child" {
    try ListingEpochChecks.crashChild(URL(fileURLWithPath: args[2], isDirectory: true), boundary: args[3])
    return
   }
   let base=URL(fileURLWithPath:CommandLine.arguments[1],isDirectory:true).standardizedFileURL, fm=FileManager.default
   try checkRejectedStageFormats(base.appendingPathComponent("rejected-formats",isDirectory:true))
+  try WriterCheckpointChecks.run(base.appendingPathComponent("writer-checkpoint",isDirectory:true))
+  try FreshLeafGroupChecks.run(base.appendingPathComponent("fresh-leaf-groups",isDirectory:true))
   try ListingEpochChecks.run(base.appendingPathComponent("listing-epochs",isDirectory:true))
   try checkDirectoryRegistrationRollback(base.appendingPathComponent("directory-rollback",isDirectory:true))
   try checkIdentityLookup(base.appendingPathComponent("identity",isDirectory:true))
