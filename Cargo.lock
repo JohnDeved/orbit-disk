@@ -3476,14 +3476,19 @@ version = "1.0.0-alpha.0"
 dependencies = [
  "libc",
  "orbit-platform",
+ "tempfile",
 ]
 
 [[package]]
 name = "orbit-platform-macos"
 version = "1.0.0-alpha.0"
 dependencies = [
+ "criterion",
  "libc",
+ "objc2",
+ "objc2-foundation",
  "orbit-platform",
+ "tempfile",
 ]
 
 [[package]]

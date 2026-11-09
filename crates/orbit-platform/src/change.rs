@@ -1,5 +1,6 @@
 use crate::Result;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// A saved position in the OS change history for one root.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -54,4 +55,13 @@ pub trait ChangeMonitor: Send {
 
     /// Stops delivery. After return, the sink is never called again.
     fn stop(&mut self);
+
+    /// Replays the saved history of `checkpoint.root` from `checkpoint` and returns `true` only
+    /// when the checkpoint still belongs to the current history, the replay records no change at
+    /// all, and it catches up with the present within `timeout`. Lets the engine reuse a saved map
+    /// of a subfolder without rescanning it. Platforms without history return `false`.
+    fn history_unchanged_since(&self, checkpoint: &ChangeCheckpoint, timeout: Duration) -> bool {
+        let _ = (checkpoint, timeout);
+        false
+    }
 }
