@@ -775,7 +775,18 @@ impl<P: Platform> Stage<P> {
         }
         match recovery {
             Some(Recovery::Block) => {
-                let message = error.to_string();
+                // The platform error names only the component it opened; the skipped-items
+                // sheet lists full paths (Swift `ScanError.filesystem(path, code)`).
+                let reason = match &error {
+                    CoreError::Platform(PlatformError::Os { code, .. }) => {
+                        std::io::Error::from_raw_os_error(*code).to_string()
+                    }
+                    CoreError::Platform(PlatformError::Dataless { .. }) => {
+                        "cloud content is not available offline".to_owned()
+                    }
+                    other => other.to_string(),
+                };
+                let message = private_issue(&directory.path, &reason);
                 self.writer.block_directory(&directory.path, &message)?;
                 Ok(StepOutcome::progressed())
             }

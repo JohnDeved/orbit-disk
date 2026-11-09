@@ -125,6 +125,21 @@ fn main() {
             }
         };
         MAIN_WINDOW.with(|main| *main.borrow_mut() = Some(window.into()));
+        // Reduce Motion may change in System Settings while the app runs: re-read it whenever
+        // the main window becomes active (a cheap preference query).
+        {
+            let shell = Rc::clone(&shell);
+            window
+                .update(cx, |_, window, cx| {
+                    cx.observe_window_activation(window, move |_, window, cx| {
+                        if window.is_window_active() {
+                            orbit_ui::theme::set_reduce_motion(shell.reduce_motion(), cx);
+                        }
+                    })
+                    .detach();
+                })
+                .ok();
+        }
         cx.activate(true);
         // The main window is on screen: start scheduled update checks (idempotent).
         if let Some(updater) = shell.updater() {

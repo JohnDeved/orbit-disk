@@ -38,12 +38,13 @@ pub(crate) fn needs_boot_upgrade(snapshot: &CoreSnapshot) -> bool {
         && identity.get("bootTraversal").is_none_or(|v| v.as_i64() == Some(1))
 }
 
-pub(crate) fn progress(progress: &MappingProgress, work: &DiscoveryProgress, root: &[u8]) -> ProgressSnapshot {
+/// `current_path`: the folder being listed (the root until discovery listed one).
+pub(crate) fn progress(progress: &MappingProgress, work: &DiscoveryProgress, current_path: &[u8]) -> ProgressSnapshot {
     ProgressSnapshot {
         revision: progress.revision,
         item_count: work.records,
         bytes_scanned: work.logical_size,
-        current_path: root.to_vec(),
+        current_path: current_path.to_vec(),
         discovery_complete: progress.discovery_complete,
         discovery_fraction: progress.discovery_fraction,
         estimate_basis: match progress.estimate_basis {

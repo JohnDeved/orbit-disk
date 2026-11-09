@@ -399,3 +399,33 @@ fn switching_away_during_a_refresh_restores_the_refreshing_map() {
     assert!(!h.state.is_refreshing());
     assert_eq!(current(&h), "/r/docs");
 }
+
+/// Before the first preview the map's opening view shows the progress (items, bytes, the folder
+/// being read); afterwards progress reaches the footer only. The list never re-renders for it.
+#[test]
+fn progress_reaches_the_opening_view_until_the_first_folder_and_never_the_list() {
+    let mut h = harness();
+    h.send(Event::OpenLocation { path: b"/r".to_vec(), force: false });
+    while h.run_one(|request| !is_preview_view(request)) {}
+    assert!(h.state.folder().is_none() && h.state.is_scanning());
+    let tick = |revision: u64, path: &str| {
+        MappingEvent::Progress(crate::model::ProgressSnapshot {
+            revision,
+            item_count: 12 * revision,
+            bytes_scanned: 4_096 * revision,
+            current_path: path.as_bytes().to_vec(),
+            ..Default::default()
+        })
+    };
+    let regions = h.mapping(b"/r", tick(1, "/r/docs"));
+    assert!(regions.contains(Regions::MAP | Regions::FOOTER) && !regions.contains(Regions::LIST), "{regions:?}");
+    assert_eq!((h.state.progress_count(), h.state.progress_bytes()), (12, 4_096));
+    assert_eq!(h.state.scan_path(), b"/r/docs");
+
+    h.run();
+    assert!(h.state.folder().is_some(), "the first preview is shown");
+    let regions = h.mapping(b"/r", tick(2, "/r/big"));
+    assert!(!regions.intersects(Regions::MAP | Regions::LIST), "{regions:?}");
+    assert!(regions.contains(Regions::FOOTER));
+    assert_eq!(h.state.scan_path(), b"/r/big");
+}

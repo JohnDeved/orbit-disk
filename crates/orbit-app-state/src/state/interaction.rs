@@ -604,11 +604,17 @@ impl AppState {
     }
 
     pub(crate) fn on_computed(&mut self, id: RequestId, result: Computed) {
-        let Some(Pending::Sort { revision }) = self.pending.remove(&id) else { return };
+        let order = match (self.pending.remove(&id), result) {
+            (Some(Pending::CollectionEdit { session, base }), Computed::Collection(collection)) => {
+                return self.on_collection_edited(id, session, base, collection);
+            }
+            (Some(Pending::Sort { revision }), Computed::NameOrder(order)) => (revision, order),
+            _ => return,
+        };
+        let (revision, order) = order;
         if self.sort_request == Some(id) {
             self.sort_request = None;
         }
-        let Computed::NameOrder(order) = result;
         if revision != self.sort_revision || self.sort != SortOrder::Name {
             return;
         }

@@ -73,7 +73,7 @@ impl AutomationModel for AppState {
             collection_count: collection.map_or(0, |c| c.len() as u64),
             collection_bytes: collection.map_or(0, |c| c.size()),
             validating_collection: state.is_validating_collection(),
-            updating_collection: false,
+            updating_collection: state.is_updating_collection(),
             removing: state.is_removing(),
             active_removals: state.removal_active(),
             updating_sizes: state.updating_removal_sizes(),

@@ -31,7 +31,7 @@ pub use footer::{FooterAction, FooterState, Phase};
 pub use ids::{DragId, GestureId, LeaseId, RemovalId, RequestId, SessionId};
 pub use model::{Item, SnapshotInfo, SortOrder, Volume};
 pub use review::ReviewToken;
-pub use state::{AppState, Config, HoverPresentation, Receipt, RowView};
+pub use state::{AppState, BACKGROUND_EDIT_ITEMS, Config, HoverPresentation, Receipt, RowView};
 
 #[cfg(test)]
 mod tests;

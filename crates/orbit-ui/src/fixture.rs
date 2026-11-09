@@ -424,6 +424,7 @@ impl FixtureBackend {
             root_identity: tree.find(root).map(Tree::identity),
             indexed_at: SystemTime::now(),
             skipped_count: 0,
+            issues: Arc::from([]),
             needs_boot_upgrade: false,
         };
         drop(tree);

@@ -42,6 +42,8 @@ use crate::places::{Places, selected_place};
 use crate::review::ReviewToken;
 use crate::session::Session;
 
+pub use collect::BACKGROUND_EDIT_ITEMS;
+pub(crate) use collect::CollectionEdit;
 pub use interaction::{HoverPresentation, RowView};
 pub(crate) use mapping::Deferred;
 pub use removal::Receipt;
@@ -161,6 +163,11 @@ pub(crate) enum Pending {
     Sort {
         revision: u64,
     },
+    CollectionEdit {
+        session: SessionId,
+        /// Collection revision the edit started from.
+        base: u64,
+    },
 }
 
 /// The collection drag in progress.
@@ -262,6 +269,7 @@ pub struct AppState {
 
     footer: Option<FooterState>,
     item_count: u64,
+    progress_bytes: u64,
     scan_path: Vec<u8>,
     places: Places,
     volumes: Vec<Volume>,
@@ -357,6 +365,7 @@ impl AppState {
             present_pending_error: false,
             footer: None,
             item_count: 0,
+            progress_bytes: 0,
             scan_path: Vec::new(),
             places,
             volumes: vec![Volume::fallback_root()],
@@ -610,7 +619,8 @@ impl AppState {
         self.session_mut(id)
     }
 
-    pub(crate) fn active_epoch(&self) -> u64 {
+    /// Changes whenever the displayed session's removal overlay changes.
+    pub fn active_epoch(&self) -> u64 {
         self.active_session().map_or(0, |s| s.epoch)
     }
 
@@ -629,6 +639,29 @@ impl AppState {
     /// Sizes of folders may still include removed items (Swift `isUpdatingRemovalSizes`).
     pub fn updating_removal_sizes(&self) -> bool {
         self.active_session().is_some_and(|s| s.removing || s.recovery_pending || !s.removals.is_empty())
+    }
+
+    /// Whether the size of the folder at `path` may still include removed items, so it shows
+    /// "Updating…" (Swift `isUpdatingRemovalSize(of:)`, narrowed to folders that contain a
+    /// removed or removing item or a folder whose contents changed). Files never update. While
+    /// the journal recovery or a full refresh is pending, every folder may be affected.
+    pub fn updating_removal_size(&self, path: &[u8], is_dir: bool) -> bool {
+        if !is_dir || !self.updating_removal_sizes() {
+            return false;
+        }
+        let Some(session) = self.active_session() else { return false };
+        if session.recovery_pending || session.pending_full_refresh {
+            return true;
+        }
+        let contains = |inner: &[u8]| inner != path && is_within(inner, path);
+        session.removals.iter().any(|removal| contains(&removal.path))
+            || session.removal_parents.iter().any(|parent| is_within(parent, path))
+            || (session.removing
+                && self
+                    .removals_running
+                    .values()
+                    .filter(|running| *running.root == *session.root)
+                    .any(|running| running.items.keys().any(|item| contains(item))))
     }
 
     pub(crate) fn begin_review_command(&mut self) -> Option<ReviewToken> {
@@ -900,6 +933,12 @@ impl AppState {
         self.item_count
     }
 
+    /// Bytes of the files found so far by the displayed mapping (opening view "File size").
+    pub fn progress_bytes(&self) -> u64 {
+        self.progress_bytes
+    }
+
+    /// The folder being listed by the displayed mapping (the root until one was listed).
     pub fn scan_path(&self) -> &[u8] {
         &self.scan_path
     }

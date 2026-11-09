@@ -90,7 +90,7 @@ impl FooterPanel {
             progress_opacity: None,
             root_label: None,
             age_timer: None,
-            _subscriptions: host.observe(REGIONS, cx),
+            _subscriptions: host.observe(REGIONS, cx).into_iter().chain([theme::observe_motion(cx)]).collect(),
         }
     }
 

@@ -22,6 +22,7 @@ orbit-platform.workspace = true
 orbit-sunburst.workspace = true
 futures = { version = "0.3", default-features = false, features = ["std"] }
 serde_json.workspace = true
+unicode-segmentation.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

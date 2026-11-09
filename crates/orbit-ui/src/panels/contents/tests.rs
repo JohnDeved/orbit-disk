@@ -166,6 +166,11 @@ fn a_double_click_opens_a_folder_once_and_a_dragged_press_never_opens(cx: &mut T
 
     w.click(big, 1);
     assert_eq!((w.current(), w.selected()), ("/r".into(), Some("/r/big".into())), "one click selects");
+    // A click on the empty space below the rows clears the selection (native lists).
+    let empty = w.slot_point(4);
+    w.click(empty, 1);
+    assert_eq!(w.selected(), None);
+    w.click(big, 1);
     w.click(big, 2);
     assert_eq!(w.current(), "/r/big", "the second click of a double click opens");
     assert!(!w.cx.read(|cx| w.host.state(cx).gesture_active()), "the release ended the gesture");

@@ -16,8 +16,9 @@
 //!   and is consumed: every layer occludes what is below it.
 //! - Escape is Cancel / Done of the top card. Return is its default action: Move to Trash in the
 //!   trash confirmation, OK in alerts. The permanent-delete sheet has no default action.
-//! - While a card is open the layer holds keyboard focus and swallows the window's shortcuts
-//!   (Quick Look, Refresh, Go Up, ⌘F, …) so nothing behind the sheet reacts.
+//! - While a card is open the layer holds keyboard focus and the main window does not register
+//!   its actions (Quick Look, Refresh, Go Up, ⌘F, …): their menu items are disabled and nothing
+//!   behind the sheet reacts.
 //! - Actions carry the review token as rendered, so the app state rejects them when the
 //!   collection changed after the user saw it. Removal locks every collection edit.
 
@@ -39,7 +40,6 @@ use orbit_app_state::{AppState, Event, Item, LeaseId, Regions, ReviewToken};
 
 pub use alert::{Alert, AlertRole};
 
-use crate::actions::*;
 use crate::frame_stats;
 use crate::host::Host;
 use crate::icons::{Icon, icon};
@@ -347,33 +347,16 @@ impl Render for SheetsLayer {
                     .into_any_element(),
             );
         }
-        swallow_window_actions(
-            div()
-                .id("sheets")
-                .size_full()
-                .relative()
-                .track_focus(&self.focus)
-                .key_context(SHEET_CONTEXT)
-                .on_key_down(cx.listener(Self::key_down)),
-        )
-        .children(children)
-        .into_any_element()
+        div()
+            .id("sheets")
+            .size_full()
+            .relative()
+            .track_focus(&self.focus)
+            .key_context(SHEET_CONTEXT)
+            .on_key_down(cx.listener(Self::key_down))
+            .children(children)
+            .into_any_element()
     }
-}
-
-/// Window shortcuts and Explore menu items do nothing while a sheet is open (native sheets block
-/// their window). Quit, Settings… and the other app actions stay available.
-fn swallow_window_actions(element: Stateful<Div>) -> Stateful<Div> {
-    element
-        .on_action(|_: &OpenFolder, _, _| {})
-        .on_action(|_: &RefreshFullMap, _, _| {})
-        .on_action(|_: &CloseWindow, _, _| {})
-        .on_action(|_: &GoUp, _, _| {})
-        .on_action(|_: &OpenSelectedFolder, _, _| {})
-        .on_action(|_: &RevealInFinder, _, _| {})
-        .on_action(|_: &QuickLook, _, _| {})
-        .on_action(|_: &AddToCollection, _, _| {})
-        .on_action(|_: &FocusSearch, _, _| {})
 }
 
 /// The confirmation may proceed: same review and collection, nothing removing or validating.

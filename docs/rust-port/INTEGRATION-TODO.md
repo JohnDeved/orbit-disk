@@ -63,8 +63,8 @@ Seam and wiring changes that agents requested. The integrator applies them once 
 ## From the engine backend (`orbit-backend`)
 - [ ] Wire `EngineBackend` into the app: the host runs `orbit_app_state::perform` on the background
   executor and forwards `Notifier` events to the UI thread.
-- [ ] `ProgressSnapshot::current_path` is the mapped root: `MappingSession` does not expose the
-  folder being listed. Swift showed the current path in the footer.
+- [x] `ProgressSnapshot::current_path` is the folder being listed (`MappingSession::current_path`,
+  sampled by the discovery workers at most every 50 ms; the root until the first listing).
 - [ ] `SearchSource::Saved { stable_order }` is ignored. The saved-map order (size, then path) is
   already deterministic; confirm this matches the Swift tie order across the preview hand-off.
 - [ ] Journal recovery (`SavedMaps::recover`) runs every time a non-forced mapping starts for a
@@ -80,14 +80,28 @@ Seam and wiring changes that agents requested. The integrator applies them once 
 ## Wave E: polish and parity, collected from the UI panel agents
 - [ ] Live frame harness with the screen unlocked (`OrbitDisk --frame-harness`); target p99 < 8.3 ms. All UI numbers so far are headless.
 - [ ] Visual parity pass against the Swift app and DESIGN.md: screenshots side by side, light and dark art.
-- [ ] Finder folder drops on the explorer area should add Places again. Reuse `sidebar::add_dropped_folders` / `track_folder_drag`.
-- [ ] First-scan full-screen view: item count, path being read, file-size figure. App-state needs to expose progress bytes, and `MappingSession` the current path.
-- [ ] Escape stops mapping (Swift parity) without stealing Escape from sheets and drags.
-- [ ] Tray "Removing from collection…" state: app-state accessor.
-- [ ] Skipped-items sheet lists the affected paths: the engine and app-state need to carry issue paths.
-- [ ] Search field: undo/redo, word-wise movement, grapheme clusters (`unicode-segmentation`).
-- [ ] Reduce Motion re-read at runtime; menu items disabled while a sheet is open.
-- [ ] Map center: middle truncation and round line caps for the badge glyphs (GPUI limits; custom text shaping if needed).
+- [x] Finder folder drops on the explorer area should add Places again. Reuse `sidebar::add_dropped_folders` / `track_folder_drag`.
+  (No automated test: GPUI cannot construct `ExternalPaths` outside the crate; check by hand.)
+- [x] First-scan full-screen view: item count, path being read, file-size figure. App-state needs to expose progress bytes, and `MappingSession` the current path.
+- [x] Escape stops mapping (Swift parity) without stealing Escape from sheets and drags.
+  Order: sheets, drags, a focused text input (always consumes Escape), context menus, then Stop.
+- [x] Tray "Removing from collection…" state: app-state accessor (`is_updating_collection`).
+  Removing from a collection of ≥ 1,000 items rebuilds it in the background (Swift threshold);
+  review, removal and other edits wait, and a concurrent change re-applies the edit.
+- [x] Skipped-items sheet lists the affected paths: the engine and app-state need to carry issue paths.
+  `SnapshotInfo::issues` carries the saved map's issue lines (the engine keeps 100, as Swift
+  does; the sheet would list up to 1,000) plus "and N more". Blocked folders now name their
+  full path instead of the last component.
+- [x] Search field: undo/redo, word-wise movement, grapheme clusters (`unicode-segmentation`).
+- [x] Reduce Motion re-read at runtime (on main-window activation); menu items disabled while a sheet is open.
+- [x] Map center: middle truncation (grapheme-aware `truncate_middle`, cached per name and slot).
+- [ ] Map center: round line caps for the badge glyphs (GPUI limits; custom path stroking if needed).
+- [x] List click on empty space clears the selection; "Updating…" only on folders that contain
+  removed items (`AppState::updating_removal_size`).
+- [ ] Flaky (pre-existing on 1b9bf92, not touched in Wave E):
+  `orbit-core discovery::tests::cancellation_fences_live_and_durable_publication` fails about one
+  run in four of `cargo nextest run -p orbit-core` ("nothing reached the live inventory after
+  cancel": the live revision still moves after `handle.cancel()`).
 - [ ] Release pipeline:
   - `xtask bundle` stamps the version and builds without `runtime-shaders`
   - swap `scripts/release.sh` and the workflows from SwiftPM to cargo

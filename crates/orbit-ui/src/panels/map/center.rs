@@ -4,7 +4,7 @@
 //! 60 pt hole radius the text is compact and Up is a bare chevron; below 80 pt the name gets one
 //! line instead of two. The Up slot is reserved (transparent) at the root.
 
-use gpui::{AnyElement, FontWeight, IntoElement, ParentElement, SharedString, Styled, div, prelude::*, px};
+use gpui::{AnyElement, FontWeight, IntoElement, ParentElement, Pixels, SharedString, Styled, div, prelude::*, px};
 
 use crate::icons::{Icon, icon};
 use crate::theme;
@@ -25,10 +25,16 @@ pub struct CenterText {
     pub can_go_up: bool,
 }
 
-/// The label stack for a hole of `radius` points.
+/// Width and line count of the name slot for a hole of `radius` points.
+pub fn name_slot(radius: f32) -> (Pixels, usize) {
+    (px((radius * 1.2).max(1.)), if radius < ONE_LINE_RADIUS { 1 } else { 2 })
+}
+
+/// The label stack for a hole of `radius` points. The name arrives middle-truncated for the
+/// slot ([`name_slot`]); the clamp only guards against unexpected wrapping.
 pub fn element(text: &CenterText, radius: f32) -> AnyElement {
     let compact = radius < COMPACT_RADIUS;
-    let title_lines = if radius < ONE_LINE_RADIUS { 1 } else { 2 };
+    let (name_width, title_lines) = name_slot(radius);
     let detail_lines = if compact { 1 } else { 2 };
     let value_size = (radius * 0.37).clamp(1.0, MAX_VALUE_SIZE);
     let spacing = if compact {
@@ -62,7 +68,7 @@ pub fn element(text: &CenterText, radius: f32) -> AnyElement {
         .child(
             clamp(
                 div()
-                    .w(px((radius * 1.2).max(1.)))
+                    .w(name_width)
                     .h(px(16. * title_lines as f32))
                     .text_size(theme::TEXT_ROW)
                     .line_height(px(16.))

@@ -25,6 +25,7 @@ pub mod regions;
 pub mod settings;
 pub mod settings_window;
 pub mod sheets;
+pub mod text_edit;
 pub mod theme;
 
 pub use host::{AppHost, Host, HostEvent, HostOptions};

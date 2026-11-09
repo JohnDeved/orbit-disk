@@ -14,12 +14,16 @@ use crate::collection::{
     Candidates, CollectJob, CollectRequest, CollectionSnapshot, GroupContext, LARGE_DROP, MAX_COMMIT_BATCH,
     VALIDATION_SLICE, apply_validated, can_begin_collection,
 };
-use crate::event::{DragSource, Regions};
+use crate::event::{ComputeJob, DragSource, Effect, Regions};
 use crate::hash::FxHashSet;
 use crate::ids::{DragId, LeaseId, RequestId, SessionId};
 use crate::model::Item;
 use crate::paths::has_collected_ancestor;
 use crate::review::ReviewToken;
+
+/// Removing an item from a collection of at least this many items rebuilds it off the UI thread
+/// (Swift: more than 1,000).
+pub const BACKGROUND_EDIT_ITEMS: usize = 1_000;
 
 const MAP_CHANGED_DRAG_ONE: &str = "The map changed. Drag the item again from the current map.";
 const MAP_CHANGED_DRAG_MANY: &str = "The map changed. Drag the items again from the current map.";
@@ -30,6 +34,15 @@ pub(crate) enum ValidationKind {
     Recheck { index: usize },
     /// Validate one slice ending at `end`; `commit` publishes it with the buffered chunks.
     Slice { end: usize, commit: bool },
+}
+
+/// Items being removed from a large collection (Swift `CollectionEditQueue`). The rebuilt
+/// snapshot is computed in the background from the collection revision it started from; when
+/// the collection changed meanwhile, the same removals are applied again to the new one.
+#[derive(Debug)]
+pub(crate) struct CollectionEdit {
+    pub request: RequestId,
+    pub remove: Arc<FxHashSet<Arc<[u8]>>>,
 }
 
 #[derive(Debug)]
@@ -629,7 +642,7 @@ impl AppState {
 
     /// Opens the review sheet; returns its token.
     pub(crate) fn begin_review(&mut self) -> Option<ReviewToken> {
-        if self.show_review || !self.can_review() || self.is_removing() {
+        if self.show_review || !self.can_review() || self.is_removing() || self.is_updating_collection() {
             return None;
         }
         self.review_id = self.token();
@@ -639,7 +652,11 @@ impl AppState {
     }
 
     pub(crate) fn begin_confirmation(&mut self, token: &ReviewToken) -> Option<LeaseId> {
-        if !self.review_matches(token) || self.is_removing() || self.confirmation.is_some() {
+        if !self.review_matches(token)
+            || self.is_removing()
+            || self.is_updating_collection()
+            || self.confirmation.is_some()
+        {
             return None;
         }
         let lease = LeaseId(self.token());
@@ -688,6 +705,8 @@ impl AppState {
         }
         let Some(session) = self.active else { return };
         self.cancel_job(session);
+        let edit = self.session_mut(session).and_then(|s| s.edit.take()).map(|edit| edit.request);
+        self.cancel(edit);
         let revision = self.token();
         if let Some(s) = self.session_mut(session) {
             s.collection = CollectionSnapshot::empty(revision);
@@ -708,14 +727,71 @@ impl AppState {
             return;
         }
         let Some(session) = self.active else { return };
-        let revision = self.token();
-        let Some(s) = self.session_mut(session) else { return };
-        if !s.collection.contains(path) {
+        let Some(s) = self.session(session) else { return };
+        if !s.collection.contains(path) || s.edit.as_ref().is_some_and(|edit| edit.remove.contains(path)) {
             return;
         }
-        let remove: FxHashSet<&[u8]> = std::iter::once(path).collect();
-        s.collection = s.collection.without(&remove, revision);
+        if s.edit.is_none() && s.collection.len() < BACKGROUND_EDIT_ITEMS {
+            let revision = self.token();
+            let Some(s) = self.session_mut(session) else { return };
+            let remove: FxHashSet<&[u8]> = std::iter::once(path).collect();
+            s.collection = s.collection.without(&remove, revision);
+            self.notify(Regions::TRAY | Regions::MAP | Regions::LIST | Regions::INSPECTOR | Regions::SHEETS);
+            return;
+        }
+        let mut remove = s.edit.as_ref().map(|edit| (*edit.remove).clone()).unwrap_or_default();
+        remove.insert(Arc::from(path));
+        self.schedule_collection_edit(session, Arc::new(remove));
+    }
+
+    /// (Re)starts rebuilding `session`'s collection without `remove` in the background.
+    fn schedule_collection_edit(&mut self, session: SessionId, remove: Arc<FxHashSet<Arc<[u8]>>>) {
+        let previous = self.session_mut(session).and_then(|s| s.edit.take()).map(|edit| edit.request);
+        self.cancel(previous);
+        let Some(s) = self.session(session) else { return };
+        let base = s.collection.clone();
+        let id = RequestId(self.token());
+        let revision = self.token();
+        self.pending.insert(id, Pending::CollectionEdit { session, base: base.revision() });
+        self.out.push(Effect::Compute {
+            id,
+            job: ComputeJob::CollectionWithout { collection: base, remove: Arc::clone(&remove), revision },
+        });
+        if let Some(s) = self.session_mut(session) {
+            s.edit = Some(CollectionEdit { request: id, remove });
+        }
+        self.notify(Regions::TRAY | Regions::SHEETS | Regions::INSPECTOR);
+    }
+
+    /// A background collection edit finished: install it unless the collection changed since it
+    /// started, in which case the same removals are applied to the current collection.
+    pub(crate) fn on_collection_edited(
+        &mut self,
+        id: RequestId,
+        session: SessionId,
+        base: u64,
+        collection: CollectionSnapshot,
+    ) {
+        let Some(s) = self.session_mut(session) else { return };
+        let Some(edit) = s.edit.take_if(|edit| edit.request == id) else { return };
+        if s.collection.revision() != base {
+            self.schedule_collection_edit(session, edit.remove);
+            return;
+        }
+        s.collection = collection;
         self.notify(Regions::TRAY | Regions::MAP | Regions::LIST | Regions::INSPECTOR | Regions::SHEETS);
+    }
+
+    /// Items are being removed from the displayed collection in the background (the tray says
+    /// "Removing from collection…"; review, removal and other edits wait).
+    pub fn is_updating_collection(&self) -> bool {
+        self.displayed_matches_active() && self.active_session().is_some_and(|s| s.edit.is_some())
+    }
+
+    /// `path` is being removed from the displayed collection.
+    pub fn is_removing_from_collection(&self, path: &[u8]) -> bool {
+        self.displayed_matches_active()
+            && self.active_session().and_then(|s| s.edit.as_ref()).is_some_and(|edit| edit.remove.contains(path))
     }
 
     pub(crate) fn confirm_removal(&mut self, token: &ReviewToken, permanently: bool) {

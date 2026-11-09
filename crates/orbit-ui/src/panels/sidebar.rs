@@ -122,6 +122,15 @@ impl SidebarPanel {
         Self { host: host.clone(), rendered_folder: None, selected: None, menu: None, _subscriptions: subscriptions }
     }
 
+    /// Closes the "Remove from Places" menu (Escape). Returns whether one was open.
+    pub fn dismiss_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        let open = self.menu.take().is_some();
+        if open {
+            cx.notify();
+        }
+        open
+    }
+
     /// The highlighted place as last rendered.
     pub fn selected(&self) -> Option<&[u8]> {
         self.selected.as_deref()
