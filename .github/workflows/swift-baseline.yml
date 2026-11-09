@@ -1,0 +1,58 @@
+name: Swift baseline
+# Manual only: builds the Swift app and its benchmark probes at a Swift release tag, for
+# `cargo xtask bench-compare --swift-dir`. CI validates the Rust app; the Swift sources stay in the
+# tree until cutover but are not checked on every push.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Swift release tag or commit
+        default: v0.9.15
+        required: true
+permissions:
+  contents: read
+jobs:
+  swift:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      SWIFT_REF: ${{ inputs.ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tools
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          path: swift
+          persist-credentials: false
+      - name: Show build toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: Build the Swift app with its own build script
+        working-directory: swift
+        run: ./build-app.sh --universal --output "$RUNNER_TEMP/baseline/Orbit Disk.app"
+      - name: Build the Swift benchmark probes
+        run: |
+          probes="$RUNNER_TEMP/baseline/orbit-bench"
+          mkdir -p "$probes"
+          for probe in indexing pipeline marking; do
+            ./tools/scripts/benchmarks/build-durable-indexing.sh "$PWD/swift" "$probes/swift-${SWIFT_REF}-$probe" grouped "$probe"
+            rm -rf "$probes/swift-${SWIFT_REF}-$probe/module-cache"
+          done
+      - name: Archive
+        run: |
+          cd "$RUNNER_TEMP/baseline"
+          ditto -c -k --sequesterRsrc --keepParent 'Orbit Disk.app' Orbit-Disk-swift.zip
+          tar -czf orbit-bench.tar.gz orbit-bench
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: swift-baseline-${{ inputs.ref }}
+          path: |
+            ${{ runner.temp }}/baseline/Orbit-Disk-swift.zip
+            ${{ runner.temp }}/baseline/orbit-bench.tar.gz
+          if-no-files-found: error
+          retention-days: 30

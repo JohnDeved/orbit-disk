@@ -1,13 +1,15 @@
 //! Build automation for the Rust port: `cargo xtask <command>`.
 //!
-//! - `bundle [--universal] [--output PATH.app] [--profile NAME]`: the Rust replacement for
-//!   `build-app.sh` (signed `Orbit Disk.app` with Sparkle).
+//! - `bundle`: builds and signs `Orbit Disk.app` (`build-app.sh` wraps it).
+//! - `version`: prints the bundle version mapped from the workspace version.
+//! - `sparkle DIR`: extracts the pinned, verified Sparkle release with its tools.
 //! - `dmg APP OUTPUT.dmg`: wraps `scripts/package-dmg.sh`.
-//! - `bench-compare --rounds N --swift-dir DIR --output DIR`: scaffold only.
+//! - `bench-compare`: interleaved Rust vs. Swift v0.9.15 probe comparisons.
 
 mod bench;
 mod bundle;
 mod sparkle;
+mod version;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -19,12 +21,18 @@ const USAGE: &str = "\
 Usage: cargo xtask <command>
 
 Commands:
-  bundle [--universal] [--output PATH.app] [--profile NAME]
+  bundle [--universal] [--output PATH.app] [--profile NAME] [--release-mode] [--runtime-shaders]
       Build and sign Orbit Disk.app (default output: ../Orbit Disk.app, profile: release).
+      --release-mode requires Xcode's Metal toolchain (precompiled shaders); without it, local
+      builds fall back to runtime shader compilation with a warning.
+  version [--json]
+      Print CFBundleShortVersionString and CFBundleVersion for the workspace version.
+  sparkle NEW-DIR
+      Extract the pinned Sparkle release (framework, LICENSE, bin/ tools) into NEW-DIR.
   dmg APP OUTPUT.dmg
       Package an existing app into a disk image (scripts/package-dmg.sh).
-  bench-compare --rounds N --swift-dir DIR --output DIR
-      Compare Rust and Swift v0.9.15 probes (not implemented yet).";
+  bench-compare --output DIR [--rounds N] [--swift-dir DIR] [--suites LIST] [--small]
+      Interleaved fresh-process comparison of the Rust and Swift v0.9.15 probes.";
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -32,6 +40,8 @@ fn main() -> ExitCode {
     let rest: Vec<OsString> = args.collect();
     let result = match command.as_ref().and_then(|command| command.to_str()) {
         Some("bundle") => bundle::run(&rest),
+        Some("version") => version::run(&rest),
+        Some("sparkle") => sparkle::run(&rest),
         Some("dmg") => dmg(&rest),
         Some("bench-compare") => bench::run(&rest),
         Some("-h" | "--help" | "help") => {
@@ -52,6 +62,11 @@ fn main() -> ExitCode {
 /// The workspace root (the parent of this crate).
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask lives inside the workspace").to_path_buf()
+}
+
+/// Cargo's target directory (`CARGO_TARGET_DIR` or `<workspace>/target`).
+fn target_dir() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| workspace_root().join("target"), PathBuf::from)
 }
 
 /// Walks `--flag` / `--name value` arguments; callers reject anything they do not expect.

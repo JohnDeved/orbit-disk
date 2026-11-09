@@ -25,6 +25,10 @@ pub struct Release {
     pub license: PathBuf,
 }
 
+/// The release tools `scripts/release.sh` uses (`generate_appcast`, `sign_update`) and
+/// `generate_keys` for exporting the maintainer's key.
+pub const TOOLS: [&str; 3] = ["generate_appcast", "sign_update", "generate_keys"];
+
 /// Returns the verified archive, downloading it into `cache_dir` when missing or corrupt.
 fn archive(cache_dir: &Path) -> Result<PathBuf> {
     let archive = cache_dir.join(format!("Sparkle-{VERSION}.tar.xz"));
@@ -55,17 +59,22 @@ fn archive(cache_dir: &Path) -> Result<PathBuf> {
 
 /// Extracts the framework and license into `destination`, which must not exist yet (it is
 /// created empty, so nothing left over from earlier runs can end up in the bundle).
-pub fn extract(cache_dir: &Path, destination: &Path) -> Result<Release> {
+/// With `tools`, `bin/` (the command-line release tools) is extracted too.
+pub fn extract(cache_dir: &Path, destination: &Path, tools: bool) -> Result<Release> {
     let archive = archive(cache_dir)?;
     fs::create_dir(destination).map_err(|error| format!("could not create {}: {error}", destination.display()))?;
-    exec(
-        Command::new("tar")
-            .arg("-xJf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(destination)
-            .args(["./Sparkle.framework", "./LICENSE"]),
-    )?;
+    let mut members = vec!["./Sparkle.framework", "./LICENSE"];
+    if tools {
+        members.push("./bin");
+    }
+    exec(Command::new("tar").arg("-xJf").arg(&archive).arg("-C").arg(destination).args(members))?;
+    if tools {
+        for tool in TOOLS {
+            if !destination.join("bin").join(tool).is_file() {
+                return Err(format!("Sparkle {VERSION} archive has no bin/{tool}"));
+            }
+        }
+    }
     let release = Release { framework: destination.join("Sparkle.framework"), license: destination.join("LICENSE") };
     let symlinked =
         fs::symlink_metadata(release.framework.join("Versions/Current")).is_ok_and(|meta| meta.is_symlink());
@@ -73,6 +82,26 @@ pub fn extract(cache_dir: &Path, destination: &Path) -> Result<Release> {
         return Err(format!("Sparkle {VERSION} archive does not have the expected layout"));
     }
     Ok(release)
+}
+
+/// The download cache shared by `bundle` and `sparkle`.
+pub fn cache_dir(target_dir: &Path) -> PathBuf {
+    target_dir.join("xtask").join(format!("sparkle-{VERSION}"))
+}
+
+/// `cargo xtask sparkle NEW-DIR`: extracts the verified, pinned Sparkle release (framework,
+/// license and the `bin/` tools) into a directory that must not exist yet.
+pub fn run(args: &[std::ffi::OsString]) -> Result<()> {
+    let [destination] = args else {
+        return Err("Usage: cargo xtask sparkle NEW-DIRECTORY".into());
+    };
+    let destination = std::path::absolute(destination).map_err(|error| format!("invalid directory: {error}"))?;
+    if fs::symlink_metadata(&destination).is_ok() {
+        return Err(format!("{} already exists", destination.display()));
+    }
+    extract(&cache_dir(&crate::target_dir()), &destination, true)?;
+    println!("{}", destination.display());
+    Ok(())
 }
 
 fn sha256(path: &Path) -> Result<String> {

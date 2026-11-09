@@ -1,7 +1,7 @@
 name: Build
 on:
   push:
-    branches: [main]
+    branches: [main, rust-port]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -9,10 +9,14 @@ permissions:
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 jobs:
   checks:
     uses: ./.github/workflows/checks.yml
   build:
+    name: Release-mode app bundle
     needs: checks
     runs-on: macos-26
     timeout-minutes: 45
@@ -25,19 +29,34 @@ jobs:
       - name: Show build toolchain
         run: |
           xcodebuild -version
-          swift --version
+          rustup show active-toolchain && rustc --version
+      - name: Ensure the Metal toolchain (precompiled shaders)
+        run: |
+          xcrun -sdk macosx metal --version 2>/dev/null || xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Build app
-        run: ./build-app.sh --output '.build/ci/Orbit Disk.app'
+        run: ./build-app.sh --release-mode --output 'target/ci/Orbit Disk.app'
+      - name: Check the bundle
+        run: |
+          python3 scripts/validate-release.py --print-version
+          codesign --verify --deep --strict 'target/ci/Orbit Disk.app'
+          'target/ci/Orbit Disk.app/Contents/MacOS/OrbitControl' --version
+          python3 -I Tests/test_mcp.py 'target/ci/Orbit Disk.app/Contents/MacOS/OrbitControl'
+      - name: Rehearse Developer ID signing (ad-hoc, hardened runtime)
+        run: |
+          ditto 'target/ci/Orbit Disk.app' 'target/ci/rehearsal/Orbit Disk.app'
+          ./scripts/sign-release.sh 'target/ci/rehearsal/Orbit Disk.app' --dry-run
       - name: Check disk image packaging
         run: |
-          ./scripts/package-dmg.sh '.build/ci/Orbit Disk.app' .build/ci/Orbit-Disk.dmg
-          test -s .build/ci/Orbit-Disk.dmg
-          python3 scripts/test-package-dmg.py '.build/ci/Orbit Disk.app'
+          ./scripts/package-dmg.sh 'target/ci/Orbit Disk.app' target/ci/Orbit-Disk.dmg
+          test -s target/ci/Orbit-Disk.dmg
+          python3 scripts/test-package-dmg.py 'target/ci/Orbit Disk.app'
       - name: Archive app with framework symlinks
-        run: ditto -c -k --sequesterRsrc --keepParent '.build/ci/Orbit Disk.app' .build/ci/Orbit-Disk.zip
+        run: ditto -c -k --sequesterRsrc --keepParent 'target/ci/Orbit Disk.app' target/ci/Orbit-Disk.zip
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Orbit-Disk-${{ github.sha }}
-          path: .build/ci/Orbit-Disk.zip
+          path: target/ci/Orbit-Disk.zip
           if-no-files-found: error
           retention-days: 14
