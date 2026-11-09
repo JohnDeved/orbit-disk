@@ -3470,6 +3470,9 @@ dependencies = [
  "orbit-core",
  "orbit-native",
  "orbit-platform",
+ "rusqlite",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

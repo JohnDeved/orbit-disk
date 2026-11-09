@@ -11,6 +11,9 @@ publish.workspace = true
 orbit-core.workspace = true
 orbit-platform.workspace = true
 orbit-native.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
