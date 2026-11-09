@@ -248,6 +248,8 @@ pub fn format_age(age: std::time::Duration) -> String {
 pub const DESTRUCTIVE: u32 = 0xff6961;
 /// Dim of the window behind the lowest open sheet.
 pub const SHEET_BACKDROP_ALPHA: f32 = 0.45;
+/// Extra dimming over a sheet that has another sheet stacked on top of it.
+pub const STACKED_SHEET_BACKDROP_ALPHA: f32 = 0.6;
 /// Collection review (720 × 470).
 pub const REVIEW_SHEET: (f32, f32) = (720., 470.);
 /// Permanent-delete confirmation (640 × 430).

@@ -31,10 +31,15 @@ pub enum MarketingState {
     Projects,
     /// The removal review of the collected "Downloads" (Move to Trash / Delete Permanently).
     Review,
+    /// The review with its Move to Trash confirmation open.
+    TrashConfirm,
+    /// The review with its permanent-deletion confirmation sheet open.
+    PermanentDelete,
 }
 
 impl MarketingState {
-    pub const ALL: [Self; 4] = [Self::Overview, Self::Collection, Self::Projects, Self::Review];
+    pub const ALL: [Self; 6] =
+        [Self::Overview, Self::Collection, Self::Projects, Self::Review, Self::TrashConfirm, Self::PermanentDelete];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -42,6 +47,8 @@ impl MarketingState {
             Self::Collection => "collection",
             Self::Projects => "projects",
             Self::Review => "review",
+            Self::TrashConfirm => "trash-confirm",
+            Self::PermanentDelete => "permanent-delete",
         }
     }
 
@@ -55,10 +62,27 @@ impl MarketingState {
             Self::Collection => &[Step::Select(sample::DOWNLOADS), Step::Collect(sample::DOWNLOADS)],
             Self::Projects => &[Step::Open(sample::PROJECTS), Step::Select(sample::STUDIO)],
             Self::Review => &[Step::Select(sample::DOWNLOADS), Step::Collect(sample::DOWNLOADS), Step::Review],
+            Self::TrashConfirm => &[
+                Step::Select(sample::DOWNLOADS),
+                Step::Collect(sample::DOWNLOADS),
+                Step::Review,
+                Step::Confirm { permanent: false },
+            ],
+            Self::PermanentDelete => &[
+                Step::Select(sample::DOWNLOADS),
+                Step::Collect(sample::DOWNLOADS),
+                Step::Review,
+                Step::Confirm { permanent: true },
+            ],
         }
     }
 
     /// Home is mapped and every step of this state shows in `state`.
+    /// Whether this state shows a sheet.
+    fn shows_sheet(self) -> bool {
+        matches!(self, Self::Review | Self::TrashConfirm | Self::PermanentDelete)
+    }
+
     pub fn reached(self, state: &AppState) -> bool {
         home_mapped(state) && self.steps().iter().all(|step| step.done(state))
     }
@@ -84,6 +108,10 @@ enum Step {
     Open(&'static str),
     Collect(&'static str),
     Review,
+    /// Opens a confirmation from the review (a sheets-layer action, not an app event).
+    Confirm {
+        permanent: bool,
+    },
 }
 
 impl Step {
@@ -95,6 +123,14 @@ impl Step {
                 .collection()
                 .is_some_and(|collection| collection.items().iter().any(|item| *item.path == *sample::path(relative))),
             Self::Review => state.show_review(),
+            Self::Confirm { .. } => state.confirmation_lease().is_some(),
+        }
+    }
+
+    fn action(self) -> Poll {
+        match self {
+            Self::Confirm { permanent } => Poll::Confirm { permanent },
+            _ => Poll::Send(self.event()),
         }
     }
 
@@ -104,7 +140,7 @@ impl Step {
             Self::Select(relative) => Event::Select { path: Some(path(relative)) },
             Self::Open(relative) => Event::Open { path: path(relative) },
             Self::Collect(relative) => Event::Collect { paths: vec![path(relative)] },
-            Self::Review => Event::BeginReview,
+            Self::Review | Self::Confirm { .. } => Event::BeginReview,
         }
     }
 }
@@ -124,6 +160,10 @@ pub struct WindowFacts {
 #[derive(Debug)]
 pub enum Poll {
     Send(Event),
+    /// Open the review's trash (`false`) or permanent-delete (`true`) confirmation.
+    Confirm {
+        permanent: bool,
+    },
     Wait,
     /// The state is reached and nothing is pending.
     Settled,
@@ -162,7 +202,7 @@ impl Director {
                 return Poll::Wait;
             }
             self.sent = true;
-            return Poll::Send(step.event());
+            return step.action();
         }
         let idle = host.in_flight() == 0
             && !state.is_opening()
@@ -171,7 +211,7 @@ impl Director {
             && !state.is_sorting_rows()
             && state.error().is_none()
             && self.target.reached(state)
-            && window.sheet_open == (self.target == MarketingState::Review)
+            && window.sheet_open == self.target.shows_sheet()
             && !window.animating
             && window.sized;
         if !idle {
@@ -251,6 +291,11 @@ pub fn drive(
                 match director.poll(host.read(cx), facts) {
                     Poll::Send(event) => {
                         host.send(event, cx);
+                        false
+                    }
+                    Poll::Confirm { permanent } => {
+                        let sheets = panels.sheets.clone();
+                        sheets.update(cx, |sheets, cx| sheets.open_confirmation(permanent, cx));
                         false
                     }
                     Poll::Wait => false,

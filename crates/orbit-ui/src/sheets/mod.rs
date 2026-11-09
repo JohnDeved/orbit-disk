@@ -223,6 +223,14 @@ impl SheetsLayer {
     // -----------------------------------------------------------------------------------------
     // Confirmations.
 
+    /// Opens the review's trash or permanent-delete confirmation as if its button was clicked
+    /// (screenshot states). Does nothing unless the review is open and allows it.
+    pub fn open_confirmation(&mut self, permanent: bool, cx: &mut Context<Self>) {
+        let Some(review) = self.host.state(cx).review_token() else { return };
+        let kind = if permanent { ConfirmKind::Permanent } else { ConfirmKind::Trash };
+        self.begin_confirmation(kind, review, cx);
+    }
+
     /// "Move to Trash…" / "Delete Permanently…" in the review: takes the confirmation lease and
     /// captures the reviewed items.
     fn begin_confirmation(&mut self, kind: ConfirmKind, review: ReviewToken, cx: &mut Context<Self>) {
@@ -339,7 +347,10 @@ impl Render for SheetsLayer {
                     .flex()
                     .items_center()
                     .justify_center()
+                    // The first backdrop dims the window; each stacked sheet dims the sheet below it
+                    // as well, so only the top card reads as active.
                     .when(index == 0, |el| el.bg(theme::with_alpha(theme::INK, theme::SHEET_BACKDROP_ALPHA)))
+                    .when(index > 0, |el| el.bg(theme::with_alpha(theme::INK, theme::STACKED_SHEET_BACKDROP_ALPHA)))
                     // Nothing below the backdrop sees the pointer: no hover, cursor, click or scroll.
                     .occlude()
                     .when(top, |el| el.on_mouse_down(MouseButton::Left, cx.listener(Self::outside_mouse_down)))
