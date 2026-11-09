@@ -17,7 +17,7 @@
 
 use crate::hardlinks;
 use crate::mailbox::{DirComponent, ListingBatch};
-use crate::records::RecordMeta;
+use crate::records::{RecordBatch, RecordMeta};
 use crate::scope::TraversalScope;
 use crate::types::ScanState;
 use hashbrown::HashTable;
@@ -25,6 +25,7 @@ use orbit_platform::{EntryKind, FileIdentity};
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
+use std::sync::Arc;
 
 pub type NodeId = u32;
 pub const NONE: u32 = u32::MAX;
@@ -584,6 +585,10 @@ impl Arena {
         if !self.is_alive(dir) {
             return false;
         }
+        self.append_to(dir, batch, scope)
+    }
+
+    fn append_to(&mut self, dir: NodeId, batch: &ListingBatch, scope: &TraversalScope) -> bool {
         self.revision += 1;
         if batch.failure.is_some() {
             // Partial results stay visible ("so far"); the listing is no longer expected.
@@ -673,6 +678,54 @@ impl Arena {
             self.drop_children(dir);
         }
         self.set_dir_state(dir, ScanState::Scanning, 0, DIR_FAILED | DIR_DENIED);
+        self.revision += 1;
+    }
+
+    /// Replaces the listing of `dir` with the complete `records` of a newer listing, keeping
+    /// the subtree of every child directory that is still the same directory (name, identity
+    /// and mount flag). Files and changed children are replaced. The folder ends complete.
+    pub fn relist(&mut self, dir: NodeId, parent_path: &[u8], records: &RecordBatch, scope: &TraversalScope) {
+        let mut existing: HashMap<Vec<u8>, NodeId> = HashMap::new();
+        let mut children = Vec::new();
+        self.for_each_child(dir, |n| children.push(n));
+        for &n in &children {
+            if self.is_dir(n) {
+                existing.insert(self.name(n).to_vec(), n);
+            }
+        }
+        let mut kept = std::collections::HashSet::new();
+        let mut fresh = RecordBatch::with_capacity(records.len(), 0);
+        for (i, meta) in records.metas().iter().enumerate() {
+            let name = records.name(i);
+            let same = meta.kind == EntryKind::Directory
+                && existing.get(name).is_some_and(|&n| {
+                    self.identity(n) == meta.id && (self.flags(n) & MOUNT != 0) == meta.is_mount_point
+                });
+            if same {
+                kept.insert(existing[name]);
+            } else {
+                fresh.push(&records.get(i));
+            }
+        }
+        for n in children {
+            if !kept.contains(&n) {
+                self.remove(n);
+            }
+        }
+        let state = self.dir(dir).state;
+        if state == ScanState::Pending {
+            self.set_dir_state(dir, ScanState::Scanning, 0, 0);
+        }
+        let batch = ListingBatch::new(
+            Arc::from(parent_path),
+            self.identity(dir),
+            Arc::from(Vec::new()),
+            fresh,
+            Some(Default::default()),
+            None,
+        );
+        self.append_to(dir, &batch, scope);
+        self.set_dir_state(dir, ScanState::Complete, 0, DIR_FAILED | DIR_DENIED);
         self.revision += 1;
     }
 

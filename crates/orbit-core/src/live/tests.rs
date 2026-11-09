@@ -333,3 +333,25 @@ fn views_stop_at_view_depth() {
     assert_eq!(deepest, VIEW_DEPTH);
     assert_eq!(tree.node(FolderTree::FOLDER).meta.file_count, 6);
 }
+
+#[test]
+fn relisting_a_folder_keeps_unchanged_subtrees_and_replaces_the_rest() {
+    let live = inventory();
+    live.claim_root();
+    live.append(&batch(&[], &[dir("keep", 10), dir("swap", 11), file("gone", 12, 100), file("stay", 13, 50)], true));
+    live.append(&batch(&[("keep", 10)], &[file("deep", 20, 1000)], true));
+    live.append(&batch(&[("swap", 11)], &[file("old", 21, 500)], true));
+    // The writer re-listed /r: `gone` vanished, `swap` is another directory now, `new` appeared.
+    let relisted = batch(&[], &[dir("keep", 10), dir("swap", 31), file("stay", 13, 60), file("new", 32, 7)], true);
+    assert!(live.relist(b"/r", id(1), &relisted.records));
+    let tree = live.view(b"/r", &[]).unwrap();
+    let root = tree.node(FolderTree::FOLDER).meta;
+    // keep/deep survives; swap's old contents and `gone` do not.
+    assert_eq!((root.file_count, root.size), (3, 1000 + 60 + 7));
+    assert_eq!(child(&tree, FolderTree::FOLDER, "keep").unwrap().meta.size, 1000);
+    assert!(child(&tree, FolderTree::FOLDER, "gone").is_none());
+    assert_eq!(live.state(b"/r/swap"), Some(ScanState::Pending));
+    assert_eq!(live.state(b"/r"), Some(ScanState::Complete));
+    // A stale identity is rejected.
+    assert!(!live.relist(b"/r/keep", id(99), &relisted.records));
+}

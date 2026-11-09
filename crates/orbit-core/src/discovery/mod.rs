@@ -41,6 +41,7 @@ use cache::{ListingCache, ListingCacheReader};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use cursor::Cursor;
 pub use cursor::{CursorStats, MAX_CACHED};
+pub(crate) use exclusions::path_bytes;
 pub use exclusions::{Exclusions, scan_exclusions};
 use hashbrown::HashTable;
 use orbit_platform::{
@@ -654,7 +655,7 @@ impl<P: Platform> Shared<P> {
                 revision = cached.revision;
                 generation = cached.generation;
                 if let Some(records) = cached.records {
-                    let mut listing = Listing::new(self, dir, ticket, false, revision, generation, scratch);
+                    let mut listing = Listing::new(self, dir, ticket, cached.import, revision, generation, scratch);
                     let records: Vec<EntryRecord<'_>> = records.iter().collect();
                     let accepted = listing.accept(&records).is_ok() && listing.finish(0, Vec::new()).is_ok();
                     if accepted {

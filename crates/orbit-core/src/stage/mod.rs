@@ -24,6 +24,7 @@
 //! The writer is generic over the platform (`P: Platform`) for root validation, secure
 //! directory opens and listing; nothing on the hot path goes through `dyn`.
 
+pub mod cache;
 pub mod writer;
 
 #[cfg(test)]
@@ -139,7 +140,9 @@ pub struct Stage<P: Platform> {
     root: Vec<u8>,
     root_identity: FileIdentity,
     writer: Writer,
-    lease: StageLease,
+    /// `None` for a repair stage over a private working copy of a saved map.
+    lease: Option<StageLease>,
+    database: PathBuf,
     checkpoint: StageCheckpoint,
     resumed: bool,
     expected: SnapshotExpectation,
@@ -154,6 +157,18 @@ pub struct Stage<P: Platform> {
     /// Open ancestors reused by [`Stage::validate_components`] (root first).
     ancestors: Vec<CursorLevel<P::Dir>>,
     before_acknowledge: Option<BeforeAcknowledge>,
+    observer: Option<Box<dyn LocalObserver>>,
+}
+
+/// Receives what the writer's local pass learns from the filesystem, so an in-memory inventory
+/// built by discovery stays complete while the writer re-lists folders (retries, dirty folders,
+/// removal replay). Called on the writer thread; keep it cheap.
+pub trait LocalObserver: Send {
+    /// `path` (with `identity`) was listed completely; `records` is the full listing.
+    fn listed(&self, path: &[u8], identity: FileIdentity, records: &RecordBatch);
+    /// `path` could not be listed: `missing` when it vanished or was replaced, otherwise it is
+    /// unreadable and stays as an inaccessible, empty folder.
+    fn unavailable(&self, path: &[u8], identity: FileIdentity, missing: bool);
 }
 
 impl<P: Platform> std::fmt::Debug for Stage<P> {
@@ -244,13 +259,15 @@ impl<P: Platform> Stage<P> {
         drop(mutation);
         lease.validate_paths()?;
         let preview = writer.preview_snapshot(&checkpoint.identity, checkpoint.event_id)?;
+        let database = lease.database_path().to_path_buf();
         Ok(Opened::Stage(Box::new(Self {
             platform,
             paths,
             root: root.to_vec(),
             root_identity,
             writer,
-            lease,
+            lease: Some(lease),
+            database,
             checkpoint,
             resumed: previous.is_some(),
             expected: original,
@@ -264,7 +281,52 @@ impl<P: Platform> Stage<P> {
             lister: None,
             ancestors: Vec::new(),
             before_acknowledge: None,
+            observer: None,
         })))
+    }
+
+    /// A writer over a private working copy of a saved map (see `crate::saved`), used to re-list
+    /// changed folders before the copy replaces the saved map. No stage lease: the copy is a
+    /// hidden file only this process knows; publication goes through the store.
+    pub fn open_repair(
+        platform: Arc<P>,
+        paths: IndexPaths,
+        copy: &SnapshotInfo,
+        root_identity: FileIdentity,
+        cancel: Cancellation,
+        config: StageConfig,
+    ) -> Result<Self> {
+        let root = copy.root_path.clone();
+        let writer = Writer::open(&copy.database, &root, root_identity, config.traversal.clone())?;
+        if writer.directory(&root)?.map(|d| d.identity) != Some(root_identity) {
+            return Err(CoreError::SnapshotChanged);
+        }
+        let checkpoint =
+            StageCheckpoint { root_path: root.clone(), identity: copy.event_identity.clone(), event_id: copy.event_id };
+        let generation = writer.scan_generation()?.unwrap_or_default();
+        Ok(Self {
+            platform,
+            paths,
+            root,
+            root_identity,
+            writer,
+            lease: None,
+            database: copy.database.clone(),
+            checkpoint,
+            resumed: true,
+            expected: SnapshotExpectation::Matching(copy.id.clone()),
+            generation,
+            cancel,
+            config,
+            preview: copy.clone(),
+            preferred: Arc::new(Mutex::new(None)),
+            async_listing: None,
+            async_finished: None,
+            lister: None,
+            ancestors: Vec::new(),
+            before_acknowledge: None,
+            observer: None,
+        })
     }
 
     /// Deletes a stage whose snapshot is published (or is the saved map's origin).
@@ -353,8 +415,31 @@ impl<P: Platform> Stage<P> {
         &self.cancel
     }
 
-    pub fn lease(&self) -> &StageLease {
-        &self.lease
+    /// The stage lease; `None` for a repair stage.
+    pub fn lease(&self) -> Option<&StageLease> {
+        self.lease.as_ref()
+    }
+
+    /// The stage database file.
+    pub fn database(&self) -> &Path {
+        &self.database
+    }
+
+    /// Installs (or removes) the observer of the local pass.
+    pub fn set_local_observer(&mut self, observer: Option<Box<dyn LocalObserver>>) {
+        self.observer = observer;
+    }
+
+    /// Lowers the scan-start event floor (a reused saved map is older than this mapping). Must
+    /// run before any record from that map is committed.
+    pub fn lower_checkpoint(&mut self, event_id: u64) -> Result<()> {
+        let identity = self.checkpoint.identity.clone();
+        self.writer.lower_checkpoint(&identity, event_id)?;
+        if event_id < self.checkpoint.event_id {
+            self.checkpoint.event_id = event_id;
+            self.preview.event_id = event_id;
+        }
+        Ok(())
     }
 
     /// The stage's partial snapshot (database path and preview id) for readers.
@@ -385,11 +470,17 @@ impl<P: Platform> Stage<P> {
         *self.preferred.lock() = path.filter(|p| crate::paths::is_within(p, &self.root)).map(<[u8]>::to_vec);
     }
 
+    /// The shared preferred-folder slot, so another thread can call [`Stage::prioritize`]'s
+    /// equivalent while the writer owns the stage. Store only paths inside the root.
+    pub fn preferred_handle(&self) -> Arc<Mutex<Option<Vec<u8>>>> {
+        self.preferred.clone()
+    }
+
     /// A cheap, cloneable handle for building views from other threads.
     pub fn reader(&self) -> StageReader {
         StageReader {
             inner: Arc::new(ReaderInner {
-                database: self.lease.database_path().to_path_buf(),
+                database: self.database.clone(),
                 root: self.root.clone(),
                 root_identity: self.root_identity,
                 traversal: self.config.traversal.clone(),
@@ -675,6 +766,13 @@ impl<P: Platform> Stage<P> {
             },
             _ => None,
         };
+        if let Some(observer) = &self.observer {
+            match recovery {
+                Some(Recovery::Block) => observer.unavailable(&directory.path, directory.identity, false),
+                Some(Recovery::Requeue) => observer.unavailable(&directory.path, directory.identity, true),
+                None => {}
+            }
+        }
         match recovery {
             Some(Recovery::Block) => {
                 let message = error.to_string();
@@ -741,9 +839,10 @@ impl<P: Platform> Stage<P> {
             issues: Vec::new(),
             issue_count: 0,
             error: None,
+            observed: self.observer.is_some().then(RecordBatch::default),
         };
         let listed = lister.list(&dir, &path, &self.cancel, &mut sink);
-        let LocalSink { pending, mut cursor, buffering, records, issues, issue_count, error, .. } = sink;
+        let LocalSink { pending, mut cursor, buffering, records, issues, issue_count, error, observed, .. } = sink;
         self.lister = Some(lister);
         drop(dir);
         if let Some(error) = error {
@@ -760,6 +859,9 @@ impl<P: Platform> Stage<P> {
             return self.recover_directory(&directory, error.into());
         }
         self.validate_root()?;
+        if let (Some(observer), Some(observed)) = (&self.observer, &observed) {
+            observer.listed(&path, directory.identity, observed);
+        }
         let completion = Completion { revision, generation, issue_count, issues: &issues };
         let mut total = records;
         if buffering && self.writer.complete_fresh_listing(&path, &[&pending], completion, None)? {
@@ -804,6 +906,8 @@ struct LocalSink<'a> {
     issues: Vec<String>,
     issue_count: u32,
     error: Option<SinkError>,
+    /// Every accepted record, kept for the [`LocalObserver`].
+    observed: Option<RecordBatch>,
 }
 
 impl LocalSink<'_> {
@@ -846,6 +950,9 @@ impl LocalSink<'_> {
                 }
             }
             self.pending.push(record);
+            if let Some(observed) = &mut self.observed {
+                observed.push(record);
+            }
         }
         if self.buffering {
             let preferred = self.preferred.lock().as_deref() == Some(self.path);

@@ -84,6 +84,10 @@ impl Exclusions {
     pub fn paths(&self) -> impl Iterator<Item = &[u8]> {
         self.paths.iter().map(Vec::as_slice)
     }
+
+    pub fn identities(&self) -> impl Iterator<Item = FileIdentity> + '_ {
+        self.identities.iter().copied()
+    }
 }
 
 /// Cloud storage roots below `home` plus the app's own directories that every mapping skips.
@@ -93,7 +97,7 @@ pub fn scan_exclusions<P: Platform>(platform: &P, home: &Path, extra: &[PathBuf]
     roots
 }
 
-fn path_bytes(path: &Path) -> Vec<u8> {
+pub(crate) fn path_bytes(path: &Path) -> Vec<u8> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;

@@ -85,7 +85,7 @@ impl<P: Platform> Stage<P> {
             return Err(CoreError::Cancelled);
         }
         self.writer().checkpoint_for_clone(options.checkpoint_timeout, &cancel)?;
-        let source = self.lease().database_path().to_path_buf();
+        let source = self.database().to_path_buf();
         let destination = crate::store::saved_map_path(&paths.cache, &root);
         let temporary = paths.cache.join(format!(".orbit-stage-{}.sqlite", uuid::Uuid::new_v4().hyphenated()));
         let mut created: Option<(u64, u64)> = None;

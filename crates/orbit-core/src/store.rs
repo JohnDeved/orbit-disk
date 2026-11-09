@@ -42,6 +42,143 @@ pub struct IndexPaths {
     pub locks: PathBuf,
     /// Parent of `.orbit-stages` (mapping stages). Usually equal to `locks`.
     pub staging: PathBuf,
+    /// Parent of the removal journal (`.orbit-removals`); see [`orbit_platform::AppDirs`].
+    pub journal: PathBuf,
+}
+
+impl IndexPaths {
+    /// The engine's directories for this user (Swift `IndexLocations`): saved maps in the cache
+    /// directory, locks and stages under the support directory, the removal journal where the
+    /// Swift app kept it. Paths are canonicalized so that discovery exclusions and journal
+    /// records match however the folders are reached.
+    pub fn for_platform<P: Platform>(platform: &P) -> Self {
+        Self::from_dirs(&platform.app_dirs(), &platform.path_aliases())
+    }
+
+    pub fn from_dirs(dirs: &orbit_platform::AppDirs, aliases: &orbit_platform::PathAliases) -> Self {
+        let support = canonical_location(&dirs.support, aliases);
+        Self {
+            cache: canonical_location(&dirs.cache, aliases),
+            locks: support.clone(),
+            staging: support,
+            journal: canonical_location(&dirs.removal_journal, aliases),
+        }
+    }
+
+    /// Everything below `base` (tests and probes): `cache/`, and `support/` for the rest.
+    pub fn under(base: &Path) -> Self {
+        let support = base.join("support");
+        Self { cache: base.join("cache"), locks: support.clone(), staging: support.clone(), journal: support }
+    }
+
+    /// Directories mapping must never enter (Swift `ResumableStage` exclusions): the cache, the
+    /// lock, stage and journal directories and their hidden subdirectories.
+    pub fn exclusion_roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![
+            self.cache.clone(),
+            self.locks.clone(),
+            self.staging.clone(),
+            self.journal.clone(),
+            self.locks.join(".orbit-locks"),
+            self.staging.join(".orbit-stages"),
+            self.journal.join(crate::journal::DIRECTORY_NAME),
+        ];
+        roots.sort();
+        roots.dedup();
+        roots
+    }
+}
+
+/// Swift `IndexLocations.canonicalCache`: resolves the longest existing ancestor (the folder
+/// itself may not exist yet), re-appends the rest, and prefers the firmlinked spelling of a
+/// Data-volume path when both name the same folder.
+pub fn canonical_location(path: &Path, aliases: &orbit_platform::PathAliases) -> PathBuf {
+    let bytes = crate::discovery::path_bytes(path);
+    let Some(input) = crate::paths::standardize(&bytes) else { return path.to_path_buf() };
+    if input == b"/" {
+        return path.to_path_buf();
+    }
+    let mut current = input.as_slice();
+    let mut suffix: Vec<&[u8]> = Vec::new();
+    while std::fs::symlink_metadata(crate::discovery::native_path(current)).is_err() && current != b"/" {
+        suffix.push(crate::paths::file_name(current));
+        current = crate::paths::parent(current).unwrap_or(b"/");
+    }
+    let mut resolved = std::fs::canonicalize(crate::discovery::native_path(current))
+        .map(|p| crate::discovery::path_bytes(&p))
+        .unwrap_or_else(|_| current.to_vec());
+    for component in suffix.iter().rev() {
+        resolved = crate::paths::join(&resolved, component);
+    }
+    if let Some(data) = &aliases.data_volume
+        && crate::paths::is_within(&resolved, data)
+        && resolved.len() > data.len()
+    {
+        let native = &resolved[data.len()..];
+        if same_through_ancestor(&resolved, native) {
+            return crate::discovery::native_path(native);
+        }
+    }
+    crate::discovery::native_path(&resolved)
+}
+
+fn same_through_ancestor(first: &[u8], second: &[u8]) -> bool {
+    let identity = |p: &[u8]| std::fs::metadata(crate::discovery::native_path(p)).ok().map(|m| file_identity(&m));
+    let (mut a, mut b) = (first, second);
+    while b != b"/" {
+        if let (Some(x), Some(y)) = (identity(a), identity(b))
+            && x == y
+        {
+            return true;
+        }
+        a = crate::paths::parent(a).unwrap_or(b"/");
+        b = crate::paths::parent(b).unwrap_or(b"/");
+    }
+    false
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+/// Deletes the cache directories of earlier builds (`AppDirs::obsolete_caches`; on macOS the
+/// Swift `Indexes` folder, whose format-5 maps this build cannot read). Skips anything that is
+/// not a real directory owned by this user, and anything that contains or lies inside a
+/// directory holding durable data (`support`, the removal journal, the current cache). Returns
+/// what was removed.
+pub fn discard_obsolete_caches(dirs: &orbit_platform::AppDirs) -> Vec<PathBuf> {
+    let durable = [&dirs.support, &dirs.removal_journal, &dirs.cache, &dirs.settings];
+    let mut removed = Vec::new();
+    for obsolete in &dirs.obsolete_caches {
+        let obsolete_bytes = crate::discovery::path_bytes(obsolete);
+        let overlaps = durable.iter().any(|keep| {
+            let keep = crate::discovery::path_bytes(keep);
+            crate::paths::is_within(&keep, &obsolete_bytes) || crate::paths::is_within(&obsolete_bytes, &keep)
+        });
+        if overlaps || obsolete_bytes.len() < 2 {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            let Ok(Some(info)) = orbit_platform::posix::optional(orbit_platform::posix::lstat(obsolete)) else {
+                continue;
+            };
+            if !info.is_dir() || info.uid != orbit_platform::posix::euid() {
+                continue;
+            }
+        }
+        if std::fs::remove_dir_all(obsolete).is_ok() {
+            removed.push(obsolete.clone());
+        }
+    }
+    removed
 }
 
 /// Swift `DiskIndexStore.databaseURL(for:)`.
@@ -79,7 +216,7 @@ pub(crate) struct Row {
 }
 
 /// Row columns for stage views (with queue state) and saved maps (always complete).
-fn columns(stage: bool) -> &'static str {
+pub(crate) fn columns(stage: bool) -> &'static str {
     if stage {
         "n.id,n.name,n.kind,n.accessible,n.is_mount,n.size,n.allocated,n.file_count,n.raw_alloc,n.dev,n.inode,
          (SELECT pending FROM dirs WHERE id=n.id),(SELECT epoch FROM dirs WHERE id=n.id),(SELECT pending FROM dirs WHERE id=n.parent)"
@@ -88,7 +225,7 @@ fn columns(stage: bool) -> &'static str {
     }
 }
 
-fn read_row(row: &rusqlite::Row<'_>, stage: bool) -> rusqlite::Result<Row> {
+pub(crate) fn read_row(row: &rusqlite::Row<'_>, stage: bool) -> rusqlite::Result<Row> {
     let kind: i64 = row.get(2)?;
     let is_dir = kind == EntryKind::Directory as i64;
     let (size, allocated, files, raw): (i64, i64, i64, i64) = (row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?);
@@ -285,6 +422,11 @@ impl Projection {
         Ok(projection)
     }
 
+    /// No removal applies to this inventory.
+    pub fn is_empty(&self) -> bool {
+        self.hidden.is_empty()
+    }
+
     /// `path` or one of its ancestors is hidden.
     pub fn hides(&self, path: &[u8], root: &[u8]) -> bool {
         if self.hidden.is_empty() {
@@ -435,7 +577,7 @@ impl Store {
         read_saved_snapshot(&self.database_path(root), root, true)
     }
 
-    fn open(&self, snapshot: &SnapshotInfo, cancel: Option<&Cancellation>) -> Result<Connection> {
+    pub(crate) fn open(&self, snapshot: &SnapshotInfo, cancel: Option<&Cancellation>) -> Result<Connection> {
         schema::check(cancel)?;
         let conn = schema::open_reader(&snapshot.database, cancel, true)?;
         let current = schema::read_snapshot(&conn, &snapshot.database)?;
@@ -577,6 +719,20 @@ impl Store {
         fence: crate::publish::Fence<'_>,
         cancel: &Cancellation,
     ) -> Result<SnapshotInfo> {
+        let lease = RootMutationLease::acquire(&self.paths.locks, &original.root_path, cancel)?;
+        self.publish_recovery_copy_locked(copy, original, &lease, fence, cancel)
+    }
+
+    /// [`Store::publish_recovery_copy`] for a caller that already holds the root's mutation
+    /// lease (taken before the journal fence, the order every saved-map writer uses).
+    pub fn publish_recovery_copy_locked(
+        &self,
+        copy: &SnapshotInfo,
+        original: &SnapshotInfo,
+        lease: &RootMutationLease,
+        fence: crate::publish::Fence<'_>,
+        cancel: &Cancellation,
+    ) -> Result<SnapshotInfo> {
         let valid_name = copy
             .database
             .file_name()
@@ -589,7 +745,7 @@ impl Store {
         {
             return Err(CoreError::Invalid("The recovery copy is invalid.".into()));
         }
-        let lease = RootMutationLease::acquire(&self.paths.locks, &original.root_path, cancel)?;
+        lease.validate()?;
         drop(self.open(original, Some(cancel))?);
         let conn = schema::open_reader(&copy.database, Some(cancel), true)?;
         let prepared = schema::read_snapshot(&conn, &copy.database)?;

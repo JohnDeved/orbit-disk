@@ -378,6 +378,37 @@ mod unix {
 #[cfg(unix)]
 pub(crate) use unix::sys;
 
+/// The invalidation generation of `root` read without taking its lock (Swift
+/// `MappingCoverage.generation`): `"0"` before the first invalidation, `None` when the lock
+/// directory or marker is unsafe or unreadable. For advisory checks only; writers validate
+/// under [`RootMutationLease`].
+#[cfg(unix)]
+pub fn read_invalidation_generation(locks: &Path, root: &[u8]) -> Option<String> {
+    use orbit_platform::posix;
+    use std::os::fd::AsFd;
+    let (parent, _) = posix::open_root(locks).ok()?;
+    let dir = posix::open_dir_at(parent.as_fd(), LOCKS_DIR.as_bytes()).ok()?;
+    let info = posix::fstat(dir.as_fd()).ok()?;
+    if !info.is_dir() || info.uid != posix::euid() || info.permissions() != 0o700 {
+        return None;
+    }
+    let name = format!("{}.lock.generation", crate::schema::root_digest(root));
+    let file = match posix::open_at(dir.as_fd(), name.as_bytes(), libc::O_RDONLY, 0) {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Some("0".into()),
+        Err(_) => return None,
+    };
+    let held = posix::fstat(file.as_fd()).ok()?;
+    let named = posix::fstat_at(dir.as_fd(), name.as_bytes()).ok()?;
+    if !held.is_file() || !held.is_private(0o600) || !held.same_file(&named) {
+        return None;
+    }
+    let mut buffer = [0u8; 64];
+    let count = posix::read(file.as_fd(), &mut buffer).ok()?;
+    let text = std::str::from_utf8(&buffer[..count]).ok()?;
+    (count > 0 && count < buffer.len() && uuid::Uuid::parse_str(text).is_ok()).then(|| text.to_string())
+}
+
 /// Creates `path` (and parents) with mode `0700` and checks the result is a directory we own.
 pub fn create_private_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]

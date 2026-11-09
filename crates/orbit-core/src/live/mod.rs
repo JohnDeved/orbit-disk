@@ -129,6 +129,20 @@ impl LiveInventory {
         }
     }
 
+    /// A newer complete listing of the directory at `path` (the writer's local pass re-listed
+    /// it). Child directories that are still the same keep their subtrees; everything else is
+    /// replaced. Returns false when `path` is not a known directory with `identity`.
+    pub fn relist(&self, path: &[u8], identity: FileIdentity, records: &crate::records::RecordBatch) -> bool {
+        let mut arena = self.arena.write();
+        match arena.lookup(&self.root_path, path) {
+            Some(n) if arena.is_dir(n) && arena.identity(n) == identity => {
+                arena.relist(n, path, records, &self.scope);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The directory at `path` could not be listed. `missing` removes it (it vanished or was
     /// replaced); otherwise it stays as an inaccessible, empty folder.
     pub fn unavailable(&self, path: &[u8], identity: FileIdentity, missing: bool) {

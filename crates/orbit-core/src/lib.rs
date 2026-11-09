@@ -46,4 +46,11 @@ pub mod search;
 pub mod journal;
 pub mod recovery;
 
+// Integration: what the app drives.
+pub mod query;
+pub mod removal;
+pub mod reuse;
+pub mod saved;
+pub mod session;
+
 pub use types::{CoreError, Result, ScanRemoval};
