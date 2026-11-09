@@ -68,6 +68,7 @@ fn main() {
 
     Application::new().with_assets(Assets).run(move |cx: &mut App| {
         let shell: Rc<dyn Shell> = Rc::new(shell::create());
+        orbit_ui::theme::set_reduce_motion(shell.reduce_motion(), cx);
         orbit_ui::sheets::set_privacy_settings_url(shell.privacy_settings_url(), cx);
 
         // First launch: import the Swift app's Places and last location.
