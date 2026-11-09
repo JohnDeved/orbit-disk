@@ -70,6 +70,15 @@ impl HoverPresentation {
         }
     }
 
+    /// The first display position of a related row under a name order.
+    fn first_rank(&self, order: &crate::event::NameOrder) -> Option<u32> {
+        match &self.related {
+            Related::None => None,
+            Related::Range(range) => order.first_rank_in(range.clone()),
+            Related::Rows(rows) => rows.iter().filter_map(|&row| order.rank(row)).min(),
+        }
+    }
+
     fn min(&self) -> Option<u32> {
         match &self.related {
             Related::None => None,
@@ -157,7 +166,7 @@ impl AppState {
 
     /// Unsorted row index shown at `display` position.
     pub fn base_row(&self, display: usize) -> usize {
-        self.order.as_ref().and_then(|order| order.get(display)).map_or(display, |&base| base as usize)
+        self.order.as_ref().and_then(|order| order.row_at(display)).map_or(display, |base| base as usize)
     }
 
     pub fn row(&self, display: usize) -> Option<RowView<'_>> {
@@ -232,7 +241,7 @@ impl AppState {
     pub fn first_related_row(&self) -> Option<usize> {
         match &self.order {
             None => self.hover.min().map(|base| base as usize),
-            Some(order) => order.iter().position(|&base| self.hover.contains(base)),
+            Some(order) => self.hover.first_rank(order).map(|rank| rank as usize),
         }
     }
 
@@ -581,7 +590,7 @@ impl AppState {
         if self.sort != SortOrder::Name || len < BACKGROUND_SORT_ROWS {
             self.sorting = false;
             self.order = match (self.sort, rows) {
-                (SortOrder::Name, Some(rows)) => Some(name_order(&rows, self.cfg.compare_names).into()),
+                (SortOrder::Name, Some(rows)) => Some(name_order(&rows, self.cfg.compare_names)),
                 _ => None,
             };
             return;
@@ -610,7 +619,7 @@ impl AppState {
         self.finish_name_sort(order, revision);
     }
 
-    pub(crate) fn finish_name_sort(&mut self, order: Arc<[u32]>, revision: u64) {
+    pub(crate) fn finish_name_sort(&mut self, order: crate::event::NameOrder, revision: u64) {
         if revision != self.sort_revision || self.sort != SortOrder::Name {
             return;
         }

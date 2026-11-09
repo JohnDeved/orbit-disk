@@ -179,3 +179,22 @@ fn automation_collects_and_removes_on_a_partial_map_with_its_own_receipt() {
     assert_eq!(kept.message, "Moved 1 item to Trash.");
     assert!(h.backend.identity_of(b"/r/file1").is_none());
 }
+
+#[test]
+fn name_order_first_rank_matches_a_full_scan_across_block_boundaries() {
+    use crate::event::NameOrder;
+    // A deterministic shuffle of 5,000 rows (several 1,024-row blocks plus a ragged tail).
+    let mut order: Vec<u32> = (0..5_000).collect();
+    let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+    for i in (1..order.len()).rev() {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        order.swap(i, (seed % (i as u64 + 1)) as usize);
+    }
+    let names = NameOrder::new(order.clone());
+    for (start, end) in [(0, 5_000), (3, 4), (1_000, 1_030), (1_023, 2_049), (17, 4_999), (4_096, 5_000), (9, 9)] {
+        let expected = order.iter().position(|&row| (start..end).contains(&row)).map(|p| p as u32);
+        assert_eq!(names.first_rank_in(start..end), expected, "{start}..{end}");
+    }
+}

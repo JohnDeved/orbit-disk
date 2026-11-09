@@ -30,7 +30,7 @@ pub(crate) struct Deferred {
     pub preview: Option<(Arc<PreparedFolder>, u64, u64)>,
     pub completion: Option<DeferredCompletion>,
     pub indexed: Option<DeferredIndexed>,
-    pub sort: Option<(Arc<[u32]>, u64)>,
+    pub sort: Option<(crate::event::NameOrder, u64)>,
 }
 
 #[derive(Debug)]

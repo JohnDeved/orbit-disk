@@ -401,6 +401,20 @@ impl<Id: Copy + Eq + Hash> Layout<Id> {
         self.member_index().get(&id).is_some_and(|&found| found as usize == index)
     }
 
+    /// Whether some lookup may have to build the member index (groups too large to scan). Hosts
+    /// can then call [`warm_member_index`](Self::warm_member_index) off the UI thread right after
+    /// a layout is built, so the first hover never pays for it.
+    pub fn has_large_groups(&self) -> bool {
+        self.groups.iter().any(|group| group.members.len() > SCAN_MEMBERS_UP_TO)
+    }
+
+    /// Builds the member index now (idempotent, thread-safe).
+    pub fn warm_member_index(&self) {
+        if !self.groups.is_empty() {
+            self.member_index();
+        }
+    }
+
     fn member_index(&self) -> &FxHashMap<Id, u32> {
         self.members.get_or_init(|| {
             let mut map = FxHashMap::default();

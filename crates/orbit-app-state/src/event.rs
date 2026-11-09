@@ -247,21 +247,81 @@ impl SortRows {
 impl ComputeJob {
     pub fn run(self) -> Computed {
         match self {
-            Self::NameSort { rows, compare } => Computed::NameOrder(name_order(&rows, compare).into()),
+            Self::NameSort { rows, compare } => Computed::NameOrder(name_order(&rows, compare)),
         }
     }
 }
 
 /// Stable order of `rows` by `compare` on names.
-pub fn name_order(rows: &SortRows, compare: fn(&[u8], &[u8]) -> Ordering) -> Vec<u32> {
+pub fn name_order(rows: &SortRows, compare: fn(&[u8], &[u8]) -> Ordering) -> NameOrder {
     let mut order: Vec<u32> = (0..rows.len() as u32).collect();
     order.sort_by(|&a, &b| compare(rows.name(a as usize), rows.name(b as usize)));
-    order
+    NameOrder::new(order)
+}
+
+/// A name order plus its inverse, so "where is row X displayed" is O(1) and "which related row
+/// is displayed first" needs no scan of the whole order (1M-row folders, map hover reveal).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NameOrder {
+    /// Display position → unsorted row.
+    order: Arc<[u32]>,
+    /// Unsorted row → display position.
+    rank: Arc<[u32]>,
+    /// Minimum rank of each block of `RANK_BLOCK` consecutive unsorted rows.
+    block_min: Arc<[u32]>,
+}
+
+const RANK_BLOCK: usize = 1024;
+
+impl NameOrder {
+    pub fn new(order: Vec<u32>) -> Self {
+        let mut rank = vec![0u32; order.len()];
+        for (position, &row) in order.iter().enumerate() {
+            rank[row as usize] = position as u32;
+        }
+        let block_min = rank.chunks(RANK_BLOCK).map(|block| block.iter().copied().min().unwrap_or(u32::MAX)).collect();
+        Self { order: order.into(), rank: rank.into(), block_min }
+    }
+
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    /// The unsorted row shown at `display`.
+    pub fn row_at(&self, display: usize) -> Option<u32> {
+        self.order.get(display).copied()
+    }
+
+    /// The display position of unsorted `row`.
+    pub fn rank(&self, row: u32) -> Option<u32> {
+        self.rank.get(row as usize).copied()
+    }
+
+    /// The first display position among unsorted rows `range` (O(block + range / block)).
+    pub fn first_rank_in(&self, range: std::ops::Range<u32>) -> Option<u32> {
+        let (start, end) = (range.start as usize, (range.end as usize).min(self.rank.len()));
+        if start >= end {
+            return None;
+        }
+        let first_full = start.div_ceil(RANK_BLOCK);
+        let last_full = end / RANK_BLOCK;
+        if first_full >= last_full {
+            return self.rank[start..end].iter().copied().min();
+        }
+        let head = self.rank[start..first_full * RANK_BLOCK].iter().copied();
+        let tail = self.rank[last_full * RANK_BLOCK..end].iter().copied();
+        let blocks = self.block_min[first_full..last_full].iter().copied();
+        head.chain(blocks).chain(tail).min()
+    }
 }
 
 #[derive(Clone, Debug)]
 pub enum Computed {
-    NameOrder(Arc<[u32]>),
+    NameOrder(NameOrder),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

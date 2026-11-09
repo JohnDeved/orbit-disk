@@ -474,6 +474,13 @@ impl MapPanel {
             self.host.update(cx, |host, _| (host.presentation(), host.row_hover_segment()));
         let revision = presentation.as_ref().map(|p| p.layout_revision);
         if revision != self.layout_revision() {
+            // Build the group-member lookup in the background so the first hover of a large
+            // folder doesn't pay for it on the UI thread (≈5 ms for a million grouped files).
+            if let Some(layout) = presentation.as_ref().map(|p| Arc::clone(&p.layout))
+                && layout.has_large_groups()
+            {
+                cx.background_spawn(async move { layout.warm_member_index() }).detach();
+            }
             // Segment indices of the old layout mean nothing now; the state re-targets its hover.
             self.pointer = Hit::None;
             self.hover_sent = None;

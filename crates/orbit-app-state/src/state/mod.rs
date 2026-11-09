@@ -233,7 +233,7 @@ pub struct AppState {
     deferred: Deferred,
     drag: Option<Drag>,
     sort: SortOrder,
-    order: Option<Arc<[u32]>>,
+    order: Option<crate::event::NameOrder>,
     sorting: bool,
     sort_request: Option<RequestId>,
     sort_revision: u64,
