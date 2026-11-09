@@ -39,7 +39,7 @@ impl Tree {
                 tree.sizes.push(0);
                 tree.children.push(vec![]);
                 tree.children[parent as usize].push(id);
-                let size = if depth >= 3 || next() % 3 == 0 {
+                let size = if depth >= 3 || next().is_multiple_of(3) {
                     1_000_000_000 / u64::from(i + 1) + next() % 1000
                 } else {
                     build(tree, id, depth + 1, next)
@@ -125,7 +125,7 @@ impl Spike {
             }
             outlines.push(points);
             // Pretend every 5th segment is collected.
-            if i % 5 == 0 {
+            if i.is_multiple_of(5) {
                 lines.clear();
                 sector.hatch(orbit_sunburst::HATCH_SPACING, &mut lines);
                 if !lines.is_empty() {
