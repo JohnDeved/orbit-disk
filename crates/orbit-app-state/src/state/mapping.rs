@@ -9,7 +9,12 @@ use orbit_core::paths::is_within;
 use orbit_core::view::NodeMeta;
 use orbit_platform::FileIdentity;
 
-use super::{AppState, COUNT_READ_INTERVAL, FOLDER_CACHE_LIMIT, Pending, REFRESH_DELAY, SYNC_PREPARE_LIMIT};
+use std::time::Duration;
+
+use super::{
+    AppState, BACKGROUND_QUIET, BACKGROUND_REFRESH_DELAYS, COUNT_READ_INTERVAL, FOLDER_CACHE_LIMIT, Pending,
+    REFRESH_DELAY, SYNC_PREPARE_LIMIT,
+};
 use crate::backend::{MappingRequest, Request, Resolution, ResolveCandidate, ViewRequest, ViewSource};
 use crate::event::{MappingEvent, Persist, Regions, TimerKind};
 use crate::folder::{ColorState, PreparedFolder, prepare_folder};
@@ -23,6 +28,26 @@ pub(crate) const TITLE_MAPPING: &str = "Mapping your files…";
 pub(crate) const TITLE_OPENING: &str = "Opening saved map…";
 const STATUS_PARTIAL_KEPT: &str = "Partial map kept. Restart mapping to finish.";
 const STATUS_UPDATING_AFFECTED: &str = "Updating affected folders…";
+
+/// How soon pending monitor changes are refreshed (most urgent first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RefreshUrgency {
+    /// Pending changes just became visible (navigation, search, review): no delay.
+    Flush,
+    /// Changes the user can see: [`REFRESH_DELAY`].
+    Visible,
+    /// Changes only outside what is shown: [`BACKGROUND_REFRESH_DELAYS`], quietly.
+    Background,
+}
+
+/// What is shown, for deciding which changes are visible: the displayed (or requested) folder,
+/// whether search results or the collection review are up. Compared after every step.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RefreshFocus {
+    folder: Option<Vec<u8>>,
+    searching: bool,
+    reviewing: bool,
+}
 
 /// Work held while a pointer gesture is down, applied in order when it ends.
 #[derive(Debug, Default)]
@@ -252,6 +277,8 @@ impl AppState {
         self.cancel_search();
         self.search.searching = false;
         self.refresh_timer = None;
+        self.refresh_due = None;
+        self.refresh_flush = false;
         self.count_timer = None;
         if let Some(session) = self.monitored.take() {
             self.send(Request::StopMonitor { session });
@@ -1254,10 +1281,14 @@ impl AppState {
                 if !active || self.monitored != Some(id) || self.updates_paused {
                     return;
                 }
+                let now = self.now;
+                if self.last_change.is_none_or(|last| now.saturating_duration_since(last) >= BACKGROUND_QUIET) {
+                    self.background_step = 0;
+                }
+                self.last_change = Some(now);
                 self.pending_dirs.extend(directories);
                 self.pending_full_refresh |= full_refresh;
                 self.schedule_refresh();
-                self.notify(Regions::FOOTER);
             }
             MappingEvent::MonitorUnavailable => {
                 if !active || self.monitored != Some(id) {
@@ -1421,28 +1452,106 @@ impl AppState {
         }
     }
 
+    /// The folder pending changes are judged against: the requested (or displayed) folder.
+    fn focus_folder(&self) -> Option<&[u8]> {
+        self.requested_path.as_deref().or_else(|| self.current_path())
+    }
+
+    /// A change reported for `directory` can alter what is shown: it is inside the displayed
+    /// folder (its totals and the map's rings) or one of its ancestors (the folder itself, or the
+    /// selection's ancestors, may have been replaced or removed).
+    pub(crate) fn change_is_visible(&self, directory: &[u8]) -> bool {
+        let Some(focus) = self.focus_folder() else { return true };
+        is_within(directory, focus) || is_within(focus, directory)
+    }
+
+    /// How soon the pending changes should be refreshed, ignoring a requested flush.
+    fn pending_urgency(&self) -> RefreshUrgency {
+        let recovery = self.active_session().is_some_and(|s| s.recovery_pending || s.pending_full_refresh);
+        if self.pending_full_refresh
+            || recovery
+            || self.removal_result_status.is_some()
+            || self.filtering()
+            || self.show_review
+            || self.pending_dirs.iter().any(|dir| self.change_is_visible(dir))
+        {
+            RefreshUrgency::Visible
+        } else {
+            RefreshUrgency::Background
+        }
+    }
+
+    /// A pending (not yet running) refresh is shown as an update in progress in the footer only
+    /// when the user is waiting for it: never for monitor changes being debounced or deferred.
+    pub(crate) fn refresh_shown(&self) -> bool {
+        self.refresh_flush
+            || self.removal_result_status.is_some()
+            || self.active_session().is_some_and(|s| s.recovery_pending || s.pending_full_refresh)
+    }
+
+    /// After every step: when what is shown changed (navigation, search, review) and pending
+    /// changes became visible, refresh them now instead of waiting for their delay.
+    pub(crate) fn reprioritize_refresh(&mut self) {
+        let focus = self.focus_folder();
+        let (searching, reviewing) = (self.filtering(), self.show_review);
+        let current = &self.refresh_focus;
+        if current.folder.as_deref() == focus && current.searching == searching && current.reviewing == reviewing {
+            return;
+        }
+        self.refresh_focus = RefreshFocus { folder: focus.map(<[u8]>::to_vec), searching, reviewing };
+        // Waiting behind a timer, or behind a running refresh that did not take them.
+        let waiting = (self.refresh_timer.is_some()
+            && self.refresh_due.is_some_and(|(_, urgency)| urgency != RefreshUrgency::Flush))
+            || (self.refresh_request.is_some() && !self.pending_dirs.is_empty());
+        if waiting && !self.refresh_flush && self.pending_urgency() == RefreshUrgency::Visible {
+            self.refresh_flush = true;
+            self.schedule_refresh();
+        }
+    }
+
+    /// Swift `scheduleRefresh`, prioritized: changes the user can see are refreshed after
+    /// [`REFRESH_DELAY`], others after a delay that backs off while changes keep arriving; a
+    /// flush refreshes now. An earlier deadline replaces a later timer; a later one never
+    /// postpones it (the debounce runs from the first change).
     pub(crate) fn schedule_refresh(&mut self) {
         let recovery = self.active_session().is_some_and(|s| s.recovery_pending);
         if self.refreshing
             || self.scanning
             || self.is_removing()
             || (self.updates_paused && !recovery)
-            || self.refresh_timer.is_some()
             || self.refresh_request.is_some()
             || (!self.pending_full_refresh && self.pending_dirs.is_empty())
         {
             return;
         }
-        self.refresh_timer = Some(self.timer(TimerKind::Refresh, REFRESH_DELAY));
+        let urgency = if self.refresh_flush { RefreshUrgency::Flush } else { self.pending_urgency() };
+        let delay = match urgency {
+            RefreshUrgency::Flush => Duration::ZERO,
+            RefreshUrgency::Visible => REFRESH_DELAY,
+            RefreshUrgency::Background => BACKGROUND_REFRESH_DELAYS[self.background_step],
+        };
+        let due = self.now + delay;
+        if self.refresh_timer.is_some()
+            && let Some((at, current)) = self.refresh_due
+            && at <= due
+        {
+            self.refresh_due = Some((at, current.min(urgency)));
+            return;
+        }
+        self.refresh_timer = Some(self.timer(TimerKind::Refresh, delay));
+        self.refresh_due = Some((due, urgency));
     }
 
-    pub(crate) fn refresh_changed_folders(&mut self) {
+    /// Swift `refreshChangedFolders`: refreshes every pending change (never a subset, so the
+    /// change-history checkpoint can advance). `urgency` is the class of the timer that fired.
+    pub(crate) fn refresh_changed_folders(&mut self, urgency: Option<RefreshUrgency>) {
         let Some(saved) = self.snapshot.clone() else { return };
         if self.refreshing || self.scanning || self.is_removing() {
             return;
         }
         if self.pending_full_refresh {
             self.pending_full_refresh = false;
+            self.refresh_flush = false;
             self.pending_dirs.clear();
             if let Some(session) = self.active_session_mut() {
                 session.pending_full_refresh = false;
@@ -1453,33 +1562,54 @@ impl AppState {
         if self.pending_dirs.is_empty() {
             return;
         }
+        // Re-evaluated now: what is shown may have changed since the timer was set.
+        let quiet = !self.refresh_flush
+            && urgency != Some(RefreshUrgency::Flush)
+            && self.pending_urgency() == RefreshUrgency::Background;
+        if quiet {
+            self.background_step = (self.background_step + 1).min(BACKGROUND_REFRESH_DELAYS.len() - 1);
+        }
+        self.refresh_flush = false;
         let paths: Vec<Vec<u8>> = std::mem::take(&mut self.pending_dirs).into_iter().collect();
         let Some(session) = self.active_session() else { return };
         let versions: Vec<(Vec<u8>, u64)> = session.removal_versions.iter().map(|(p, v)| (p.clone(), *v)).collect();
         let (id, epoch, root) = (session.id, session.epoch, Arc::clone(&session.root));
         self.refreshing = true;
-        let status = match &self.removal_result_status {
-            Some(status) => format!("{status} Updating the map…"),
-            None => "Updating changed folders…".to_owned(),
+        self.quiet_refresh = quiet;
+        if !quiet {
+            let status = match &self.removal_result_status {
+                Some(status) => format!("{status} Updating the map…"),
+                None => "Updating changed folders…".to_owned(),
+            };
+            self.set_status(Some(status));
+        }
+        let pending = Pending::Refresh {
+            generation: self.generation,
+            session: Some(id),
+            epoch,
+            paths: paths.clone(),
+            versions,
+            quiet,
         };
-        self.set_status(Some(status));
-        let pending =
-            Pending::Refresh { generation: self.generation, session: Some(id), epoch, paths: paths.clone(), versions };
         let request = crate::backend::RefreshRequest { session: id, root, snapshot: saved.id, paths };
         self.refresh_request = Some(self.request(pending, Request::Refresh(request)));
     }
 
     pub(crate) fn on_refreshed(&mut self, id: RequestId, pending: Pending, result: Result<SnapshotInfo, String>) {
-        let Pending::Refresh { generation, session, epoch, paths, versions } = pending else { return };
+        let Pending::Refresh { generation, session, epoch, paths, versions, quiet } = pending else { return };
         if self.refresh_request == Some(id) {
             self.refresh_request = None;
         }
         if generation != self.generation {
             return;
         }
+        self.quiet_refresh = false;
         match result {
             Ok(updated) => {
+                // The backend keeps the saved map when the re-listed folders did not change.
+                let unchanged = self.snapshot.as_ref().is_some_and(|s| s.id == updated.id);
                 self.snapshot = Some(updated.clone());
+                let removal_versions = !versions.is_empty();
                 if let Some(s) = session.and_then(|id| self.session_mut(id)) {
                     s.saved = Some(updated.clone());
                     for (path, version) in versions {
@@ -1496,10 +1626,13 @@ impl AppState {
                         s.preview_blocked = false;
                     }
                 }
-                self.folder_cache.clear();
+                if !unchanged {
+                    self.folder_cache.clear();
+                }
                 self.refreshing = false;
                 self.saved_map = false;
                 let removals_empty = self.active_session().is_none_or(|s| s.removals.is_empty());
+                let was_partial = self.partial;
                 if self.partial && removals_empty {
                     self.preview_session = None;
                     self.partial = false;
@@ -1507,9 +1640,16 @@ impl AppState {
                         s.live_preview = false;
                     }
                 }
-                let status = self.removal_result_status.take().unwrap_or_else(|| "Updated changed folders.".into());
-                self.set_status(Some(status));
-                if !self.partial {
+                if !quiet {
+                    let status = self.removal_result_status.take().unwrap_or_else(|| "Updated changed folders.".into());
+                    self.set_status(Some(status));
+                }
+                // Reload what is shown unless nothing it depends on changed: an unchanged map, or
+                // a background refresh of folders outside the displayed one.
+                let affected = removal_versions
+                    || (!unchanged
+                        && (!quiet || self.filtering() || paths.iter().any(|path| self.change_is_visible(path))));
+                if !self.partial && (affected || was_partial) {
                     let route = self
                         .requested_path
                         .clone()
@@ -1538,6 +1678,9 @@ impl AppState {
                 self.set_error(Some(message));
             }
         }
-        self.notify(Regions::FOOTER | Regions::HEADER);
+        if !quiet {
+            self.notify(Regions::HEADER);
+        }
+        self.notify(Regions::FOOTER);
     }
 }

@@ -5,6 +5,7 @@ mod collection;
 mod hover;
 mod mapping;
 mod misc;
+mod refresh;
 mod removal;
 mod search;
 

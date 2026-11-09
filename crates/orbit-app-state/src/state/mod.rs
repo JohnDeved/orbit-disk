@@ -53,8 +53,16 @@ pub(crate) use search::SearchState;
 pub const FOLDER_CACHE_LIMIT: usize = 24;
 /// Cached folders with fewer rows are prepared synchronously on navigation.
 pub const SYNC_PREPARE_LIMIT: usize = 256;
-/// Debounce of monitor batches before refreshing changed folders.
+/// Debounce of monitor batches before refreshing changed folders the user can see (inside the
+/// displayed folder, its ancestors, or anywhere while searching or reviewing the collection).
 pub const REFRESH_DELAY: Duration = Duration::from_millis(1_500);
+/// Delays of background refreshes (changes only outside what is shown). Each background refresh
+/// moves one step further while changes keep arriving; [`BACKGROUND_QUIET`] without changes starts
+/// over. Navigating into a changed folder, searching or reviewing the collection flushes them.
+pub const BACKGROUND_REFRESH_DELAYS: [Duration; 3] =
+    [Duration::from_secs(5), Duration::from_secs(10), Duration::from_secs(30)];
+/// A change after this long without changes resets the background backoff.
+pub const BACKGROUND_QUIET: Duration = Duration::from_secs(30);
 /// Minimum interval between discovered-file count reads of a hidden mapping.
 pub const COUNT_READ_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -157,6 +165,8 @@ pub(crate) enum Pending {
         epoch: u64,
         paths: Vec<Vec<u8>>,
         versions: Vec<(Vec<u8>, u64)>,
+        /// A background refresh of changes outside what is shown (no status, no reload).
+        quiet: bool,
     },
     Volumes,
     Places,
@@ -225,6 +235,18 @@ pub struct AppState {
     pending_dirs: BTreeSet<Vec<u8>>,
     pending_full_refresh: bool,
     refresh_timer: Option<u64>,
+    /// When the pending refresh timer fires and how urgent its changes are.
+    refresh_due: Option<(Instant, mapping::RefreshUrgency)>,
+    /// Pending changes became visible (navigation, search, review): refresh without delay.
+    refresh_flush: bool,
+    /// The running refresh only covers changes outside what is shown: no status, no spinner.
+    quiet_refresh: bool,
+    /// Index into [`BACKGROUND_REFRESH_DELAYS`].
+    background_step: usize,
+    /// When the monitor last reported changes.
+    last_change: Option<Instant>,
+    /// What was shown when refresh urgency was last evaluated (see `mapping::RefreshFocus`).
+    refresh_focus: mapping::RefreshFocus,
     refresh_request: Option<RequestId>,
     removal_result_status: Option<String>,
     monitored: Option<SessionId>,
@@ -330,6 +352,12 @@ impl AppState {
             pending_dirs: BTreeSet::new(),
             pending_full_refresh: false,
             refresh_timer: None,
+            refresh_due: None,
+            refresh_flush: false,
+            quiet_refresh: false,
+            background_step: 0,
+            last_change: None,
+            refresh_focus: mapping::RefreshFocus::default(),
             refresh_request: None,
             removal_result_status: None,
             monitored: None,
@@ -488,6 +516,7 @@ impl AppState {
                 self.dirty |= Regions::LIST | Regions::MAP;
             }
         }
+        self.reprioritize_refresh();
         self.refresh_footer();
         let mut out = std::mem::take(&mut self.out);
         let dirty = std::mem::take(&mut self.dirty);
@@ -549,7 +578,8 @@ impl AppState {
             TimerKind::Refresh => {
                 if self.refresh_timer == Some(timer.token) {
                     self.refresh_timer = None;
-                    self.refresh_changed_folders();
+                    let urgency = self.refresh_due.take().map(|(_, urgency)| urgency);
+                    self.refresh_changed_folders(urgency);
                 }
             }
             TimerKind::CountRead => {
@@ -782,9 +812,12 @@ impl AppState {
 
     pub(crate) fn refresh_footer(&mut self) {
         let next = self.active_session().map(|session| {
-            let pending_refresh = self.refreshing
+            // Monitor changes being debounced or deferred, and background refreshes, are not
+            // shown as an update in progress (no spinner); paused updates still offer Refresh.
+            let refreshing = self.refreshing && !self.quiet_refresh;
+            let pending_refresh = refreshing
                 || self.pending_full_refresh
-                || !self.pending_dirs.is_empty()
+                || (!self.pending_dirs.is_empty() && (self.updates_paused || self.refresh_shown()))
                 || session.pending_full_refresh
                 || !session.pending_dirs.is_empty();
             let pending_presentation =
@@ -797,7 +830,7 @@ impl AppState {
                 finished: session.finished,
                 failed: session.failed,
                 stopped: session.stopped,
-                refreshing: self.refreshing,
+                refreshing,
                 scanning: self.scanning,
                 partial: self.partial,
                 updates_paused: self.updates_paused,
