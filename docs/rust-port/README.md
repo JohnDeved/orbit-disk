@@ -1,6 +1,6 @@
 # Rust + GPUI port: conventions
 
-The Swift app under `Sources/` is the **reference implementation** until cutover. Port its behavior, not its structure. Read `TECHNICAL-NOTES.md` sections for the code you port; they record invariants that were expensive to find.
+The Swift app (removed at the 1.0.0 cutover; see tag `v0.9.15`) was the **reference implementation** during the port. Port its behavior, not its structure. Read `TECHNICAL-NOTES.md` sections for the code you port; they record invariants that were expensive to find.
 
 ## Crate rules
 - `orbit-platform` defines the OS boundary (`Platform`, `Shell`, shared types). Change it only with the integrator's agreement; layer crates implement it.

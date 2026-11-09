@@ -15,7 +15,7 @@ Both workflows share the jobs in `checks.yml`:
 - `macos-26`, lint: platform boundary check, `cargo fmt`, `cargo clippy -D warnings`.
 - `macos-26`, tests: `cargo nextest run --workspace`, `Tests/test_mcp.py` against the Rust `OrbitControl`, the updater copy overlay against the pinned Sparkle, and benchmark compilation.
 
-The macOS jobs select Xcode 26.6 through `DEVELOPER_DIR`; Rust comes from `rust-toolchain.toml`. App packaging and publishing wait for every check job. The Swift sources stay in the tree until cutover but are no longer checked in CI; the manual **Swift baseline** workflow builds the Swift app and its benchmark probes at a tag (default `v0.9.15`) for `cargo xtask bench-compare`.
+The macOS jobs select Xcode 26.6 through `DEVELOPER_DIR`; Rust comes from `rust-toolchain.toml`. App packaging and publishing wait for every check job. The Swift app was removed at the 1.0.0 cutover. The manual **Swift baseline** workflow still builds it, with its benchmark probes, from a tag (default `v0.9.15`) for `cargo xtask bench-compare`.
 
 After publication, the release workflow renders the README screenshots from the released commit (`scripts/capture-marketing.sh`) and commits only the generated images to `main`. Until the app has the deterministic `--marketing-state` mode described in that script, the step is skipped with a warning. Ordinary pushes do not refresh screenshots.
 

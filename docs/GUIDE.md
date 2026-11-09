@@ -1,6 +1,6 @@
 # Orbit Disk
 
-A native Swift / SwiftUI disk-space explorer for macOS 14 and later, on Apple silicon and Intel Macs. Inspired by DaisyDisk's visual exploration and the scan-once, search-an-index architecture of instant file-search tools. This is an independent implementation; it bundles Sparkle for app updates.
+A native disk-space explorer for macOS 14 and later, on Apple silicon and Intel Macs, written in Rust with the GPUI framework. Inspired by DaisyDisk's visual exploration and the scan-once, search-an-index architecture of instant file-search tools. This is an independent implementation; it bundles Sparkle for app updates.
 
 Download the [universal disk image](https://github.com/JohnDeved/orbit-disk/releases/latest/download/Orbit-Disk.dmg), open it, and drag **Orbit Disk.app** to Applications before opening it. The current distribution is ad-hoc signed, without an Apple Developer ID signature or notarization. macOS may require initial approval in **System Settings → Privacy & Security**. Version 0.8.3 has no updater: install 0.9.0 or later manually once to enable future in-app updates.
 
@@ -61,27 +61,25 @@ The map, list, inspector and action controls keep their positions while navigati
 
 ## Build and verify
 
-Install Apple's Swift command-line tools or Xcode with Swift 6.3 or later, plus Python 3, then run from the repository root:
+Install [Rust](https://rustup.rs) (the toolchain pinned in `rust-toolchain.toml` installs automatically), [cargo-nextest](https://nexte.st) and Python 3, then run from the repository root:
 
 ```sh
 ./build-app.sh
-swift run OrbitCoreChecks
-./scripts/checks/check-app.sh
-./scripts/checks/check-session.sh
-./scripts/checks/check-updater.sh
-./scripts/checks/check-rendering.sh
-./scripts/checks/check-layout.sh
+cargo nextest run --workspace
+./scripts/checks/check-platform-boundary.sh
+python3 -I Tests/test_mcp.py '../Orbit Disk.app/Contents/MacOS/OrbitControl'
 python3 scripts/test-release.py
-python3 Tests/test_update_copy.py
-swift run -c release OrbitScan /path/to/folder
-swift run -c release OrbitScan --posix /path/to/folder
+cargo run -p orbit-disk -- --fixture
+cargo xtask bench-compare --output /tmp/orbit-bench-results --rounds 3
 ```
 
-The build script creates `../Orbit Disk.app`, includes the Night app icon and pinned Sparkle framework, and signs it ad hoc for local use. It builds for the current Mac's architecture; use `./build-app.sh --universal` for Apple silicon and Intel. The first build downloads Sparkle through Swift Package Manager. The package opens in Xcode through `Package.swift`. The editable icon and regeneration instructions are in [Assets](../Assets/README.md); ordinary builds use the included ICNS and need no image tooling. Layout checks need a macOS desktop session; generated files stay in `.build`.
+The build script creates `../Orbit Disk.app` with `cargo xtask bundle`, includes the Night app icon and the pinned, checksum-verified Sparkle framework, and signs it ad hoc for local use. It builds for the current Mac's architecture; use `./build-app.sh --universal` for Apple silicon and Intel. With full Xcode and its Metal toolchain, `--release-mode` precompiles the Metal shaders; otherwise the app compiles them at first launch. `--fixture` opens the app on generated sample data. The editable icon and regeneration instructions are in [Assets](../Assets/README.md); ordinary builds use the included ICNS and need no image tooling.
+
+The crates are laid out in [docs/rust-port/README.md](rust-port/README.md). Everything OS-specific lives in `crates/orbit-platform-macos` and `crates/orbit-shell-macos`, and the boundary check enforces that. Benchmarks against the last Swift release (v0.9.15) are in [docs/benchmarks/rust-port](benchmarks/rust-port/).
 
 GitHub Actions builds and checks pushes to `main` and pull requests. Version tags create universal GitHub releases. See [RELEASING.md](../RELEASING.md) for the version, signing, and publishing steps.
 
-Test sources live in `Tests/`; their shell runners live in `scripts/checks/`. Each runner finds the repository from its own location, so it can also be invoked by absolute path from another directory. Build, packaging, and release tools remain in `build-app.sh` and `scripts/`.
+Rust tests live next to the code they cover (`crates/*/src/**/tests*.rs` and `crates/*/tests/`). `Tests/` holds the Python protocol and updater-copy tests. Build, packaging and release tools are in `xtask/`, `build-app.sh` and `scripts/`.
 
 To run one CI suite locally, use `./scripts/checks/check-ci.sh SUITE`:
 
