@@ -28,6 +28,11 @@ fn real_backend() -> Option<Arc<dyn Backend>> {
     Some(Arc::new(orbit_backend::EngineBackend::new(platform)))
 }
 
+/// Whether a remembered location still exists as a folder (metadata only; no content reads).
+fn still_a_folder(path: &[u8]) -> bool {
+    std::fs::metadata(orbit_ui::host::os_path(path)).is_ok_and(|meta| meta.is_dir())
+}
+
 fn home() -> Vec<u8> {
     std::env::var_os("HOME").map(|home| path_bytes(home.as_ref())).unwrap_or_else(|| b"/".to_vec())
 }
@@ -101,7 +106,9 @@ fn main() {
             _ if marketing.is_some() => Some(fixture::HOME.to_vec()),
             (Some(_), _) => None,
             (None, true) => settings.settings().last_location.clone().or_else(|| Some(fixture::ROOT.to_vec())),
-            (None, false) => settings.settings().last_location.clone(),
+            // A remembered folder that was deleted or moved meanwhile opens the welcome screen
+            // instead of greeting the user with a "couldn't be opened" error.
+            (None, false) => settings.settings().last_location.clone().filter(|path| still_a_folder(path)),
         };
         let mut config = Config::new(home);
         config.places = settings.settings().places.clone();
