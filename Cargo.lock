@@ -3414,7 +3414,10 @@ dependencies = [
 name = "orbit-bench"
 version = "1.0.0-alpha.0"
 dependencies = [
+ "libc",
  "orbit-core",
+ "orbit-native",
+ "orbit-platform",
 ]
 
 [[package]]
@@ -3435,6 +3438,8 @@ dependencies = [
  "caseless",
  "crossbeam-channel",
  "crossbeam-deque",
+ "foldhash 0.1.5",
+ "hashbrown 0.15.5",
  "memchr",
  "orbit-native",
  "orbit-platform",
