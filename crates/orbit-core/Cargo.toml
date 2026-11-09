@@ -20,6 +20,9 @@ uuid.workspace = true
 thiserror.workspace = true
 unicode-normalization.workspace = true
 caseless.workspace = true
+# Discovery/live: index of directory nodes keyed by (parent, name) hash, without storing paths.
+hashbrown = { version = "0.15", default-features = false, features = ["inline-more"] }
+foldhash = "0.1"
 # Name-sort collation (numeric, locale-aware); see `collate`.
 icu_collator = "2.4"
 icu_locale_core = "2.4"

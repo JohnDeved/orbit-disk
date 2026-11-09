@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 orbit-core.workspace = true
 orbit-platform.workspace = true
+orbit-native.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
