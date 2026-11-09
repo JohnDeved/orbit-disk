@@ -9,7 +9,7 @@
 //!                                                        the folder, identity-checked
 //!   .snapshot(root) / .view(..)     -> SnapshotInfo / FolderTree
 //!   .search(snapshot, query, ..)    -> SearchResults      (prepared NameIndex + SQL tail)
-//!   .prepare_search / .warm_search  -> build the accelerator (now / in the background)
+//!   .prepare_search                 -> build the accelerator (callers choose when)
 //!   .refresh(snapshot, dirs, ckpt)  -> SnapshotInfo       re-lists changed subtrees in a private
 //!                                                        working copy, folds in removal-journal
 //!                                                        history, publishes under the fence
@@ -44,6 +44,9 @@ use std::time::{Duration, Instant};
 
 /// Publication attempts before a refresh gives up on a journal that keeps moving.
 const REFRESH_ATTEMPTS: usize = 8;
+/// A refresh that changed nothing still publishes when the saved map's change-history position
+/// is older than this, so a restart never replays more than this much history.
+const CHECKPOINT_REFRESH_INTERVAL: Duration = Duration::from_secs(600);
 /// Head start the first folder read gets over search preparation (Swift: 250 ms).
 pub const SEARCH_WARMUP_DELAY: Duration = Duration::from_millis(250);
 
@@ -182,25 +185,6 @@ impl<P: Platform> SavedMaps<P> {
         }
         search_indexes().insert(key, PreparedIndex { index, generation: None });
         Ok(true)
-    }
-
-    /// Prepares search on a background thread after [`SEARCH_WARMUP_DELAY`] (Swift: when a map
-    /// becomes the displayed snapshot). Cancel the returned token to abandon it.
-    pub fn warm_search(self: &Arc<Self>, snapshot: SnapshotInfo) -> Cancellation {
-        let cancel = Cancellation::new();
-        let token = cancel.clone();
-        let maps = Arc::clone(self);
-        let _ = std::thread::Builder::new().name("orbit-search-warmup".into()).spawn(move || {
-            let deadline = Instant::now() + SEARCH_WARMUP_DELAY;
-            while Instant::now() < deadline {
-                if token.is_cancelled() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let _ = maps.prepare_search(&snapshot, &token);
-        });
-        cancel
     }
 
     /// Up to `limit` matches for `query` in the saved map, largest first, plus the exact count of
@@ -429,10 +413,28 @@ impl<P: Platform> SavedMaps<P> {
                     plan_refresh(changed.iter().map(Vec::as_slice), &root, &mut facts, cancel)?
                 };
                 let mut stage = self.repair_stage(&copy, root_identity, cancel)?;
+                let issues = stage.writer_ref().issue_fingerprint()?;
+                stage.writer().track_inventory_changes()?;
                 for path in &minimal {
                     stage.writer().mark_subtree_changed(path)?;
                 }
                 drain(&mut stage)?;
+                // Re-listing found nothing new (e.g. a file rewritten with the same size): keep the
+                // saved map instead of publishing an identical one (a durable rewrite, and a new
+                // search accelerator and view reload downstream). Only the change-history position
+                // would advance; it lags until the next real change (replaying it is harmless),
+                // but never for longer than CHECKPOINT_REFRESH_INTERVAL.
+                let checkpoint_due = (event_identity.as_str(), event_id)
+                    != (snapshot.event_identity.as_str(), snapshot.event_id)
+                    && crate::stage::writer::unix_now() - snapshot.scanned_at
+                        >= CHECKPOINT_REFRESH_INTERVAL.as_secs_f64();
+                if stage.writer_ref().inventory_changes()? == 0
+                    && stage.writer_ref().issue_fingerprint()? == issues
+                    && stored.as_ref() == Some(&plan.cursor)
+                    && !checkpoint_due
+                {
+                    return Ok(snapshot.clone());
+                }
                 let elapsed = started.elapsed().as_secs_f64();
                 let cursor = (plan.cursor.identity.as_str(), plan.cursor.sequence);
                 let info = stage.writer().finish_repair(&event_identity, event_id, elapsed, Some(cursor))?;

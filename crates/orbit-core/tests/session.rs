@@ -282,6 +282,36 @@ fn refresh_after_changes_converges_with_the_disk() {
     assert_matches_disk(&maps, &updated);
 }
 
+#[test]
+fn refresh_of_unchanged_folders_keeps_the_saved_map() {
+    let fx = Fixture::new();
+    fx.populate(30, 6);
+    let snapshot = fx.map();
+    let maps = fx.maps();
+    let folder = fx.root.join("d3/e3/f3");
+    let changed = vec![bytes(&folder)];
+    let at = |event_id| ChangeCheckpoint { root: fx.root.clone(), identity: "test-history".into(), event_id };
+    // A real change publishes.
+    write(&folder.join("file-0.dat"), 4_321);
+    let first = maps.refresh(&snapshot, &changed, Some(&at(5)), &Cancellation::new()).unwrap();
+    assert_ne!(first.id, snapshot.id);
+    let published = identity(&first.database);
+    // The folder reported again without a real change (rewritten with the same size): the saved map
+    // stays as it is, file and all.
+    write(&folder.join("file-0.dat"), 4_321);
+    let second = maps.refresh(&first, &changed, Some(&at(6)), &Cancellation::new()).unwrap();
+    assert_eq!(second, first);
+    assert_eq!(identity(&first.database), published, "nothing was published");
+    assert_eq!(maps.snapshot(&bytes(&fx.root)).map(|s| s.event_id), Some(5), "the history position lags");
+    // The next real change publishes, with the newer position.
+    write(&folder.join("file-1.dat"), 1);
+    let third = maps.refresh(&second, &changed, Some(&at(7)), &Cancellation::new()).unwrap();
+    assert_ne!(third.id, first.id);
+    assert_eq!(third.event_id, 7);
+    assert_ne!(identity(&third.database), published);
+    assert_matches_disk(&maps, &third);
+}
+
 fn allow_all(_: &[u8]) -> Option<String> {
     None
 }

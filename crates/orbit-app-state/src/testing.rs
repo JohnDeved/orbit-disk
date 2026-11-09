@@ -41,6 +41,8 @@ struct Fs {
     snapshot_ids: u64,
     hidden: BTreeSet<Vec<u8>>,
     saved: HashMap<Vec<u8>, SnapshotInfo>,
+    /// The filesystem revision each saved map was taken at.
+    saved_revision: HashMap<Vec<u8>, u64>,
     protected: Vec<Vec<u8>>,
     exclusions: HashMap<Vec<u8>, String>,
     volumes: Vec<Volume>,
@@ -175,6 +177,8 @@ impl FakeBackend {
             needs_boot_upgrade: false,
         };
         fs.saved.insert(root.to_vec(), snapshot.clone());
+        let revision = fs.revision;
+        fs.saved_revision.insert(root.to_vec(), revision);
         snapshot
     }
 
@@ -457,9 +461,17 @@ impl Backend for FakeBackend {
     }
 
     fn refresh(&self, request: &RefreshRequest, _: &Cancellation) -> Result<SnapshotInfo, String> {
-        if let Some(message) = self.fs().fail_refresh.take() {
+        let mut fs = self.fs();
+        if let Some(message) = fs.fail_refresh.take() {
             return Err(message);
         }
+        // Like the engine: when nothing changed on disk since the map was saved, it is kept.
+        if fs.saved_revision.get(&request.root[..]) == Some(&fs.revision)
+            && let Some(saved) = fs.saved.get(&request.root[..])
+        {
+            return Ok(saved.clone());
+        }
+        drop(fs);
         Ok(self.save(&request.root))
     }
 

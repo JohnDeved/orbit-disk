@@ -212,4 +212,19 @@ mod tests {
         ledger.push(batch(&["/r/e"], true, 5));
         assert_eq!(ledger.settle(&paths(&["/r"])), None, "a full refresh re-maps instead");
     }
+
+    /// Deferred (off-screen) changes hold the position back while visible ones are refreshed;
+    /// the deferred refresh, which also takes everything delivered meanwhile, releases it.
+    #[test]
+    fn deferred_batches_hold_the_checkpoint_until_their_refresh() {
+        let mut ledger = Ledger::default();
+        ledger.push(batch(&["/r/elsewhere"], false, 1));
+        ledger.push(batch(&["/r/shown/a"], false, 2));
+        assert_eq!(ledger.settle(&paths(&["/r/shown"])), None, "the deferred batch is older");
+        ledger.push(batch(&["/r/shown/b"], false, 3));
+        ledger.push(batch(&["/r/elsewhere/deep"], false, 4));
+        let settled = ledger.settle(&paths(&["/r/elsewhere", "/r/shown"]));
+        assert_eq!(settled.map(|c| c.event_id), Some(4));
+        assert_eq!(ledger.settle(&paths(&["/r"])), None, "nothing is left to persist");
+    }
 }

@@ -8,7 +8,8 @@
 //!                   map, reuse, MappingSession, throttled Progress / PreviewChanged, Published
 //!   view / search / discovered_file_count   the session's live mapping, else its saved map
 //!   monitor      platform change monitor -> debounced MappingEvent::Changes (see `monitor`)
-//!   refresh      SavedMaps::refresh; persists the history position of the batches it covers
+//!   refresh      SavedMaps::refresh; persists the history position of the batches it covers;
+//!                the refreshed map's search index is rebuilt once it settles (see `warm`)
 //!   remove       orbit_core::removal::remove (Trash or permanent delete, journaled)
 //! ```
 //!
@@ -22,6 +23,7 @@ mod convert;
 mod mapping;
 mod monitor;
 mod registry;
+mod warm;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -51,6 +53,7 @@ use parking_lot::Mutex;
 use crate::convert::{FOLDER_UNAVAILABLE, MAP_UNAVAILABLE, MAP_UPDATING, ROOT_CHANGED, message};
 use crate::monitor::MonitorRun;
 use crate::registry::{Entry, Snapshots};
+use crate::warm::{REFRESH_WARM_DELAY, SearchWarmer};
 
 /// How long removal-policy inputs (cloud roots, mounted volumes) are reused between checks.
 const POLICY_INPUTS_TTL: Duration = Duration::from_secs(2);
@@ -132,6 +135,8 @@ pub(crate) struct Inner<P: Platform> {
     pub platform: Arc<P>,
     pub options: BackendOptions,
     pub maps: Arc<SavedMaps<P>>,
+    /// Rebuilds search indexes of refreshed saved maps once they settle (or a search needs one).
+    warmer: SearchWarmer<P>,
     sessions: Mutex<HashMap<SessionId, Arc<Entry<P>>>>,
     snapshots: Mutex<Snapshots>,
     policy: Mutex<Option<(Instant, Arc<PolicyInputs>)>>,
@@ -155,6 +160,7 @@ impl<P: Platform> EngineBackend<P> {
             inner: Arc::new(Inner {
                 platform,
                 options,
+                warmer: SearchWarmer::new(Arc::clone(&maps)),
                 maps,
                 sessions: Mutex::default(),
                 snapshots: Mutex::default(),
@@ -181,6 +187,7 @@ impl<P: Platform> EngineBackend<P> {
         for entry in entries {
             entry.shut_down();
         }
+        self.inner.warmer.stop();
     }
 }
 
@@ -494,6 +501,10 @@ impl<P: Platform> Backend for EngineBackend<P> {
             // The saved map's order (largest first, then path) is stable across hand-offs.
             SearchSource::Saved { snapshot, .. } => inner.saved_snapshot(snapshot)?,
         };
+        // A refreshed map whose index is not rebuilt yet: build it now for the next keystrokes.
+        if !inner.maps.is_search_prepared(&saved) {
+            inner.warmer.schedule(saved.clone(), Duration::ZERO);
+        }
         let results =
             result_message(inner.maps.search(&saved, &request.query, &request.removals, request.limit, Some(cancel)))?;
         Ok(convert::search_reply(results, 0))
@@ -540,8 +551,11 @@ impl<P: Platform> Backend for EngineBackend<P> {
         if let Some(entry) = entry {
             entry.set_saved(updated.clone());
         }
-        // The rewritten file needs a new accelerator; the next search uses SQL until it is ready.
-        let _ = inner.maps.warm_search(updated);
+        // A rewritten file needs a new accelerator, built once the map settles (searches use SQL
+        // until then). An unchanged map keeps its file and its accelerator.
+        if saved.id != updated.id {
+            inner.warmer.schedule(updated, REFRESH_WARM_DELAY);
+        }
         Ok(info)
     }
 
