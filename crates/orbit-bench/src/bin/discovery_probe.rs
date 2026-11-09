@@ -4,7 +4,9 @@
 //! discovery_probe fixtures --dir DIR
 //! discovery_probe bench    --dir DIR [--workers 4,6,8,10] [--samples 5] [--fixtures flat,mixed]
 //! discovery_probe sample   --dir DIR --fixture flat --workers 6      (one measured child run)
+//! discovery_probe profile  --dir DIR --fixture mixed --workers 4 [--seconds 10]  (repeat, for `sample`)
 //! discovery_probe micro                                              (view and search benches)
+//! discovery_probe scaling  --dir DIR [--spread same-parent]          (kernel calls alone, 1-8 threads)
 //! ```
 //!
 //! Fixture shapes follow `docs/benchmarks/parallel-discovery.json` (the Swift generator is not in
@@ -48,7 +50,18 @@ fn main() {
         }
         Some("bench") => bench(&args),
         Some("micro") => micro(),
-        Some("scaling") => scaling(&PathBuf::from(arg(&args, "--dir").expect("--dir"))),
+        Some("profile") => {
+            // Repeats discovery in one process for `sample <pid>` / profilers.
+            let dir = PathBuf::from(arg(&args, "--dir").expect("--dir"));
+            let fixture = arg(&args, "--fixture").expect("--fixture");
+            let workers: usize = arg(&args, "--workers").map_or(4, |w| w.parse().unwrap());
+            let seconds: f64 = arg(&args, "--seconds").map_or(10.0, |s| s.parse().unwrap());
+            let started = Instant::now();
+            while started.elapsed().as_secs_f64() < seconds {
+                sample(&dir, &fixture, workers);
+            }
+        }
+        Some("scaling") => scaling(&args),
         _ => {
             eprintln!("usage: discovery_probe fixtures|bench|sample|micro --dir DIR ...");
             std::process::exit(2);
@@ -382,38 +395,78 @@ impl orbit_platform::ListingSink for Count {
     fn issue(&mut self, _issue: orbit_platform::Issue) {}
 }
 
-/// Raw platform scaling: T threads list disjoint leaf folders of `mixed`, opened by path.
-fn scaling(dir: &Path) {
+/// Raw platform scaling on `mixed`: each kernel operation discovery performs, alone, on T threads
+/// over disjoint slices of the 3,600 leaf folders (best of three passes). Parents and leaves are
+/// opened before timing, so `list` measures enumeration only and `open_child` measures one
+/// relative open + identity check + close. `--spread same-parent` interleaves the slices so
+/// concurrent threads work in the same parent folder.
+fn scaling(args: &[String]) {
     use orbit_platform::DirectoryLister;
+    let dir = PathBuf::from(arg(args, "--dir").expect("--dir"));
+    let interleave = arg(args, "--spread").as_deref() == Some("same-parent");
     let root = fs::canonicalize(dir.join("mixed")).unwrap();
+    let platform = Native::new();
+    let mut parents = Vec::new();
     let mut leaves = Vec::new();
     for t in 0..60 {
+        let parent = root.join(format!("t{t:02}"));
+        parents.push(platform.open_root(&parent).unwrap().0);
         for s in 0..60 {
-            leaves.push(root.join(format!("t{t:02}/s{s:02}")));
+            let path = parent.join(format!("s{s:02}"));
+            let (handle, identity) = platform.open_root(&path).unwrap();
+            let name = format!("s{s:02}").into_bytes();
+            leaves.push((t, name, identity, handle, path.as_os_str().as_bytes().to_vec()));
         }
     }
-    let platform = Native::new();
-    for threads in [1, 2, 4, 6, 8] {
-        for mode in ["open+list", "open-only"] {
-            let started = Instant::now();
-            std::thread::scope(|scope| {
-                for t in 0..threads {
-                    let leaves = &leaves;
-                    let platform = &platform;
-                    scope.spawn(move || {
-                        let mut lister = platform.new_lister();
-                        let cancel = Cancellation::new();
-                        let n = leaves.len();
-                        for leaf in &leaves[t * n / threads..(t + 1) * n / threads] {
-                            let (dir, _) = platform.open_root(leaf).unwrap();
-                            if mode == "open+list" {
-                                lister.list(&dir, leaf.as_os_str().as_bytes(), &cancel, &mut Count).unwrap();
+    let threads_list = [1, 2, 4, 8];
+    println!(
+        "operation (3,600 leaf folders, {}) | {}",
+        if interleave { "same parent" } else { "split parents" },
+        threads_list.map(|t| format!("{t} thread(s)")).join(" | ")
+    );
+    for mode in ["open_child", "child_identity", "list", "open_child+list", "open_root (path)"] {
+        let mut cells = Vec::new();
+        for threads in threads_list {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let started = Instant::now();
+                std::thread::scope(|scope| {
+                    for t in 0..threads {
+                        let (leaves, parents, platform) = (&leaves, &parents, &platform);
+                        scope.spawn(move || {
+                            let mut lister = platform.new_lister();
+                            let cancel = Cancellation::new();
+                            let n = leaves.len();
+                            let mine: Vec<usize> = if interleave {
+                                (t..n).step_by(threads).collect()
+                            } else {
+                                (t * n / threads..(t + 1) * n / threads).collect()
+                            };
+                            for index in mine {
+                                let (parent, name, identity, handle, path) = &leaves[index];
+                                let parent = &parents[*parent];
+                                match mode {
+                                    "open_child" => drop(platform.open_child(parent, name, *identity).unwrap()),
+                                    "child_identity" => {
+                                        assert_eq!(platform.child_identity(parent, name).unwrap(), *identity)
+                                    }
+                                    "list" => drop(lister.list(handle, path, &cancel, &mut Count).unwrap()),
+                                    "open_child+list" => {
+                                        let opened = platform.open_child(parent, name, *identity).unwrap();
+                                        lister.list(&opened, path, &cancel, &mut Count).unwrap();
+                                    }
+                                    _ => {
+                                        drop(platform.open_root(Path::new(std::ffi::OsStr::from_bytes(path))).unwrap())
+                                    }
+                                }
                             }
-                        }
-                    });
-                }
-            });
-            println!("{threads} threads {mode}: {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+                        });
+                    }
+                });
+                best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            cells.push(format!("{best:.1} ms"));
         }
+        println!("{mode} | {}", cells.join(" | "));
     }
 }

@@ -61,7 +61,9 @@ use std::time::{Duration, Instant};
 /// flat from 1 to 10 workers because the kernel serialized directory opens and listings
 /// (`discovery_probe scaling` shows the raw platform calls do not scale either), while system
 /// CPU grew with every worker. Four matches the Swift build, which scaled ~2.7x with four
-/// workers when the kernel did not serialize.
+/// workers when the kernel did not serialize. Root cause and paired Swift numbers:
+/// `docs/benchmarks/rust-port/discovery-scaling.md` (opens and per-file attribute reads are
+/// serialized system-wide; where the kernel parallelizes, four workers are ~2.3x faster than one).
 pub const DEFAULT_WORKERS: usize = 4;
 /// Records in the first published batch of a directory (immediately visible, fresh-leaf sized).
 pub const FIRST_BATCH: usize = LISTING_BATCH;

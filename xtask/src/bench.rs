@@ -8,8 +8,9 @@
 //! - `marking`: `marking_probe` vs. Swift `MarkingProbe` (3 timed passes per process).
 //! - `pipeline`: `pipeline_probe` vs. Swift `PipelineProbe`, through
 //!   `scripts/benchmarks/run-indexing-pipeline.py`.
-//! - `discovery`: `discovery_probe` (Rust only; no Swift probe binary exists). The Swift column
-//!   shows the documented `docs/benchmarks/parallel-discovery.json` medians, not a paired run.
+//! - `discovery`: `discovery_probe sample` vs. Swift `DiscoveryProbe producer`
+//!   (`Benchmarks/Discovery`, built by `scripts/benchmarks/build-discovery.sh`) on the same
+//!   generated flat and mixed fixtures, 1/4/8 workers (4 with `--small`), with CPU and RSS.
 //! - `e2e`: `e2e_probe` (Rust only); the documented Swift reference is a different tree.
 //!
 //! Writes `results.jsonl` (one line per sample, with the probe's raw output), `summary.md`
@@ -117,8 +118,7 @@ pub fn run(args: &[OsString]) -> Result<()> {
     if fs::symlink_metadata(&output).is_ok() {
         return Err(format!("{} already exists; bench-compare writes into a new directory", output.display()));
     }
-    let needs_swift = options.suites.iter().any(|suite| ["indexing", "marking", "pipeline"].contains(&suite.as_str()));
-    let swift = if needs_swift { Some(swift_probes(&options.swift_dir)?) } else { None };
+    let swift = swift_probes(&options.swift_dir, &options.suites)?;
 
     let root = workspace_root();
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
@@ -149,15 +149,16 @@ pub fn run(args: &[OsString]) -> Result<()> {
     eprintln!("bench-compare: load average before: {}", environment["load_before"].as_str().unwrap_or("?"));
 
     let suites = run.options.suites.clone();
+    let swift_path = |kind: &str| swift.as_ref().expect("loaded for the selected suites").path(kind);
     let mut loads = Vec::new();
     for suite in &suites {
         let before = load_average();
         eprintln!("bench-compare: suite {suite} (load {before})");
         match suite.as_str() {
-            "indexing" => run.indexing(&rust_dir.join("indexing_probe"), &swift.as_ref().expect("checked").indexing)?,
-            "marking" => run.marking(&rust_dir.join("marking_probe"), &swift.as_ref().expect("checked").marking)?,
-            "pipeline" => run.pipeline(&rust_dir.join("pipeline_probe"), &swift.as_ref().expect("checked").pipeline)?,
-            "discovery" => run.discovery(&rust_dir.join("discovery_probe"))?,
+            "indexing" => run.indexing(&rust_dir.join("indexing_probe"), swift_path("indexing"))?,
+            "marking" => run.marking(&rust_dir.join("marking_probe"), swift_path("marking"))?,
+            "pipeline" => run.pipeline(&rust_dir.join("pipeline_probe"), swift_path("pipeline"))?,
+            "discovery" => run.discovery(&rust_dir.join("discovery_probe"), swift_path("discovery"))?,
             "e2e" => run.e2e(&rust_dir.join("e2e_probe"))?,
             _ => unreachable!("validated in parse"),
         }
@@ -335,76 +336,85 @@ impl Run {
         Ok(())
     }
 
-    fn discovery(&mut self, rust: &Path) -> Result<()> {
+    /// `discovery_probe sample` vs. Swift `DiscoveryProbe producer` on the same generated fixtures
+    /// (flat, mixed), 1/4/8 workers, one fresh process per sample, order alternating per round.
+    fn discovery(&mut self, rust: &Path, swift: &Path) -> Result<()> {
         let dir = self.work.0.join("discovery");
         self.probe("discovery", "fixtures", Command::new(rust).arg("fixtures").arg("--dir").arg(&dir))?;
-        let workers = "4";
         let fixtures = ["flat", "mixed"];
+        let workers: &[u32] = if self.options.small { &[4] } else { &[1, 4, 8] };
+        let mut expected = BTreeMap::new();
         for fixture in fixtures {
-            // Unmeasured warm-up, as in `discovery_probe bench`.
-            self.probe("discovery", &format!("warmup-{fixture}"), &mut sample_command(rust, &dir, fixture, workers))?;
+            expected.insert(fixture, discovery_manifest(&dir, fixture)?);
+        }
+        let command = |label: &str, fixture: &str, workers: u32| -> Command {
+            let workers = workers.to_string();
+            if label == "rust" {
+                let mut command = Command::new(rust);
+                command.arg("sample").arg("--dir").arg(&dir).args(["--fixture", fixture, "--workers", &workers]);
+                command
+            } else {
+                let (records, files) = expected[fixture];
+                let mut command = Command::new(swift);
+                command.arg("producer").arg(dir.join(fixture)).args([workers, records.to_string(), files.to_string()]);
+                command
+            }
+        };
+        // Unmeasured warm-up of both implementations, as in `discovery_probe bench`.
+        for fixture in fixtures {
+            for label in ["rust", "swift"] {
+                self.probe("discovery", &format!("warmup-{fixture}-{label}"), &mut command(label, fixture, 4))?;
+            }
         }
         for round in 1..=self.options.rounds {
             for fixture in fixtures {
-                let name = format!("r{round}-{fixture}-rust");
-                let line = self.probe("discovery", &name, &mut sample_command(rust, &dir, fixture, workers))?;
-                let fields: BTreeMap<&str, &str> =
-                    line.split_whitespace().filter_map(|kv| kv.split_once('=')).collect();
-                if fields.get("correct") != Some(&"true") {
-                    return Err(format!("{name}: incorrect inventory: {line}"));
+                for index in 0..workers.len() {
+                    // Rotate the worker order too, so no count always runs first.
+                    let count = workers[(index + round as usize) % workers.len()];
+                    for (label, _) in ordered(round, rust, swift) {
+                        let name = format!("r{round}-{fixture}-w{count}-{label}");
+                        let load = load_average();
+                        let stdout = self.probe("discovery", &name, &mut command(label, fixture, count))?;
+                        let mut raw = discovery_output(label, &stdout).map_err(|error| format!("{name}: {error}"))?;
+                        if raw["correct"] != json!(true) && raw["correct"] != json!("true") {
+                            return Err(format!("{name}: incorrect inventory: {stdout}"));
+                        }
+                        raw["load_before"] = json!(load);
+                        let value = |key: &str| -> Result<f64> {
+                            raw[key]
+                                .as_f64()
+                                .or_else(|| raw[key].as_str().and_then(|v| v.parse().ok()))
+                                .ok_or_else(|| format!("{name}: no {key} in {stdout}"))
+                        };
+                        let scenario = format!("{fixture} ({count} worker{})", if count == 1 { "" } else { "s" });
+                        for (metric, unit, number) in [
+                            ("discovery", "s", value("discovery_ms")? / 1e3),
+                            ("user CPU", "s", value("user_ms")? / 1e3),
+                            ("system CPU", "s", value("system_ms")? / 1e3),
+                            ("peak RSS", "MiB", value("peak_rss")? / 1_048_576.0),
+                        ] {
+                            self.record(Sample {
+                                suite: "discovery",
+                                scenario: scenario.clone(),
+                                label,
+                                round,
+                                metric,
+                                unit,
+                                value: number,
+                                raw: raw.clone(),
+                            })?;
+                        }
+                    }
                 }
-                let field = |key: &str| -> Result<f64> {
-                    fields.get(key).and_then(|v| v.parse().ok()).ok_or_else(|| format!("{name}: no {key} in {line}"))
-                };
-                let raw = json!(fields);
-                let scenario = format!("{fixture} ({workers} workers)");
-                self.record(Sample {
-                    suite: "discovery",
-                    scenario: scenario.clone(),
-                    label: "rust",
-                    round,
-                    metric: "discovery",
-                    unit: "s",
-                    value: field("discovery_ms")? / 1e3,
-                    raw: raw.clone(),
-                })?;
-                self.record(Sample {
-                    suite: "discovery",
-                    scenario,
-                    label: "rust",
-                    round,
-                    metric: "peak RSS",
-                    unit: "MiB",
-                    value: field("peak_rss")? / 1_048_576.0,
-                    raw,
-                })?;
             }
         }
         let _ = fs::remove_dir_all(&dir);
-        // Documented Swift medians (stage mode, the shipped candidate) from parallel-discovery.json.
-        let documented = workspace_root().join("docs/benchmarks/parallel-discovery.json");
-        if let Ok(text) = fs::read_to_string(&documented) {
-            let doc: Value =
-                serde_json::from_str(&text).map_err(|error| format!("{}: {error}", documented.display()))?;
-            for entry in doc["summary"].as_array().into_iter().flatten() {
-                if entry["mode"] == "stage"
-                    && let (Some(fixture), Some(median)) =
-                        (entry["fixture"].as_str(), entry["candidate"]["discovery_ms"]["median"].as_f64())
-                {
-                    self.references.push(Reference {
-                        suite: "discovery",
-                        // The documented mixed fixture is named `mixed-deep`; the probe generates the same shape.
-                        scenario: format!("{} ({workers} workers)", fixture.trim_end_matches("-deep")),
-                        metric: "discovery",
-                        value: median / 1e3,
-                        source: "docs/benchmarks/parallel-discovery.json (2026-10-28, stage mode)",
-                    });
-                }
-            }
-        }
         self.notes.push(
-            "discovery: Rust only (no Swift discovery probe binary exists); the Swift column is the documented \
-             median from a different session, so no speedup is computed."
+            "discovery: discovery into the live inventory only (no writer). Swift runs `AsyncListingProducer` with a \
+             `LiveMappingInventory` (Benchmarks/Discovery/DiscoveryProbe.swift); its four-worker clamp is raised in the \
+             benchmark copy so 8 workers mean 8. CPU rows are process user/system time over the same span. The \
+             unpaired 2026-10-28 Swift numbers in docs/benchmarks/parallel-discovery.json are not comparable \
+             (see docs/benchmarks/rust-port/discovery-scaling.md)."
                 .into(),
         );
         Ok(())
@@ -556,10 +566,30 @@ impl Run {
     }
 }
 
-fn sample_command(rust: &Path, dir: &Path, fixture: &str, workers: &str) -> Command {
-    let mut command = Command::new(rust);
-    command.arg("sample").arg("--dir").arg(dir).args(["--fixture", fixture, "--workers", workers]);
-    command
+/// `records=N files=M` written by `discovery_probe fixtures` next to each fixture.
+fn discovery_manifest(dir: &Path, fixture: &str) -> Result<(u64, u64)> {
+    let path = dir.join(format!("{fixture}.manifest"));
+    let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let value = |key: &str| -> Result<u64> {
+        text.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(key))
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| format!("{}: no {key}", path.display()))
+    };
+    Ok((value("records=")?, value("files=")?))
+}
+
+/// The Rust probe prints `key=value` pairs, the Swift probe one JSON object.
+fn discovery_output(label: &str, stdout: &str) -> Result<Value> {
+    if label == "swift" {
+        return serde_json::from_str(stdout.trim()).map_err(|error| error.to_string());
+    }
+    let fields: serde_json::Map<String, Value> = stdout
+        .split_whitespace()
+        .filter_map(|kv| kv.split_once('='))
+        .map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
+        .collect();
+    Ok(Value::Object(fields))
 }
 
 struct Stats {
@@ -636,25 +666,41 @@ fn keep_runner_output(work: &Path, raw: &Path) -> Result<()> {
 // --- Swift probes and environment ---------------------------------------------------------------
 
 struct SwiftProbes {
-    indexing: PathBuf,
-    marking: PathBuf,
-    pipeline: PathBuf,
+    paths: BTreeMap<&'static str, PathBuf>,
     manifests: Value,
 }
 
-/// `DIR/swift-v0.9.15-{indexing,marking,pipeline}/<Probe>` as built by
-/// `scripts/benchmarks/build-durable-indexing.sh`; each binary must match its manifest hash.
-fn swift_probes(dir: &Path) -> Result<SwiftProbes> {
+impl SwiftProbes {
+    fn path(&self, kind: &str) -> &Path {
+        self.paths.get(kind).expect("loaded for every selected suite")
+    }
+}
+
+/// `DIR/swift-v0.9.15-<suite>/<Probe>` for every selected suite with a Swift probe, as built by
+/// `scripts/benchmarks/build-durable-indexing.sh` (indexing, marking, pipeline) and
+/// `scripts/benchmarks/build-discovery.sh` (discovery); each binary must match its manifest hash.
+/// `None` when no selected suite has one.
+fn swift_probes(dir: &Path, suites: &[String]) -> Result<Option<SwiftProbes>> {
+    const PROBES: [(&str, &str, &str); 4] = [
+        ("indexing", "IndexingProbe", "build-durable-indexing.sh <v0.9.15 checkout> {} grouped indexing"),
+        ("marking", "MarkingProbe", "build-durable-indexing.sh <v0.9.15 checkout> {} grouped marking"),
+        ("pipeline", "PipelineProbe", "build-durable-indexing.sh <v0.9.15 checkout> {} grouped pipeline"),
+        ("discovery", "DiscoveryProbe", "build-discovery.sh <v0.9.15 checkout> {}"),
+    ];
     let mut manifests = serde_json::Map::new();
-    let mut probe = |kind: &str, binary: &str| -> Result<PathBuf> {
+    let mut paths = BTreeMap::new();
+    for (kind, binary, build) in PROBES {
+        if !suites.iter().any(|suite| suite == kind) {
+            continue;
+        }
         let folder = dir.join(format!("swift-v0.9.15-{kind}"));
         let path = folder.join(binary);
         if !path.is_file() {
             return Err(format!(
-                "Swift probe {} is missing. Build it from the v0.9.15 tag with \
-                 `scripts/benchmarks/build-durable-indexing.sh <v0.9.15 checkout> {} grouped {kind}` or pass --swift-dir.",
+                "Swift probe {} is missing. Build it from the v0.9.15 tag with `scripts/benchmarks/{}` or pass \
+                 --swift-dir.",
                 path.display(),
-                folder.display()
+                build.replace("{}", &folder.display().to_string()),
             ));
         }
         let actual = sha256(&path)?;
@@ -667,13 +713,13 @@ fn swift_probes(dir: &Path) -> Result<SwiftProbes> {
         {
             return Err(format!("{} does not match its manifest.json hash", path.display()));
         }
-        manifests.insert(kind.into(), json!({"path": path, "binary_sha256": actual, "swift": manifest["swift"]}));
-        Ok(path)
-    };
-    let indexing = probe("indexing", "IndexingProbe")?;
-    let marking = probe("marking", "MarkingProbe")?;
-    let pipeline = probe("pipeline", "PipelineProbe")?;
-    Ok(SwiftProbes { indexing, marking, pipeline, manifests: Value::Object(manifests) })
+        manifests.insert(
+            kind.into(),
+            json!({"path": path, "binary_sha256": actual, "swift": manifest["swift"], "patches": manifest["patches"]}),
+        );
+        paths.insert(kind, path);
+    }
+    Ok((!paths.is_empty()).then_some(SwiftProbes { paths, manifests: Value::Object(manifests) }))
 }
 
 fn sha256(path: &Path) -> Result<String> {
