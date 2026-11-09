@@ -30,3 +30,18 @@ Seam and wiring changes that agents requested. The integrator applies them once 
 ## Behavior differences to confirm with the user
 - Removal policy is stricter under `/private`: real canonical paths are compared, so `/private/var/...` outside temp roots is rejected. Swift allowed it via Foundation's `/private` stripping.
 - Search accelerator budget is 96 MiB, about 860k varied names. Larger maps search the tail with SQL, same as Swift.
+
+## From the durable-index merge
+- [ ] Dedupe `lease::sys` and `journal::sys` into `orbit_platform::posix`:
+  - `openat`, `mkdirat`, `unlinkat`, `renameat`, `O_EXCL` create
+  - masked `fstat`/`fstatat`/`lstat` returning mode, uid, nlink, size, mtime, ctime
+  - `geteuid`; fd read/write/fsync
+- [ ] Optional: a set of inaccessible/unavailable directories on `MailboxSnapshot`.
+- [ ] Not ported yet:
+  - saved-map and staged search over SQL (`DiskIndexStore.search`/`stagedSearch`) using `search::NameIndex`
+  - `StageReuse`
+  - feeding the local pass into the live inventory
+  - `StageRemovalReplay` wiring (`ReplayTarget` over `Writer`)
+  - `DiscoveryCacheReader` (`ListingCache` over the stage DB)
+  - `MappingCoverage`
+  - path canonicalization (`IndexLocations`)
