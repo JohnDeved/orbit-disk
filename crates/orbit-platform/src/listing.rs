@@ -77,7 +77,10 @@ pub trait DirectoryLister: Send {
 
     /// Streams every entry of `dir` to `sink` in batches of at most [`LISTING_BATCH`].
     ///
-    /// `path` is the directory's full path, used only for issues and errors. Entries whose
+    /// `path` is the directory's full, standardized path, used for issues and errors and to
+    /// recognize directories that hold volume aliases (macOS firmlinks under `/`): such alias
+    /// entries are reported with the identity a no-follow open of the name yields, never the
+    /// stub's. A listing can be repeated on the same `dir`. Entries whose
     /// metadata cannot be read are reported through [`ListingSink::issue`] and skipped. The
     /// lister checks `cancel` at least every [`LISTING_BATCH`] entries and returns
     /// [`crate::PlatformError::Cancelled`]. A [`Stop`] from the sink also ends with `Cancelled`.

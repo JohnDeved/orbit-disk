@@ -28,7 +28,7 @@ pub use error::{PlatformError, Result};
 pub use listing::{
     DirectoryLister, EntryKind, EntryRecord, FileIdentity, Issue, LISTING_BATCH, ListingSink, ListingTotals, Stop,
 };
-pub use shell::{LegacySettings, Shell, Updater, UpdaterState};
+pub use shell::{LegacySettings, RelaunchHandle, Shell, Updater, UpdaterState};
 pub use system::{AppDirs, BootLayout, CloudStatus, ProtectedPaths, VolumeInfo, VolumeLayout};
 
 use std::path::{Path, PathBuf};
