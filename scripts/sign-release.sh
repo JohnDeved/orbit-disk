@@ -24,6 +24,7 @@ plutil -lint -s "$entitlements"
 framework="$app_path/Contents/Frameworks/Sparkle.framework"
 executables=("$app_path/Contents/MacOS/OrbitDisk" "$app_path/Contents/MacOS/OrbitControl")
 
+# Called in subshells: zsh skips EXIT traps (keychain cleanup) when errexit fires in a function.
 # Signs nested code first. Sparkle's helpers keep their own entitlements; OrbitControl and the
 # app (whose signature covers Contents/MacOS/OrbitDisk) get Config/OrbitDisk.entitlements.
 sign_bundle() {
@@ -63,8 +64,8 @@ if $dry_run; then
   unset APPLE_CERTIFICATE_P12_BASE64 APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
     APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER
   print 'Dry run: rehearsing Developer ID signing with an ad-hoc identity (hardened runtime, entitlements).'
-  sign_bundle - --timestamp=none
-  check_signature
+  (sign_bundle - --timestamp=none)
+  (check_signature)
   # The hardened runtime must not stop the executables from loading (dyld, library validation).
   "$app_path/Contents/MacOS/OrbitDisk" --help >/dev/null 2>&1 || (( $? == 2 ))
   print 'Dry run: would now submit to Apple and staple:'
@@ -109,8 +110,8 @@ unset APPLE_CERTIFICATE_PASSWORD
 rm "$staging/certificate.p12"
 security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
 unset keychain_password
-sign_bundle "$APPLE_SIGNING_IDENTITY" --keychain "$keychain" --timestamp
-check_signature
+(sign_bundle "$APPLE_SIGNING_IDENTITY" --keychain "$keychain" --timestamp)
+(check_signature)
 ditto -c -k --sequesterRsrc --keepParent "$app_path" "$staging/notarization.zip"
 if ! xcrun notarytool submit "$staging/notarization.zip" --key "$staging/AuthKey.p8" \
   --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" \
