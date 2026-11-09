@@ -85,3 +85,168 @@ pub fn placeholder_tag(owner: &'static str) -> Div {
 }
 
 use gpui::prelude::FluentBuilder as _;
+
+// --- chrome panels ---
+// Shared by the toolbar, sidebar, footer, tray and welcome panels; the collection drag payload is
+// also the contract between the drag sources (map, list) and the tray.
+
+/// The typed payload of an in-app collection drag (map sectors, file rows, search results).
+///
+/// Sources start the GPUI drag with `.on_drag(CollectionDrag { drag, label }, |payload, _, _, cx|
+/// cx.new(|_| payload.clone()))` and send `Event::DragBegin { drag, .. }` when it starts; they send
+/// `Event::DragEnd { drag }` when it ends anywhere but the tray (Escape, released elsewhere). The
+/// tray accepts it with `on_drop::<CollectionDrag>`, sends `DragOverTray` while the pointer
+/// crosses it and `DragDrop` on release. The payload doubles as the drag preview (a label pill).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectionDrag {
+    pub drag: orbit_app_state::DragId,
+    pub label: SharedString,
+}
+
+impl gpui::Render for CollectionDrag {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
+            .max_w(px(260.))
+            .px(px(10.))
+            .py(px(5.))
+            .rounded(px(6.))
+            .bg(theme::with_alpha(theme::PANEL, 0.95))
+            .border_1()
+            .border_color(theme::with_alpha(theme::CORAL, 0.6))
+            .text_size(theme::TEXT_BODY)
+            .text_color(theme::color(theme::TEXT))
+            .font_family(theme::FONT_FAMILY)
+            .child(icon(Icon::TrayDown).size(px(12.)).text_color(theme::color(theme::CORAL)))
+            .child(div().min_w_0().truncate().child(self.label.clone()))
+    }
+}
+
+/// A compact bordered button (native `.controlSize(.small)`): 20 points tall and `width` wide, so
+/// changing its label never moves its neighbours.
+pub fn small_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    width: gpui::Pixels,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<Div> {
+    let fg = if enabled { theme::color(theme::TEXT) } else { theme::with_alpha(theme::SLATE, 0.6) };
+    let element = div()
+        .id(id.into())
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(width)
+        .h(px(20.))
+        .rounded(px(5.))
+        .bg(theme::white(0.08))
+        .text_color(fg)
+        .text_size(theme::TEXT_SMALL)
+        .child(label.into())
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+    if enabled {
+        element.cursor(CursorStyle::PointingHand).hover(|s| s.bg(theme::white(0.14))).on_click(on_click)
+    } else {
+        element
+    }
+}
+
+/// A help tooltip (`.help(…)` in the Swift app).
+pub struct Tooltip(SharedString);
+
+impl gpui::Render for Tooltip {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(320.))
+            .px(px(8.))
+            .py(px(4.))
+            .rounded(px(5.))
+            .bg(theme::color(theme::PANEL))
+            .border_1()
+            .border_color(theme::white(0.14))
+            .text_size(theme::TEXT_SMALL)
+            .text_color(theme::color(theme::TEXT))
+            .font_family(theme::FONT_FAMILY)
+            .child(self.0.clone())
+    }
+}
+
+/// Builds a [`Tooltip`] for `.tooltip(…)`.
+pub fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    let text = text.into();
+    move |_, cx| gpui::AppContext::new(cx, |_| Tooltip(text.clone())).into()
+}
+
+/// The small activity indicator (native `ProgressView`). Under Reduce Motion it is the static
+/// `fallback` symbol instead of a spinning one.
+pub fn activity_indicator(
+    id: impl Into<ElementId>,
+    size: gpui::Pixels,
+    reduce_motion: bool,
+    fallback: Icon,
+) -> gpui::AnyElement {
+    use gpui::{Animation, AnimationExt as _, Transformation, percentage};
+    if reduce_motion {
+        return icon(fallback).size(size).text_color(theme::color(theme::SLATE)).into_any_element();
+    }
+    icon(Icon::Loader)
+        .size(size)
+        .text_color(theme::color(theme::SLATE))
+        .with_animation(id, Animation::new(theme::SPINNER_PERIOD).repeat(), |svg, delta| {
+            svg.with_transformation(Transformation::rotate(percentage(delta)))
+        })
+        .into_any_element()
+}
+
+/// `text` shortened in the middle with "…" to fit `max_width` at `font_size`/`weight` in the
+/// system font (native `.truncationMode(.middle)`: paths keep both their start and their name).
+pub fn truncate_middle(
+    text: &str,
+    max_width: gpui::Pixels,
+    font_size: gpui::Pixels,
+    weight: gpui::FontWeight,
+    window: &Window,
+) -> SharedString {
+    let mut font = window.text_style().font();
+    font.family = theme::FONT_FAMILY.into();
+    font.weight = weight;
+    let width = |candidate: &str| {
+        let run = gpui::TextRun {
+            len: candidate.len(),
+            font: font.clone(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        window.text_system().shape_line(SharedString::from(candidate.to_owned()), font_size, &[run], None).width
+    };
+    if text.is_empty() || width(text) <= max_width {
+        return SharedString::from(text.to_owned());
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let candidate = |keep: usize| {
+        let head = keep.div_ceil(2);
+        let tail = keep - head;
+        let mut out: String = chars[..head].iter().collect();
+        out.push('…');
+        out.extend(&chars[chars.len() - tail..]);
+        out
+    };
+    // The largest number of kept characters that still fits.
+    let (mut low, mut high) = (0, chars.len() - 1);
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if width(&candidate(mid)) <= max_width {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    candidate(low).into()
+}

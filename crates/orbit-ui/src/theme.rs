@@ -181,3 +181,78 @@ pub fn format_count(count: u64) -> String {
 pub fn display(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
+
+// --- chrome panels ---
+// Motion, footer timings and relative ages used by the toolbar, sidebar, footer, tray and welcome
+// panels.
+
+/// The OS "Reduce Motion" preference (`Shell::reduce_motion`), installed once at launch with
+/// [`set_reduce_motion`]. Absent (tests, harness) means full motion.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Motion {
+    pub reduce: bool,
+}
+
+impl gpui::Global for Motion {}
+
+pub fn set_reduce_motion(reduce: bool, cx: &mut gpui::App) {
+    cx.set_global(Motion { reduce });
+}
+
+/// Reduce Motion: no fill transitions, static activity symbols.
+pub fn reduce_motion(cx: &gpui::App) -> bool {
+    cx.try_global::<Motion>().is_some_and(|motion| motion.reduce)
+}
+
+/// Mapping track fill transition (`MappingProgressView`: ease-out 0.35 s).
+pub const TRACK_TRANSITION: std::time::Duration = std::time::Duration::from_millis(350);
+/// Fade of the counts and track when a map finishes saving (ease-out 0.18 s).
+pub const FOOTER_FADE: std::time::Duration = std::time::Duration::from_millis(180);
+/// Coarse refresh of "Indexed · updated … ago" while it is visible (minute granularity).
+pub const AGE_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+/// One turn of the activity indicator.
+pub const SPINNER_PERIOD: std::time::Duration = std::time::Duration::from_millis(900);
+/// Footer content: the 28-point progress block, 3 points, the 20-point status row.
+pub const FOOTER_PROGRESS_HEIGHT: Pixels = px(28.);
+pub const FOOTER_ROW_HEIGHT: Pixels = px(20.);
+/// Footer count groups ("12,345 found") and the action button.
+pub const FOOTER_COUNT_WIDTH: Pixels = px(164.);
+pub const FOOTER_ACTION_WIDTH: Pixels = px(64.);
+pub const FOOTER_ROOT_WIDTH: f32 = 160.;
+/// Legacy footer (no progress values): title, count and button columns.
+pub const FOOTER_LEGACY_TITLE_WIDTH: Pixels = px(172.);
+pub const FOOTER_LEGACY_COUNT_WIDTH: Pixels = px(140.);
+pub const FOOTER_LEGACY_ACTION_WIDTH: Pixels = px(130.);
+/// Fixed sidebar device area: volume metadata arriving never moves Places.
+pub const SIDEBAR_DEVICES_HEIGHT: Pixels = px(100.);
+/// Toolbar buttons keep fixed widths so labels and enabled states never shift the title bar.
+pub const TOOLBAR_REFRESH_WIDTH: Pixels = px(96.);
+pub const TOOLBAR_OPEN_WIDTH: Pixels = px(132.);
+/// Breadcrumb row: Up button, opening indicator slot and file count column.
+pub const BREADCRUMB_UP_WIDTH: Pixels = px(64.);
+pub const BREADCRUMB_COUNT_WIDTH: Pixels = px(138.);
+
+/// `t` in 0..=1 eased out (cubic), like SwiftUI's `.easeOut`.
+pub fn ease_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// The age of a saved map for "Indexed · updated {age} ago", at minute granularity (the footer
+/// refreshes it every [`AGE_REFRESH`]): "less than a minute", "5 min", "2 hr, 5 min", "3 days, 4 hr".
+pub fn format_age(age: std::time::Duration) -> String {
+    let minutes = age.as_secs() / 60;
+    let (hours, minutes) = (minutes / 60, minutes % 60);
+    let (days, hours) = (hours / 24, hours % 24);
+    let unit = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    if days > 0 {
+        let days_text = unit(days, "day", "days");
+        if hours > 0 && days < 7 { format!("{days_text}, {}", unit(hours, "hr", "hr")) } else { days_text }
+    } else if hours > 0 {
+        if minutes > 0 { format!("{hours} hr, {minutes} min") } else { format!("{hours} hr") }
+    } else if minutes > 0 {
+        format!("{minutes} min")
+    } else {
+        "less than a minute".to_owned()
+    }
+}

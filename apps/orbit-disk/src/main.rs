@@ -66,6 +66,7 @@ fn main() {
 
     Application::new().with_assets(Assets).run(move |cx: &mut App| {
         let shell: Rc<dyn Shell> = Rc::new(shell::create());
+        orbit_ui::theme::set_reduce_motion(shell.reduce_motion(), cx);
 
         // First launch: import the Swift app's Places and last location.
         if !fixture_mode && !settings.settings().legacy_imported {

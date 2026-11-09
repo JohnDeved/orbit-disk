@@ -30,12 +30,15 @@ use crate::harness::{FrameHarness, HarnessScript};
 use crate::host::{Host, path_bytes};
 use crate::lifecycle;
 use crate::panels::Panels;
+use crate::panels::welcome::WelcomePanel;
 use crate::theme;
 
 pub struct MainWindow {
     host: Host,
     focus: FocusHandle,
     panels: Panels,
+    /// Welcome / first-scan screen and the explorer's Finder drop target (over the explorer).
+    welcome: gpui::Entity<WelcomePanel>,
     harness: Option<Rc<RefCell<FrameHarness>>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -47,9 +50,10 @@ impl MainWindow {
         // Action availability follows the header (navigation) and inspector (selection) state.
         let subscriptions = host.observe(Regions::HEADER | Regions::INSPECTOR, cx);
         let panels = Panels::new(&host, cx);
+        let welcome = cx.new(|cx| WelcomePanel::new(&host, cx));
         let harness =
             harness.map(|script| Rc::new(RefCell::new(FrameHarness::new(host.clone(), panels.clone(), script))));
-        Self { host, focus, panels, harness, _subscriptions: subscriptions }
+        Self { host, focus, panels, welcome, harness, _subscriptions: subscriptions }
     }
 
     pub fn panels(&self) -> &Panels {
@@ -180,6 +184,7 @@ impl Render for MainWindow {
                     .flex_1()
                     .min_w_0()
                     .h_full()
+                    .relative()
                     .flex()
                     .flex_col()
                     .child(titlebar_drag(div().h(theme::TITLEBAR_HEIGHT).w_full().flex_none()).child(slot(
@@ -233,7 +238,17 @@ impl Render for MainWindow {
                         Regions::TRAY,
                         panels.tray.clone(),
                         style().h(theme::TRAY_HEIGHT + theme::TRAY_GAP + px(theme::TRAY_MARGIN.1)).w_full(),
-                    ))),
+                    )))
+                    // Over breadcrumbs, map and contents: from below the title bar to the footer.
+                    .child(AnyView::from(self.welcome.clone()).cached(
+                        style().absolute().top(theme::TITLEBAR_HEIGHT).left_0().right_0().bottom(
+                            theme::FOOTER_HEIGHT
+                                + px(1.)
+                                + theme::TRAY_HEIGHT
+                                + theme::TRAY_GAP
+                                + px(theme::TRAY_MARGIN.1),
+                        ),
+                    )),
             )
             .child(slot(Regions::SHEETS, panels.sheets.clone(), style().absolute().top_0().left_0().size_full()))
             .child(frame_stats::end_marker())
