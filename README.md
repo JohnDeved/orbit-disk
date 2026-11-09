@@ -71,12 +71,12 @@ AI clients can inspect maps, find large files, build a collection and remove exp
 
 ## Build from source
 
-Install Swift 6.3 or later and Python 3, then run:
+Install [Rust](https://rustup.rs) (the pinned toolchain in `rust-toolchain.toml` installs automatically) and Python 3, then run:
 
 ```sh
 ./build-app.sh
 ```
 
-The script builds `../Orbit Disk.app` and resolves the pinned Sparkle dependency on the first run. The [guide](docs/GUIDE.md) covers shortcuts, tests, limitations, and release steps. See [technical notes](TECHNICAL-NOTES.md) for implementation details.
+The script builds `../Orbit Disk.app` with `cargo xtask bundle` and downloads the pinned, checksum-verified Sparkle framework on the first run. With full Xcode installed, `./build-app.sh --release-mode` precompiles the Metal shaders. Without it, the build compiles them at launch instead. `cargo nextest run --workspace` runs the tests. `cargo run -p orbit-disk -- --fixture` opens the app on generated sample data. The [guide](docs/GUIDE.md) covers shortcuts, tests, limitations, and release steps. See [technical notes](TECHNICAL-NOTES.md) for implementation details.
 
 The screenshots and flow illustrations use sample data rendered from the app’s views. Run `./scripts/capture-marketing.sh` to refresh them locally; GitHub Actions refreshes them from the released commit only after a release is published.

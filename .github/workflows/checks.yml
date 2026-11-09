@@ -3,54 +3,76 @@ on:
   workflow_call:
 permissions:
   contents: read
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 jobs:
   portable:
-    name: Portable core and release metadata
+    name: Portable engine and release metadata
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Show Swift toolchain
-        run: swift --version
-      - name: Check portable core logic
-        run: ./scripts/checks/check-portable-core.sh
+      - name: Show toolchain
+        run: rustup show active-toolchain && rustc --version && python3 --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@7c48f0a661edab95fdc666d1526d9ef945205245 # nextest
       - name: Check release validation
         run: python3 scripts/test-release.py
-  check:
-    name: ${{ matrix.name }}
+      - name: Engine, pure crates and release tooling on the generic platform
+        run: >-
+          cargo nextest run --locked --no-fail-fast
+          -p orbit-platform -p orbit-platform-generic -p orbit-core
+          -p orbit-sunburst -p orbit-app-state -p orbit-automation -p xtask
+  lint:
+    name: Format, clippy and platform boundary
     runs-on: macos-26
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - suite: core
-            name: Scanner, index, and updater
-          - suite: native
-            name: App model and native interaction
-          - suite: search
-            name: Preview and search
-          - suite: sessions
-            name: Mapping sessions and collection queue
-          - suite: mapping
-            name: Mapping recovery and reuse
-          - suite: staging
-            name: Durable staging and journal
-          - suite: removal
-            name: Removal and folder transactions
-          - suite: rendering
-            name: Graph rendering and layouts
+    timeout-minutes: 30
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Show build toolchain
+      - name: Show toolchain
         run: |
           xcodebuild -version
-          swift --version
-      - name: Run ${{ matrix.name }} checks
-        run: ./scripts/checks/check-ci.sh '${{ matrix.suite }}'
+          rustup show active-toolchain && rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Platform boundary
+        run: ./scripts/checks/check-platform-boundary.sh
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+  test:
+    name: Tests, automation protocol and updater copy
+    runs-on: macos-26
+    timeout-minutes: 35
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          rustup show active-toolchain && rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@7c48f0a661edab95fdc666d1526d9ef945205245 # nextest
+      - name: Tests
+        run: cargo nextest run --workspace --locked --no-fail-fast
+      - name: MCP server (Rust OrbitControl)
+        run: |
+          cargo build --locked --release -p orbit-control --bin OrbitControl
+          python3 -I Tests/test_mcp.py target/release/OrbitControl
+      - name: Updater copy overlay against the pinned Sparkle
+        run: |
+          sparkle_dir="$RUNNER_TEMP/sparkle"
+          cargo xtask sparkle "$sparkle_dir"
+          ORBIT_SPARKLE_DIR="$sparkle_dir" python3 Tests/test_update_copy.py
+      - name: Benchmarks compile
+        run: cargo bench --workspace --no-run --locked

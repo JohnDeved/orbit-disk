@@ -1,0 +1,22 @@
+[package]
+name = "orbit-backend"
+description = "The production engine behind the app state: orbit-core mapping sessions, saved maps, change monitors and removal."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+orbit-core.workspace = true
+orbit-platform.workspace = true
+orbit-app-state.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+orbit-native.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

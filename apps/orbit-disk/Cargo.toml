@@ -1,0 +1,30 @@
+[package]
+name = "orbit-disk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The bundle layout (Contents/MacOS/OrbitDisk) is relied on by existing Codex MCP registrations.
+[[bin]]
+name = "OrbitDisk"
+path = "src/main.rs"
+
+[features]
+default = ["runtime-shaders"]
+runtime-shaders = ["orbit-ui/runtime-shaders"]
+
+[dependencies]
+gpui.workspace = true
+orbit-ui = { workspace = true, default-features = false }
+orbit-app-state.workspace = true
+orbit-backend.workspace = true
+orbit-core.workspace = true
+orbit-platform.workspace = true
+orbit-native.workspace = true
+orbit-automation.workspace = true
+futures = { version = "0.3", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

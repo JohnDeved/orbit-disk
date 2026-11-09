@@ -1,0 +1,10 @@
+<!-- Derived from lucide-static v0.468.0 circle-check (ISC): filled disc with the check cut out. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <defs>
+    <mask id="cut">
+      <rect width="24" height="24" fill="white" />
+      <path d="m8 12 3 3 5-6" fill="none" stroke="black" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+    </mask>
+  </defs>
+  <circle cx="12" cy="12" r="11" fill="currentColor" mask="url(#cut)" />
+</svg>

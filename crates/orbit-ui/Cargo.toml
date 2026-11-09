@@ -1,0 +1,35 @@
+[package]
+name = "orbit-ui"
+description = "GPUI views for Orbit Disk."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# Compile Metal shaders at launch instead of build time. Lets development machines without
+# full Xcode build the UI; release bundles are built without it (precompiled metallib, faster
+# first frame) on CI, which has Xcode.
+default = ["runtime-shaders"]
+runtime-shaders = ["gpui/runtime_shaders"]
+
+[dependencies]
+gpui.workspace = true
+orbit-app-state.workspace = true
+orbit-core.workspace = true
+orbit-platform.workspace = true
+raw-window-handle.workspace = true
+orbit-sunburst.workspace = true
+image.workspace = true
+futures = { version = "0.3", default-features = false, features = ["std"] }
+serde_json.workspace = true
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+# PNG output of the map raster tests (inspection images).
+tiny-skia.workspace = true
+
+[lints]
+workspace = true

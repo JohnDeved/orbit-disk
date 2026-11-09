@@ -1,0 +1,39 @@
+[package]
+name = "orbit-core"
+description = "Scan engine: discovery, live inventory, durable SQLite index, search, removal journal and recovery."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+orbit-platform.workspace = true
+parking_lot.workspace = true
+crossbeam-deque.workspace = true
+crossbeam-channel.workspace = true
+memchr.workspace = true
+smallvec.workspace = true
+rusqlite = { workspace = true, features = ["hooks"] }
+sha2.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
+caseless.workspace = true
+# Discovery/live: index of directory nodes keyed by (parent, name) hash, without storing paths.
+hashbrown = { version = "0.15", default-features = false, features = ["inline-more"] }
+foldhash = "0.1"
+# Name-sort collation (numeric, locale-aware); see `collate`.
+icu_collator.workspace = true
+icu_locale_core.workspace = true
+
+# Flags and modes for `orbit_platform::posix` (journal, leases, removal); portable POSIX only.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+orbit-native.workspace = true
+
+[lints]
+workspace = true

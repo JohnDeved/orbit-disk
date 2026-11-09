@@ -1,0 +1,36 @@
+[package]
+name = "orbit-platform-macos"
+description = "macOS engine layer: getattrlistbulk, FSEvents, firmlinks, clonefile, Trash. The only engine crate allowed to use Apple APIs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+orbit-platform.workspace = true
+libc.workspace = true
+objc2.workspace = true
+objc2-foundation = { workspace = true, default-features = false, features = [
+    "std",
+    "NSString",
+    "NSURL",
+    "NSFileManager",
+    "NSError",
+    "NSValue",
+    "NSDictionary",
+    "NSArray",
+    "NSObject",
+    "NSAutoreleasePool",
+] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "listing"
+harness = false
+
+[lints]
+workspace = true
