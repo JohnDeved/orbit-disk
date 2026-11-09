@@ -66,6 +66,10 @@ fn send(host: &Host, event: Event, cx: &mut VisualTestContext) {
 
 /// Whether `selector` was drawn. Only for presence: GPUI keeps debug bounds of older frames.
 fn drawn(cx: &mut VisualTestContext, selector: &'static str) -> bool {
+    // Background replies (e.g. a removal outcome) invalidate the window without drawing it;
+    // draw a frame first so the assertion sees what the user would.
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
     cx.debug_bounds(selector).is_some()
 }
 

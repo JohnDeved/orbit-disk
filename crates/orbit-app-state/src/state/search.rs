@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use orbit_platform::FileIdentity;
 
+use super::interaction::MapHover;
 use super::{AppState, Pending};
 use crate::backend::{Request, SearchReply, SearchRequest, SearchSource};
 use crate::event::{Regions, TimerKind};
@@ -118,7 +119,10 @@ impl AppState {
             return;
         }
         self.search.query = query;
-        self.selected = None;
+        // The selection outline is drawn on the map; repaint it only when one is cleared.
+        if self.selected.take().is_some() {
+            self.notify(Regions::MAP);
+        }
         self.clear_all_hover();
         self.schedule_name_sort();
         self.notify(Regions::LIST | Regions::INSPECTOR | Regions::HEADER);
@@ -141,11 +145,14 @@ impl AppState {
     fn replace_results(&mut self, results: Vec<Item>, count: u64) {
         self.search.set_results(results);
         self.search.count = count;
+        // The map shows search results only through hover relations; without a hover, new
+        // results leave it unchanged (one map render per keystroke otherwise).
+        let hovering = !matches!(self.map_hover, MapHover::None) || self.row_hover.is_some();
         if self.filtering() {
             self.schedule_name_sort();
             self.clear_hover_relations_for_new_rows();
         }
-        self.notify(Regions::LIST | Regions::MAP);
+        self.notify(if hovering { Regions::LIST | Regions::MAP } else { Regions::LIST });
     }
 
     fn clear_hover_relations_for_new_rows(&mut self) {

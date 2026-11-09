@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::backend::Reply;
-use crate::event::Effect;
+use crate::event::{Effect, Regions};
 
 fn is_search(request: &Request) -> bool {
     matches!(request, Request::Search(_))
@@ -149,4 +149,16 @@ fn removing_a_matched_item_during_a_partial_search_drops_it_and_keeps_the_query(
     h.settle();
     assert_eq!(h.state.query(), "txt");
     assert_eq!(h.rows(), ["y.txt", "z.txt"]);
+}
+
+#[test]
+fn typing_repaints_the_map_only_when_a_selection_or_hover_changes() {
+    let mut h = harness();
+    h.open_mapped(b"/r");
+    h.send(Event::Select { path: Some(p("/r/docs/x.txt")) });
+    assert!(h.send(Event::QueryChanged("x".into())).contains(Regions::MAP), "the cleared selection outline");
+    h.advance(SHORT);
+    let reply = h.take(is_search).unwrap();
+    assert!(!h.deliver(reply).contains(Regions::MAP), "results without a hover leave the map alone");
+    assert!(!h.send(Event::QueryChanged("x.".into())).contains(Regions::MAP));
 }
