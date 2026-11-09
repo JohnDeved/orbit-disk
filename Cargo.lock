@@ -652,6 +652,7 @@ dependencies = [
  "caseless",
  "crossbeam-channel",
  "crossbeam-deque",
+ "libc",
  "memchr",
  "orbit-native",
  "orbit-platform",

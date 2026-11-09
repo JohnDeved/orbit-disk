@@ -21,6 +21,11 @@ thiserror.workspace = true
 unicode-normalization.workspace = true
 caseless.workspace = true
 
+# The removal journal needs `openat`/`unlinkat`/`fdopendir`, which `orbit_platform::posix` does not
+# expose yet. All uses live in `journal::sys` and are portable POSIX.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 orbit-native.workspace = true
