@@ -42,6 +42,12 @@ impl MacShell {
         Self { updater: SparkleUpdater::load(mtm) }
     }
 
+    /// Creates the shell if called on the main thread; `None` otherwise. Lets callers that must
+    /// not name Objective-C types construct the shell safely.
+    pub fn on_main_thread() -> Option<Self> {
+        MainThreadMarker::new().map(Self::new)
+    }
+
     /// Starts Sparkle's scheduler. Idempotent; a no-op without an updater.
     pub fn start_updater(&self) {
         if let Some(updater) = &self.updater {
