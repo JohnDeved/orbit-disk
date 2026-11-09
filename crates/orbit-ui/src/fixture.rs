@@ -1,5 +1,6 @@
 //! An in-memory [`Backend`] over a generated tree (~200k entries, power-law folder sizes and
-//! log-normal file sizes) for `--fixture` runs and the frame harness.
+//! log-normal file sizes) for `--fixture` runs and the frame harness, or over the small fixed
+//! sample Home of the README screenshots ([`FixtureLayout::Sample`], `--marketing-state`).
 //!
 //! `orbit_app_state::testing::FakeBackend` recomputes folder totals by scanning every entry, so it
 //! cannot serve views of a tree this size interactively, and its mapping never reports progress.
@@ -30,8 +31,20 @@ pub const ROOT: &[u8] = b"/Fixture";
 /// The fixture user's home (use as `Config::home`).
 pub const HOME: &[u8] = b"/Fixture/Users/demo";
 
+/// The tree the fixture serves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FixtureLayout {
+    /// About `entries` generated entries on a whole fake volume.
+    #[default]
+    Generated,
+    /// The README sample Home ([`sample`]): a few recognizable folders with fixed sizes on a
+    /// 1 TB "Macintosh HD", with Home already mapped. `entries` and `seed` are ignored.
+    Sample,
+}
+
 #[derive(Clone, Debug)]
 pub struct FixtureOptions {
+    pub layout: FixtureLayout,
     /// Approximate number of entries (files + folders).
     pub entries: usize,
     pub seed: u64,
@@ -41,9 +54,17 @@ pub struct FixtureOptions {
     pub progress_interval: Duration,
 }
 
+impl FixtureOptions {
+    /// The README sample Home ([`FixtureLayout::Sample`]).
+    pub fn sample() -> Self {
+        Self { layout: FixtureLayout::Sample, ..Self::default() }
+    }
+}
+
 impl Default for FixtureOptions {
     fn default() -> Self {
         Self {
+            layout: FixtureLayout::Generated,
             entries: 200_000,
             seed: 0x0eb1_7d15_c0de,
             mapping_duration: Duration::from_millis(2_500),
@@ -364,6 +385,80 @@ fn generate(options: &FixtureOptions) -> Tree {
     tree
 }
 
+/// The sample Home of the README screenshots: the Swift app's marketing tree
+/// (`scripts/marketing/Capture.swift` at v0.9.15) under [`HOME`].
+pub mod sample {
+    const MB: u64 = 1_000_000;
+    const GB: u64 = 1_000 * MB;
+
+    /// The largest Home folder: selected on the Home map, then opened.
+    pub const PROJECTS: &str = "Projects";
+    /// The largest folder in Projects: selected once Projects is open.
+    pub const STUDIO: &str = "Projects/Studio";
+    /// The folder that is collected and reviewed.
+    pub const DOWNLOADS: &str = "Downloads";
+
+    /// Files (paths relative to Home) and their sizes in bytes; folders are implied.
+    pub const FILES: &[(&str, u64)] = &[
+        ("Projects/Studio/Footage.mov", 28 * GB),
+        ("Projects/Studio/Exports.zip", 12 * GB),
+        ("Projects/Studio/Assets.psd", 6 * GB),
+        ("Projects/Archive/2024.zip", 15 * GB),
+        ("Projects/Archive/2023.zip", 9 * GB),
+        ("Projects/Project backup.zip", 8 * GB),
+        ("Photos/Photo Library.photoslibrary", 58 * GB),
+        ("Photos/RAW archive.zip", 12 * GB),
+        ("Downloads/Installer.dmg", 12 * GB),
+        ("Downloads/Camera originals.zip", 10 * GB),
+        ("Downloads/Archive.zip", 8 * GB),
+        ("Music/Library.musiclibrary", 24 * GB),
+        ("Music/Live recordings.wav", 10 * GB),
+        ("Documents/Work archive.zip", 16 * GB),
+        ("Documents/Presentation.pdf", 4 * GB),
+        ("Movies/Travel.mov", 15 * GB),
+        ("Movies/Family.mov", 8 * GB),
+        ("Desktop archive.zip", 9 * GB),
+        ("Notes.pdf", 100 * MB),
+    ];
+
+    /// The volume: name, capacity and available bytes.
+    pub const VOLUME: (&str, u64, u64) = ("Macintosh HD", 1_000 * GB, 342 * GB);
+
+    /// The absolute path of a sample path relative to Home.
+    pub fn path(relative: &str) -> Vec<u8> {
+        let mut path = super::HOME.to_vec();
+        path.push(b'/');
+        path.extend_from_slice(relative.as_bytes());
+        path
+    }
+}
+
+fn generate_sample() -> Tree {
+    let mut tree = Tree::default();
+    let root = tree.add(NONE, ROOT, true, 0);
+    tree.nodes[0].name_at = 1;
+    tree.nodes[0].folded = fold(b"Fixture").into();
+    let users = tree.add(root, b"Users", true, 0);
+    let home = tree.add(users, b"demo", true, 0);
+    for &(relative, size) in sample::FILES {
+        let mut parent = home;
+        let mut components = relative.split('/').peekable();
+        while let Some(name) = components.next() {
+            if components.peek().is_none() {
+                tree.add(parent, name.as_bytes(), false, size);
+                break;
+            }
+            let path = [&tree.nodes[parent as usize].path[..], b"/", name.as_bytes()].concat();
+            parent = match tree.find(&path) {
+                Some(id) => id,
+                None => tree.add(parent, name.as_bytes(), true, 0),
+            };
+        }
+    }
+    tree.finish();
+    tree
+}
+
 // ---------------------------------------------------------------------------------------------
 // Backend.
 
@@ -387,15 +482,23 @@ impl std::fmt::Debug for FixtureBackend {
 
 impl FixtureBackend {
     pub fn new(options: FixtureOptions) -> Self {
-        let tree = generate(&options);
-        Self {
+        let tree = match options.layout {
+            FixtureLayout::Generated => generate(&options),
+            FixtureLayout::Sample => generate_sample(),
+        };
+        let backend = Self {
             tree: RwLock::new(tree),
             options,
             saved: Mutex::default(),
             snapshot_ids: AtomicU64::new(0),
             sessions: Mutex::default(),
             revision: AtomicU64::new(1),
+        };
+        if backend.options.layout == FixtureLayout::Sample {
+            // Already mapped: opening Home publishes this saved map without a mapping run.
+            backend.save(HOME);
         }
+        backend
     }
 
     /// Entries generated (files and folders).
@@ -673,6 +776,10 @@ impl Backend for SharedFixture {
     fn stop_monitor(&self, _: SessionId) {}
 
     fn volumes(&self) -> Vec<Volume> {
+        if self.0.options.layout == FixtureLayout::Sample {
+            let (name, capacity, available) = sample::VOLUME;
+            return vec![Volume { path: ROOT.to_vec(), name: name.into(), capacity, available }];
+        }
         let used = {
             let tree = self.0.read();
             tree.nodes[0].size

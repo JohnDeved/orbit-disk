@@ -10,12 +10,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui::{AnyWindowHandle, App, Application, WindowHandle};
+use gpui::{AnyWindowHandle, App, Application, WindowHandle, px, size};
 use orbit_app_state::{Backend, Config, Event};
 use orbit_platform::{Platform, Shell};
 use orbit_ui::fixture::{self, FixtureOptions, SharedFixture};
 use orbit_ui::host::path_bytes;
-use orbit_ui::settings::{FIXTURE_SETTINGS_FILE, SETTINGS_FILE, SettingsStore};
+use orbit_ui::marketing::{self, MarketingRun};
+use orbit_ui::settings::{FIXTURE_SETTINGS_FILE, SETTINGS_FILE, Settings, SettingsStore};
 use orbit_ui::settings_window::{self, SettingsWindow};
 use orbit_ui::{Assets, Host, HostEvent, HostOptions, actions, lifecycle, main_window};
 
@@ -51,7 +52,8 @@ fn main() {
     let (backend, home, settings_file): (Arc<dyn Backend>, Vec<u8>, &str) = match real {
         Some(backend) => (backend, home(), SETTINGS_FILE),
         None => {
-            let mut options = FixtureOptions::default();
+            let mut options =
+                if args.marketing.is_some() { FixtureOptions::sample() } else { FixtureOptions::default() };
             if let Some(entries) = args.fixture_entries {
                 options.entries = entries;
             }
@@ -61,14 +63,20 @@ fn main() {
             (Arc::new(backend), fixture::HOME.to_vec(), FIXTURE_SETTINGS_FILE)
         }
     };
-    let mut settings = SettingsStore::load(dirs.settings.join(settings_file));
+    // Screenshots never read or write saved settings (window, sort, Places, last location).
+    let mut settings = match args.marketing {
+        Some(_) => SettingsStore::in_memory(Settings::default()),
+        None => SettingsStore::load(dirs.settings.join(settings_file)),
+    };
     if !fixture_mode {
         dialogs::finish_pending_cache_reset(&mut settings, &dirs);
     }
 
     Application::new().with_assets(Assets).run(move |cx: &mut App| {
         let shell: Rc<dyn Shell> = Rc::new(shell::create());
-        orbit_ui::theme::set_reduce_motion(shell.reduce_motion(), cx);
+        // Screenshots run without animations, whatever the OS preference.
+        let marketing = args.marketing;
+        orbit_ui::theme::set_reduce_motion(marketing.is_some() || shell.reduce_motion(), cx);
         orbit_ui::sheets::set_privacy_settings_url(shell.privacy_settings_url(), cx);
 
         // First launch: import the Swift app's Places and last location.
@@ -89,6 +97,7 @@ fn main() {
             settings.save(cx.background_executor());
         }
         let last_location = match (&args.scan, fixture_mode) {
+            _ if marketing.is_some() => Some(fixture::HOME.to_vec()),
             (Some(_), _) => None,
             (None, true) => settings.settings().last_location.clone().or_else(|| Some(fixture::ROOT.to_vec())),
             (None, false) => settings.settings().last_location.clone(),
@@ -125,9 +134,12 @@ fn main() {
             }
         };
         MAIN_WINDOW.with(|main| *main.borrow_mut() = Some(window.into()));
+        if let Some((width, height)) = args.window_size {
+            window.update(cx, |_, window, _| window.resize(size(px(width), px(height)))).ok();
+        }
         // Reduce Motion may change in System Settings while the app runs: re-read it whenever
         // the main window becomes active (a cheap preference query).
-        {
+        if marketing.is_none() {
             let shell = Rc::clone(&shell);
             window
                 .update(cx, |_, window, cx| {
@@ -141,8 +153,9 @@ fn main() {
                 .ok();
         }
         cx.activate(true);
-        // The main window is on screen: start scheduled update checks (idempotent).
-        if let Some(updater) = shell.updater() {
+        // The main window is on screen: start scheduled update checks (idempotent). Screenshots
+        // never check (an update prompt would cover the window).
+        if let Some(updater) = shell.updater().filter(|_| marketing.is_none()) {
             updater.start();
         }
         // Closing the main window quits (Swift: terminate after last window closed).
@@ -154,7 +167,11 @@ fn main() {
         })
         .detach();
 
-        let server = if args.harness.is_none() { automation::start(&host, &dirs.runtime, cx) } else { None };
+        let server = if args.harness.is_none() && marketing.is_none() {
+            automation::start(&host, &dirs.runtime, cx)
+        } else {
+            None
+        };
         {
             let host = host.clone();
             cx.on_app_quit(move |cx| {
@@ -183,6 +200,24 @@ fn main() {
         host.update(cx, |host, cx| host.launch(last_location, cx));
         if let Some(path) = args.scan.clone() {
             host.send(Event::OpenLocation { path, force: false }, cx);
+        }
+        if let Some(state) = marketing {
+            let run = MarketingRun {
+                state,
+                window_size: args.window_size.map(|(width, height)| size(px(width), px(height))),
+                await_presented_frame: true,
+            };
+            marketing::drive(
+                window,
+                run,
+                |_| eprintln!("marketing-state: ready"),
+                |message, cx| {
+                    eprintln!("marketing-state: {message}");
+                    cx.quit();
+                },
+                cx,
+            )
+            .detach();
         }
     });
 }
