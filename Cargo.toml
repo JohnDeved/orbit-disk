@@ -63,6 +63,11 @@ debug = "line-tables-only"
 inherits = "release"
 debug = true
 
+# Keep dev builds small: several worktrees build in parallel on one disk.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
 # Dependencies stay optimized in dev so debug runs of the scanner remain usable.
 [profile.dev.package."*"]
 opt-level = 2
