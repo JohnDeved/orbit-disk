@@ -1,6 +1,6 @@
 # Orbit Disk: scan and search design
 
-> **History.** These implementation notes cover the Swift app up to v0.9.15. Since 1.0.0, Orbit Disk is written in Rust with GPUI. The invariants recorded here still apply and were carried into the Rust engine. For the current architecture, see [docs/rust-port](docs/rust-port/README.md); for Rust vs Swift measurements, see [docs/benchmarks/rust-port](docs/benchmarks/rust-port/).
+> **History.** These implementation notes cover the Swift app up to v0.9.15. Since 0.10.0, Orbit Disk is written in Rust with GPUI. The invariants recorded here still apply and were carried into the Rust engine. For the current architecture, see [docs/rust-port](docs/rust-port/README.md); for Rust vs Swift measurements, see [docs/benchmarks/rust-port](docs/benchmarks/rust-port/).
 
 ## Fresh-file indexing (0.9.15)
 

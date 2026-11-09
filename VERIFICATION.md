@@ -1,6 +1,6 @@
 # Verification
 
-> **History.** These verification log cover the Swift app up to v0.9.15. Since 1.0.0, Orbit Disk is written in Rust with GPUI. The invariants recorded here still apply and were carried into the Rust engine. For the current architecture, see [docs/rust-port](docs/rust-port/README.md); for Rust vs Swift measurements, see [docs/benchmarks/rust-port](docs/benchmarks/rust-port/).
+> **History.** This verification log covers the Swift app up to v0.9.15. Since 0.10.0, Orbit Disk is written in Rust with GPUI. The invariants recorded here still apply and were carried into the Rust engine. For the current architecture, see [docs/rust-port](docs/rust-port/README.md); for Rust vs Swift measurements, see [docs/benchmarks/rust-port](docs/benchmarks/rust-port/).
 
 Verified on 26 October 2026 on an Apple Silicon Mac running macOS 27.0.1, with Swift 6.3.3. The application targets macOS 14 or later.
 

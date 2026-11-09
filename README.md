@@ -50,7 +50,7 @@ Files stay where they are until you review the collection and confirm **Move to 
 
 ## Fast and native
 
-Orbit Disk 1.0 is written in Rust and draws with [GPUI](https://gpui.rs), the GPU-accelerated UI framework from the Zed editor. Compared with the previous version, measured side by side on the same Mac:
+Orbit Disk 0.10 is written in Rust and draws with [GPUI](https://gpui.rs), the GPU-accelerated UI framework from the Zed editor. Compared with the previous version, measured side by side on the same Mac:
 - maps real folders **2.3× faster**
 - indexes up to **2.9× faster**
 - shows a 180,000-file test folder in about 0.3 s
