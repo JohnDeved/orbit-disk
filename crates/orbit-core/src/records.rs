@@ -83,6 +83,21 @@ impl RecordBatch {
         self.names.capacity() + self.metas.capacity() * std::mem::size_of::<RecordMeta>()
     }
 
+    /// Drops spare capacity so pending-byte accounting matches the data held.
+    pub fn shrink_to_fit(&mut self) {
+        self.names.shrink_to_fit();
+        self.metas.shrink_to_fit();
+    }
+
+    /// Keeps the first `len` records.
+    pub fn truncate(&mut self, len: usize) {
+        if len < self.metas.len() {
+            let end = self.metas[len].name_start as usize;
+            self.metas.truncate(len);
+            self.names.truncate(end);
+        }
+    }
+
     pub fn clear(&mut self) {
         self.names.clear();
         self.metas.clear();

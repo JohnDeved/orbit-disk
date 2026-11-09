@@ -137,8 +137,9 @@ impl<'a, P: Platform> Cursor<'a, P> {
             let parent = if depth == 0 { &self.root } else { &self.cached[depth - 1].dir };
             self.stats.opens += 1;
             self.stats.revalidations += 1;
-            let probe = self.platform.open_child(parent, &component.name, component.identity)?;
-            drop(probe);
+            if self.platform.child_identity(parent, &component.name)? != component.identity {
+                return Err(identity_error(&component.name));
+            }
             if !self.check_scope(depth, components, component.identity) {
                 return Err(identity_error(&component.name));
             }

@@ -92,6 +92,11 @@ pub fn stat_at(parent: BorrowedFd<'_>, name: &[u8], path_for_errors: &Path) -> R
     Ok(info)
 }
 
+/// Identity of one entry without following a final symlink.
+pub fn child_identity(parent: BorrowedFd<'_>, name: &[u8], path_for_errors: &Path) -> Result<FileIdentity> {
+    stat_at(parent, name, path_for_errors).map(|info| stat_identity(&info))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockMode {
     Shared,

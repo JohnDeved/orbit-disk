@@ -58,6 +58,11 @@ pub trait Platform: Send + Sync + 'static {
     /// Identity of an already opened directory.
     fn dir_identity(&self, dir: &Self::Dir) -> Result<FileIdentity>;
 
+    /// Identity of `name` inside `parent`, without following a final symlink and without opening
+    /// it (one `fstatat` on Unix). Revalidates cached ancestors cheaply, so it must agree with
+    /// the identity [`Platform::open_child`] would reach (mount points, firmlinks).
+    fn child_identity(&self, parent: &Self::Dir, name: &[u8]) -> Result<FileIdentity>;
+
     /// A stable name for the filesystem holding `dir` (macOS: `f_mntonname`). Used to decide
     /// whether traversal may cross into it; `None` when the OS cannot tell.
     fn mount_name(&self, dir: &Self::Dir) -> Option<String>;

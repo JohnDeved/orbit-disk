@@ -246,3 +246,21 @@ fn boot_volume_firmlinks_and_data_mount_are_reported_as_opened() {
         assert_eq!(data_entry.id, boot.data_identity);
     }
 }
+
+/// Cached-ancestor revalidation relies on `child_identity` reaching the same object as
+/// `open_child`, including firmlinks (`/Users`) and mount points (`/System/Volumes/Data`).
+#[test]
+fn child_identity_agrees_with_open_child_across_firmlinks_and_mounts() {
+    let platform = MacPlatform::new();
+    for (parent, names) in
+        [("/", &["Users", "Applications", "System", "private"][..]), ("/System/Volumes", &["Data"][..])]
+    {
+        let (dir, _) = platform.open_root(Path::new(parent)).unwrap();
+        for name in names {
+            let id = platform.child_identity(&dir, name.as_bytes()).unwrap();
+            let opened = platform.open_child(&dir, name.as_bytes(), id);
+            assert!(opened.is_ok(), "{parent}/{name}: {opened:?}");
+            assert_eq!(platform.dir_identity(&opened.unwrap()).unwrap(), id, "{parent}/{name}");
+        }
+    }
+}

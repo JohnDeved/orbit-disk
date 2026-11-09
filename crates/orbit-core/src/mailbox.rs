@@ -17,6 +17,7 @@ use crate::records::{BatchTotals, RecordBatch};
 use orbit_platform::{Cancellation, FileIdentity};
 use parking_lot::{Condvar, Mutex};
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -208,6 +209,8 @@ pub struct Mailbox {
     root_path: Arc<[u8]>,
     root_identity: FileIdentity,
     cancellation: Cancellation,
+    /// Mirrors `State::cancelled` so hot-path checks don't take the lock.
+    cancelled: AtomicBool,
     state: Mutex<State>,
     changed: Condvar,
     on_accepted: Hook,
@@ -236,6 +239,7 @@ impl Mailbox {
             root_path,
             root_identity,
             cancellation,
+            cancelled: AtomicBool::new(false),
             state: Mutex::new(State { frozen_base: 1, ..State::default() }),
             changed: Condvar::new(),
             on_accepted: Box::new(on_accepted),
@@ -256,7 +260,7 @@ impl Mailbox {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancellation.is_cancelled() || self.state.lock().cancelled
+        self.cancellation.is_cancelled() || self.cancelled.load(Ordering::Acquire)
     }
 
     fn check_live(&self, state: &State) -> crate::Result<()> {
@@ -470,6 +474,7 @@ impl Mailbox {
         {
             let mut state = self.state.lock();
             state.cancelled = true;
+            self.cancelled.store(true, Ordering::Release);
             state.finished = true;
             state.revision = state.revision.wrapping_add(1);
             state.frozen.clear();

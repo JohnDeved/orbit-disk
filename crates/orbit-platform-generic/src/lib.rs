@@ -85,6 +85,10 @@ impl Platform for GenericPlatform {
         posix::open_child(parent.as_fd(), name, expected, posix::path_from_bytes(name))
     }
 
+    fn child_identity(&self, parent: &OwnedFd, name: &[u8]) -> Result<FileIdentity> {
+        posix::child_identity(parent.as_fd(), name, posix::path_from_bytes(name))
+    }
+
     fn dir_identity(&self, dir: &OwnedFd) -> Result<FileIdentity> {
         posix::identity(dir.as_fd(), Path::new(""))
     }
