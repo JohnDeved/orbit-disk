@@ -112,6 +112,12 @@ impl TraversalScope {
         if self.root_mount.as_deref() == Some(mount) {
             return true;
         }
+        // Platforms that cannot name mounts (`Platform::mount_name` → None, reported as "") leave
+        // the same-filesystem decision to the device comparison in `allows_identity`, which
+        // callers always apply as well.
+        if self.root_mount.is_none() && mount.is_empty() {
+            return true;
+        }
         let Some(boot) = &self.boot else { return false };
         mount == boot.data_mount
             && (is_within(path, &boot.data_path)
@@ -214,5 +220,17 @@ mod tests {
         assert!(s.allows_child(b"/", b"x", ROOT_DEV, false, &mut scratch));
         join_into(&mut scratch, b"/", b"x");
         assert_eq!(scratch, b"/x");
+    }
+
+    #[test]
+    fn unnamed_mounts_defer_to_device_identity() {
+        // A platform that cannot name mounts (the generic layer) reports "" everywhere.
+        let s = TraversalScope::new(b"/r", id(ROOT_DEV, 5), VolumeLayout { root_mount: None, boot: None });
+        assert!(s.allows_mount(b"/r/a", ""));
+        assert!(s.allows_identity(b"/r/a", id(ROOT_DEV, 9)));
+        // The device check still refuses another filesystem, and named mounts stay strict.
+        assert!(!s.allows_identity(b"/r/mnt", id(OTHER_DEV, 9)));
+        assert!(!s.allows_mount(b"/r/a", "/Volumes/Other"));
+        assert!(!s.allows_mount(b"/elsewhere", ""));
     }
 }
