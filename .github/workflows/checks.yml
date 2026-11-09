@@ -46,6 +46,7 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
+        # --all-targets also type-checks every benchmark target, so benches cannot rot unnoticed.
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
   test:
     name: Tests, automation protocol and updater copy
@@ -74,5 +75,3 @@ jobs:
           sparkle_dir="$RUNNER_TEMP/sparkle"
           cargo xtask sparkle "$sparkle_dir"
           ORBIT_SPARKLE_DIR="$sparkle_dir" python3 Tests/test_update_copy.py
-      - name: Benchmarks compile
-        run: cargo bench --workspace --no-run --locked

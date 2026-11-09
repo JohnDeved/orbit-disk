@@ -13,7 +13,7 @@ Both workflows share the jobs in `checks.yml`:
 
 - `ubuntu-24.04`: release-metadata tests and the portable crates (engine, app state, automation, xtask) on the generic platform.
 - `macos-26`, lint: platform boundary check, `cargo fmt`, `cargo clippy -D warnings`.
-- `macos-26`, tests: `cargo nextest run --workspace`, `Tests/test_mcp.py` against the Rust `OrbitControl`, the updater copy overlay against the pinned Sparkle, and benchmark compilation.
+- `macos-26`, tests: `cargo nextest run --workspace`, `Tests/test_mcp.py` against the Rust `OrbitControl` and the updater copy overlay against the pinned Sparkle. Clippy with `--all-targets` also compiles the benchmarks.
 
 The macOS jobs select Xcode 26.6 through `DEVELOPER_DIR`; Rust comes from `rust-toolchain.toml`. App packaging and publishing wait for every check job. The Swift app was removed at the 0.10.0 cutover. The manual **Swift baseline** workflow still builds it, with its benchmark probes, from a tag (default `v0.9.15`) for `cargo xtask bench-compare`.
 
