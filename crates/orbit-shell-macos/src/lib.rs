@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use objc2::MainThreadMarker;
 use objc2_app_kit::NSWorkspace;
 use objc2_foundation::NSBundle;
-use orbit_platform::{LegacySettings, Shell, Updater};
+use orbit_platform::{LegacySettings, RelaunchHandle, Shell, Updater};
 
 pub use legacy::LEGACY_DEFAULTS_DOMAIN;
 pub use updater::SparkleUpdater;
@@ -45,7 +45,7 @@ impl MacShell {
     /// Starts Sparkle's scheduler. Idempotent; a no-op without an updater.
     pub fn start_updater(&self) {
         if let Some(updater) = &self.updater {
-            updater.start();
+            orbit_platform::Updater::start(updater);
         }
     }
 
@@ -65,7 +65,7 @@ impl Shell for MacShell {
         Some(PRIVACY_SETTINGS_URL)
     }
 
-    fn relaunch(&self) -> std::io::Result<()> {
+    fn relaunch(&self) -> std::io::Result<RelaunchHandle> {
         let bundle = NSBundle::mainBundle().bundlePath().to_string();
         // Like the Swift app: a detached helper waits until every thread of this process has
         // exited, then starts a fresh instance. Paths are positional arguments, never spliced
@@ -83,7 +83,7 @@ impl Shell for MacShell {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map(drop)
+            .map(|helper| RelaunchHandle::new(Some(helper)))
     }
 
     fn updater(&self) -> Option<&dyn Updater> {

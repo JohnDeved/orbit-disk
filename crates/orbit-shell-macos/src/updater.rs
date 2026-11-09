@@ -169,7 +169,7 @@ impl SparkleUpdater {
     }
 
     /// Starts Sparkle's scheduler once. The Swift app does this when its window appears.
-    pub fn start(&self) {
+    fn start_once(&self) {
         if !self.started.replace(true) {
             // SAFETY: `-startUpdater` takes no arguments and returns void.
             unsafe {
@@ -185,12 +185,20 @@ impl SparkleUpdater {
 }
 
 impl Updater for SparkleUpdater {
+    fn start(&self) {
+        self.start_once();
+    }
+
     fn state(&self) -> UpdaterState {
         // SAFETY: both are BOOL properties of `SPUUpdater`.
         let (can_check, automatic_checks): (bool, bool) = unsafe {
             (msg_send![&*self.updater, canCheckForUpdates], msg_send![&*self.updater, automaticallyChecksForUpdates])
         };
-        UpdaterState { automatic_checks, can_check: can_check && !self.delegate.ivars().blocked.get() }
+        UpdaterState {
+            automatic_checks,
+            can_check: can_check && !self.delegate.ivars().blocked.get(),
+            waiting_for_removal: self.is_waiting_for_removal(),
+        }
     }
 
     fn set_automatic_checks(&self, enabled: bool) {
