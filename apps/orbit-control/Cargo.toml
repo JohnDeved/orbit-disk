@@ -1,5 +1,6 @@
 [package]
 name = "orbit-control"
+description = "OrbitControl: the orbitdisk CLI and the stdio MCP server that forwards tool calls to the running app."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +13,11 @@ name = "OrbitControl"
 path = "src/main.rs"
 
 [dependencies]
+orbit-automation.workspace = true
+orbit-native.workspace = true
+orbit-platform.workspace = true
+serde_json.workspace = true
+libc.workspace = true
 
 [lints]
 workspace = true
