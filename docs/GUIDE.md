@@ -41,7 +41,7 @@ The map, list, inspector and action controls keep their positions while navigati
 - Cached chart layouts and selection lookups, so pointer movement reuses the prepared map.
 - Filesystem change tracking, including changes made while closed, with background updates of affected folders.
 - Progressive browsing and search, collection and removal of eligible visible items, background mapping for other locations, resumable scans, inaccessible-item reporting, and an explicit full refresh when needed.
-- Finder reveal, native Quick Look, and collection review with confirmed Trash or permanent deletion.
+- Finder reveal, opening items in their default app, and collection review with confirmed Trash or permanent deletion.
 - System folders, Library, hidden configuration directories, the scan root, home, symlinks, and volume roots protected from collection.
 - Signed GitHub update checks and native installation, with manual restart and a daily-check preference.
 
@@ -55,7 +55,7 @@ The map, list, inspector and action controls keep their positions while navigati
 | Go up | ⌘[ |
 | Open selected folder | Return or ⌘↓ |
 | Reveal selection in Finder | ⇧⌘R |
-| Quick Look selected file | Space |
+| Open selected file in its default app | Space |
 | Add selection to collection | ⌘K |
 | Close a sheet or cancel a scan | Escape |
 
@@ -81,28 +81,34 @@ GitHub Actions builds and checks pushes to `main` and pull requests. Version tag
 
 Rust tests live next to the code they cover (`crates/*/src/**/tests*.rs` and `crates/*/tests/`). `Tests/` holds the Python protocol and updater-copy tests. Build, packaging and release tools are in `xtask/`, `build-app.sh` and `scripts/`.
 
-To run one CI suite locally, use `./scripts/checks/check-ci.sh SUITE`:
+The test suite covers the behavior that matters for a tool that deletes files:
+- crash safety of the index and removal journal (killed processes, interrupted publication)
+- deterministic race fixes
+- hard-link accounting
+- symlink, mount and firmlink safety
+- removal policy
+- automation protocol framing and schemas
+- Unicode handling
+- map geometry and hit-testing
+- every stale-result guard in the app state
 
-| Suite | Coverage |
-|---|---|
-| `core` | Scanner, indexes, updater, and bundled CLI |
-| `native` | App model, native interaction, and automation |
-| `search` | Prepared, preview, and saved search |
-| `sessions` | Background maps and collection queue |
-| `mapping` | Discovery, cache reuse, and interrupted mapping |
-| `staging` | Durable staging and removal journal |
-| `removal` | File removal and folder transactions |
-| `rendering` | Graph, layout, Places, and cache reset |
+Real-filesystem tests run against the macOS platform layer. The engine and app-state crates also run on Linux in CI against a portable fallback layer. Which Swift-era checks were carried over, and why the others were dropped, is recorded in [docs/rust-port/test-triage.md](rust-port/test-triage.md).
 
-The standalone `./scripts/checks/check-portable-core.sh` also runs on Linux. The other suites require macOS; native interaction and rendering checks need a desktop session.
+Headless frame-time checks cover hover, scrolling, navigation and drag:
 
-`OrbitCoreChecks` is a dependency-free test executable so the tests run with Command Line Tools alone, even when XCTest is unavailable. It creates temporary fixtures and checks metadata, bulk/fallback parity, resource forks, sparse files, hard links, Unicode, cancellation, unreadable roots, cleanup policy, persistent indexes, incremental updates, stale revisions, and cancellation during index writes. Progressive checks cover discovery states, preview bounds and exact completed totals. `scripts/checks/check-app.sh` checks the app model with real filesystem events, including live changes, cached relaunch, offline replay, and navigation/collection retention. It also checks partial browsing, stop/restart, save failures, gesture-held updates, linked hover, private drag tokens, grouped collection, duplicate prevention, stale identities, large-drop validation/cancellation, and native chart hit testing and gesture thresholds.
+```sh
+cargo nextest run -p orbit-ui --run-ignored only --no-capture headless
+```
 
-`scripts/checks/check-session.sh` exercises background location switching, partial collection and removal, and reconciliation after scan and refresh races. `scripts/checks/check-app.sh` also checks list-hover suppression through wheel input, scrollbar dragging and momentum, including pointer restoration and teardown. `scripts/checks/check-rendering.sh` checks native graph pixels through hover, selection, and collection changes, plus drawing-cache invalidation. The layout suite checks stable frames through navigation and interaction, native toolbar alignment and resizing.
+With the screen unlocked, the live harness measures presented frames:
+
+```sh
+OrbitDisk --frame-harness
+```
 
 ## Scope and limits
 
-The first visit to Home, a device, or another folder still needs a complete metadata scan, with partial results available during the scan. Separate locations can continue mapping while you use another location, as long as the app remains open. The app saves the completed map in a local SQLite cache under `~/Library/Caches/local.orbitdisk.app/Indexes` and remembers the last location. Partial previews never replace a saved map. Mapping progress is committed in private batches under `~/Library/Application Support/local.orbitdisk.app/Mapping`, so a stopped or interrupted scan can resume when you reopen the location, including after the app restarts. When a saved map exists, it remains available while interrupted mapping resumes in the background. Later visits load only the displayed folder and chart detail; search covers discovered items during mapping and the saved index afterward. Opening a subfolder already covered by the current map reuses that index too. macOS filesystem events trigger updates of changed folders, including changes recorded while the app was closed. The map remains usable while updating.
+The first visit to Home, a device, or another folder still needs a complete metadata scan, with partial results available during the scan. Separate locations can continue mapping while you use another location, as long as the app remains open. The app saves the completed map in a local SQLite cache under `~/Library/Caches/local.orbitdisk.app/Maps` and remembers the last location. Partial previews never replace a saved map. Mapping progress is committed in private batches under `~/Library/Application Support/local.orbitdisk.app/Engine` (the removal journal stays in `…/Mapping`), so a stopped or interrupted scan can resume when you reopen the location, including after the app restarts. When a saved map exists, it remains available while interrupted mapping resumes in the background. Later visits load only the displayed folder and chart detail; search covers discovered items during mapping and the saved index afterward. Opening a subfolder already covered by the current map reuses that index too. macOS filesystem events trigger updates of changed folders, including changes recorded while the app was closed. The map remains usable while updating.
 
 Saved maps appear after checking the root's filesystem identity; event-history validation continues in the background. Chart geometry, group lookup, and collection marks are reused across hover and selection updates. New indexed data rebuilds the chart even when paths and sizes have stayed the same.
 

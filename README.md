@@ -48,6 +48,16 @@ Drag a segment or a list row into the collection tray. Collected items are marke
 
 Files stay where they are until you review the collection and confirm **Move to Trash** or **Delete Permanently**. Permanent deletion has its own confirmation and cannot be undone.
 
+## Fast and native
+
+Orbit Disk 1.0 is written in Rust and draws with [GPUI](https://gpui.rs), the GPU-accelerated UI framework from the Zed editor. Compared with the previous version, measured side by side on the same Mac:
+- maps real folders **2.3× faster**
+- indexes up to **2.9× faster**
+- shows a 180,000-file test folder in about 0.3 s
+- keeps every interaction well inside a 120 Hz frame
+
+[Benchmarks](docs/benchmarks/rust-port/)
+
 ## Your map is ready when you return
 
 Start browsing while the first scan is still finding files. Orbit Disk saves completed maps on your Mac and usually reopens them without another full scan. When macOS provides usable change history, changed folders update in the background. Search reads the saved index by name.
@@ -77,6 +87,8 @@ Install [Rust](https://rustup.rs) (the pinned toolchain in `rust-toolchain.toml`
 ./build-app.sh
 ```
 
-The script builds `../Orbit Disk.app` with `cargo xtask bundle` and downloads the pinned, checksum-verified Sparkle framework on the first run. With full Xcode installed, `./build-app.sh --release-mode` precompiles the Metal shaders. Without it, the build compiles them at launch instead. `cargo nextest run --workspace` runs the tests. `cargo run -p orbit-disk -- --fixture` opens the app on generated sample data. The [guide](docs/GUIDE.md) covers shortcuts, tests, limitations, and release steps. See [technical notes](TECHNICAL-NOTES.md) for implementation details.
+The script builds `../Orbit Disk.app` with `cargo xtask bundle` and downloads the pinned, checksum-verified Sparkle framework on the first run. With full Xcode installed, `./build-app.sh --release-mode` precompiles the Metal shaders. Without it, the build compiles them at launch instead. `cargo nextest run --workspace` runs the tests. `cargo run -p orbit-disk -- --fixture` opens the app on generated sample data. The [guide](docs/GUIDE.md) covers shortcuts, tests, limitations, and release steps.
+
+The workspace keeps everything specific to macOS in two platform crates (`orbit-platform-macos`, `orbit-shell-macos`). The engine, app state, map geometry and automation are portable and tested on Linux, ready for future Windows and Linux layers. See [the architecture notes](docs/rust-port/README.md) and the [technical notes](TECHNICAL-NOTES.md) for the invariants the engine preserves.
 
 The screenshots and flow illustrations use sample data rendered from the app’s views. Run `./scripts/capture-marketing.sh` to refresh them locally; GitHub Actions refreshes them from the released commit only after a release is published.
