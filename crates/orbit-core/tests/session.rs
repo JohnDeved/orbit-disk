@@ -490,9 +490,13 @@ fn coverage_finds_the_covering_saved_map() {
     // A folder outside the mapped root, and a path that is a file, are not covered.
     assert!(maps.coverage(&bytes(&fx.base), &cancel).unwrap().is_none());
     assert!(maps.coverage(&bytes(&fx.root.join("d1/linked.dat")), &cancel).unwrap().is_none());
-    // A replaced folder is not reachable as the indexed directory any more.
+    // A replaced folder is not reachable as the indexed directory any more. The replacement is
+    // created while the original still exists so the two can never share an inode number
+    // (ext4 reuses freed inodes immediately).
+    let replacement = fx.root.join("d2/e2-new");
+    std::fs::create_dir(&replacement).unwrap();
     std::fs::remove_dir_all(&sub).unwrap();
-    std::fs::create_dir(&sub).unwrap();
+    std::fs::rename(&replacement, &sub).unwrap();
     let replaced = maps.coverage(&bytes(&sub), &cancel).unwrap();
     assert!(replaced.is_none(), "{replaced:?}");
 }

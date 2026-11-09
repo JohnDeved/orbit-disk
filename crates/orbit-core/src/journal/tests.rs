@@ -252,9 +252,9 @@ fn killed_owner_turns_live_operation_into_abandoned_intent() {
     assert!(journal.with_fence(&none(), |f| f.is_live(1)).unwrap());
     child.kill();
     assert!(!journal.with_fence(&none(), |f| f.is_live(1)).unwrap(), "a killed owner is abandoned");
-    // A file recreated at the removed path keeps the journal's original identity.
+    // A file recreated at the removed path keeps the journal's original identity. (ext4 may hand
+    // the freed inode number straight back, so the new file's identity can even be equal.)
     write(&fx.path("root/nested/target"), b"3");
-    assert_ne!(id(&fx.path("root/nested/target")), target_identity);
     let recorded = journal
         .with_fence(&none(), |f| f.intersections(1, &bytes(&fx.path("root")), None, 5))
         .unwrap()
