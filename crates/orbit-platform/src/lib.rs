@@ -29,7 +29,7 @@ pub use listing::{
     DirectoryLister, EntryKind, EntryRecord, FileIdentity, Issue, LISTING_BATCH, ListingSink, ListingTotals, Stop,
 };
 pub use shell::{LegacySettings, RelaunchHandle, Shell, Updater, UpdaterState};
-pub use system::{AppDirs, BootLayout, CloudStatus, ProtectedPaths, VolumeInfo, VolumeLayout};
+pub use system::{AppDirs, BootLayout, CloudStatus, PathAliases, ProtectedPaths, VolumeInfo, VolumeLayout};
 
 use std::path::{Path, PathBuf};
 
@@ -78,6 +78,12 @@ pub trait Platform: Send + Sync + 'static {
 
     /// Mounted, user-visible volumes for the Places sidebar and removal policy.
     fn volumes(&self) -> Vec<VolumeInfo>;
+
+    /// Root-independent path aliases (macOS: the boot Data volume and `/private`). Empty on
+    /// platforms without them.
+    fn path_aliases(&self) -> PathAliases {
+        PathAliases::default()
+    }
 
     // --- Cloud storage ----------------------------------------------------------------------
 

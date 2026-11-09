@@ -1919,6 +1919,62 @@ impl Writer {
         self.mark_dirty(&path)
     }
 
+    /// Queues `directory` and every registered directory below it for relisting with new
+    /// revisions (a change monitor asked for a recursive reconciliation; Swift replaced the
+    /// whole subtree with a fresh scan). Unchanged child listings keep their rows, so only the
+    /// listings themselves are repeated. The root starts a full refresh instead.
+    pub fn mark_subtree_changed(&mut self, directory: &[u8]) -> Result<()> {
+        if directory == self.root.as_slice() || !crate::paths::is_within(directory, &self.root) {
+            return self.transaction(|w| w.mark_full_refresh());
+        }
+        if self.directory(directory)?.is_none() {
+            return self.mark_changed(directory);
+        }
+        let (low, high) = descendant_range(directory);
+        self.transaction(|w| {
+            w.bump_dirty(directory)?;
+            w.conn
+                .prepare_cached(
+                    "INSERT INTO dirty(parent,revision,pending) SELECT path,1,1 FROM dirs WHERE path>=?1 AND path<?2
+                     ON CONFLICT(parent) DO UPDATE SET revision=revision+1,pending=1",
+                )?
+                .execute(params![low, high])?;
+            w.conn
+                .prepare_cached("UPDATE dirs SET pending=1 WHERE path>=?1 AND path<?2")?
+                .execute(params![low, high])?;
+            Ok(())
+        })
+    }
+
+    /// Finishes a repair of a saved-map working copy: a new snapshot id and scan time, the
+    /// change-history position the repair covers and the removal-journal cursor, atomically.
+    pub fn finish_repair(
+        &mut self,
+        event_identity: &str,
+        event_id: u64,
+        elapsed: f64,
+        removal_cursor: Option<(&str, i64)>,
+    ) -> Result<schema::SnapshotInfo> {
+        let path = self.path.clone();
+        self.transaction(|w| {
+            if w.has_remaining_work()? {
+                return Err(sqlite_invalid("the repair has pending work"));
+            }
+            let id = uuid::Uuid::new_v4().hyphenated().to_string().to_uppercase();
+            let changed = w.conn.execute(
+                "UPDATE metadata SET snapshot_id=?1,scanned_at=?2,elapsed=?3,event_id=?4,event_identity=?5 WHERE singleton=1",
+                params![id, unix_now(), elapsed.max(0.0), to_sql_u64(event_id), event_identity],
+            )?;
+            if changed != 1 {
+                return Err(sqlite_invalid("the saved map has no metadata"));
+            }
+            if let Some((identity, sequence)) = removal_cursor {
+                write_removal_cursor(&w.conn, identity, sequence)?;
+            }
+            schema::read_snapshot(&w.conn, &path)
+        })
+    }
+
     /// A queued directory vanished or was replaced: prune it and relist its parent.
     pub fn invalidate_directory(&mut self, path: &[u8]) -> Result<()> {
         let (parent, name) = split_parent(path).ok_or_else(|| sqlite_invalid("invalid directory"))?;

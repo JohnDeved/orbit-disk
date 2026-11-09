@@ -134,6 +134,7 @@ fn main() {
         cache: directory.join("published"),
         locks: directory.join("locks"),
         staging: directory.join("staging"),
+        journal: directory.join("locks"),
     };
     let checkpoint =
         StageCheckpoint { root_path: root_bytes.clone(), identity: "synthetic-indexing-benchmark".into(), event_id: 0 };
@@ -145,7 +146,7 @@ fn main() {
         Ok(Opened::Stage(stage)) => stage,
         other => fail(format!("open: {other:?}")),
     };
-    let database = stage.lease().database_path().to_path_buf();
+    let database = stage.database().to_path_buf();
     timings.measure("queue_indexes", || stage.writer().prepare_queue_indexes(&cancel)).unwrap_or_else(|e| fail(e));
     if generation != 0 {
         timings

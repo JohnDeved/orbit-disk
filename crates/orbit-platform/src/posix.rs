@@ -1,8 +1,10 @@
-//! Helpers shared by every Unix layer: no-follow directory opens with identity checks, `flock`,
-//! and durable directory sync. Kept free of Apple-only symbols so Linux can reuse it.
+//! Helpers shared by every Unix layer and by the engine's lock and journal files: no-follow
+//! directory opens with identity checks, `*at` file primitives, masked `stat`, `flock`, and durable
+//! directory sync. Kept free of Apple-only symbols so Linux can reuse it.
 
 use crate::{FileIdentity, PlatformError, Result};
-use std::ffi::{CString, OsStr};
+use std::ffi::{CStr, CString, OsStr};
+use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -140,6 +142,253 @@ pub fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
 
 pub fn path_from_bytes(bytes: &[u8]) -> &Path {
     Path::new(OsStr::from_bytes(bytes))
+}
+
+/// Owned copy of the `stat` fields that file-safety checks compare. The device is masked like
+/// [`stat_identity`]; times are `(seconds, nanoseconds)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stat {
+    pub identity: FileIdentity,
+    pub mode: u32,
+    pub uid: u32,
+    pub nlink: u64,
+    pub size: i64,
+    pub mtime: (i64, i64),
+    pub ctime: (i64, i64),
+}
+
+impl Stat {
+    #[allow(clippy::unnecessary_cast)]
+    pub fn from_raw(info: &libc::stat) -> Self {
+        Self {
+            identity: stat_identity(info),
+            mode: info.st_mode as u32,
+            uid: info.st_uid as u32,
+            nlink: info.st_nlink as u64,
+            size: info.st_size as i64,
+            mtime: (info.st_mtime as i64, info.st_mtime_nsec as i64),
+            ctime: (info.st_ctime as i64, info.st_ctime_nsec as i64),
+        }
+    }
+
+    #[inline]
+    fn file_type(&self) -> u32 {
+        self.mode & libc::S_IFMT as u32
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.file_type() == libc::S_IFDIR as u32
+    }
+
+    /// A regular file.
+    pub fn is_file(&self) -> bool {
+        self.file_type() == libc::S_IFREG as u32
+    }
+
+    pub fn permissions(&self) -> u32 {
+        self.mode & 0o777
+    }
+
+    pub fn same_file(&self, other: &Stat) -> bool {
+        self.identity == other.identity
+    }
+
+    /// Owned by this user, exactly `mode`, and (for non-directories) a single link.
+    pub fn is_private(&self, mode: u32) -> bool {
+        self.uid == euid() && self.permissions() == mode && (self.is_dir() || self.nlink == 1)
+    }
+}
+
+/// The effective user id of this process.
+pub fn euid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+fn c_bytes(bytes: &[u8]) -> io::Result<CString> {
+    CString::new(bytes).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+}
+
+/// `Ok(None)` for `ENOENT`, everything else unchanged.
+pub fn optional<T>(result: io::Result<T>) -> io::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<Stat> {
+    // SAFETY: zeroed `stat` is valid plain old data.
+    let mut info: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is live for the borrow; `info` is writable.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut info) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Stat::from_raw(&info))
+}
+
+/// `fstatat(AT_SYMLINK_NOFOLLOW)`.
+pub fn fstat_at(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<Stat> {
+    let c = c_bytes(name)?;
+    // SAFETY: zeroed `stat` is valid plain old data.
+    let mut info: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: live descriptor, NUL-terminated name, writable out-param.
+    if unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut info, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Stat::from_raw(&info))
+}
+
+/// `lstat`: the final component is not followed.
+pub fn lstat(path: &Path) -> io::Result<Stat> {
+    let c = c_bytes(path.as_os_str().as_bytes())?;
+    // SAFETY: zeroed `stat` is valid plain old data.
+    let mut info: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: NUL-terminated path, writable out-param.
+    if unsafe { libc::lstat(c.as_ptr(), &mut info) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Stat::from_raw(&info))
+}
+
+/// `stat`: follows symlinks.
+pub fn stat(path: &Path) -> io::Result<Stat> {
+    let c = c_bytes(path.as_os_str().as_bytes())?;
+    // SAFETY: zeroed `stat` is valid plain old data.
+    let mut info: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: NUL-terminated path, writable out-param.
+    if unsafe { libc::stat(c.as_ptr(), &mut info) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Stat::from_raw(&info))
+}
+
+/// `openat(dir, name, flags | O_NOFOLLOW | O_CLOEXEC, mode)`.
+pub fn open_at(dir: BorrowedFd<'_>, name: &[u8], flags: libc::c_int, mode: u32) -> io::Result<OwnedFd> {
+    let c = c_bytes(name)?;
+    // SAFETY: live descriptor and NUL-terminated name; `mode` is the variadic argument `openat`
+    // reads only with O_CREAT.
+    let fd = unsafe {
+        libc::openat(dir.as_raw_fd(), c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, mode as libc::c_uint)
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned a fresh descriptor we now own.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Opens the directory `name` inside `dir` without following a symlink.
+pub fn open_dir_at(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<OwnedFd> {
+    open_at(dir, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+}
+
+/// Creates `name` (`O_EXCL`, write-only) with `mode`; never follows or replaces anything.
+pub fn create_exclusive_at(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<OwnedFd> {
+    open_at(dir, name, libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY, mode)
+}
+
+pub fn mkdir_at(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<()> {
+    let c = c_bytes(name)?;
+    // SAFETY: live descriptor and NUL-terminated name.
+    if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), mode as libc::mode_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `unlinkat`; `directory` selects `AT_REMOVEDIR`. Never follows a symlink: the entry itself goes.
+pub fn unlink_at(dir: BorrowedFd<'_>, name: &[u8], directory: bool) -> io::Result<()> {
+    let c = c_bytes(name)?;
+    let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
+    // SAFETY: live descriptor and NUL-terminated name.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), flags) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Renames `from` to `to`, both inside `dir`.
+pub fn rename_at(dir: BorrowedFd<'_>, from: &[u8], to: &[u8]) -> io::Result<()> {
+    let (from, to) = (c_bytes(from)?, c_bytes(to)?);
+    // SAFETY: live descriptor and NUL-terminated names.
+    if unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn fchmod(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
+    // SAFETY: live descriptor.
+    if unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn fsync(fd: BorrowedFd<'_>) -> io::Result<()> {
+    // SAFETY: live descriptor.
+    if unsafe { libc::fsync(fd.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub fn read(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: live descriptor; the buffer is writable for its full length.
+    let count = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(count as usize)
+}
+
+pub fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        // SAFETY: live descriptor; `bytes` is readable for its full length.
+        let count = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+        if count <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        bytes = &bytes[count as usize..];
+    }
+    Ok(())
+}
+
+/// Names in an open directory, excluding `.` and `..`. The descriptor is duplicated, so `dir` stays
+/// usable. A read error part-way ends the listing early; callers treat the result as advisory.
+pub fn read_names(dir: BorrowedFd<'_>) -> io::Result<Vec<Vec<u8>>> {
+    // SAFETY: live descriptor; `dup` returns a new descriptor or -1.
+    let copy = unsafe { libc::dup(dir.as_raw_fd()) };
+    if copy < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `copy` is a fresh descriptor; on success `fdopendir` takes ownership of it.
+    let stream = unsafe { libc::fdopendir(copy) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: `fdopendir` failed, so `copy` is still ours to close.
+        unsafe { libc::close(copy) };
+        return Err(error);
+    }
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: `stream` is a live DIR* we own until `closedir` below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: `readdir` returned a valid entry whose `d_name` is NUL-terminated and stays valid
+        // until the next `readdir`/`closedir` on this stream; we copy it immediately.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(name.to_vec());
+        }
+    }
+    // SAFETY: `stream` is live and closed exactly once (this also closes `copy`).
+    unsafe { libc::closedir(stream) };
+    Ok(names)
 }
 
 trait AsFdBorrowed {

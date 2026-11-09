@@ -15,6 +15,10 @@ pub struct CachedListing {
     pub revision: i64,
     /// The full-refresh generation the listing belongs to.
     pub generation: i64,
+    /// The records come from another map (Swift `StageReuse`) and still have to be written to
+    /// the stage: discovery queues them for the writer like a filesystem listing. `false` for
+    /// listings the stage already holds.
+    pub import: bool,
 }
 
 /// Opens one reader per worker (SQLite handles are not shared across threads).

@@ -13,7 +13,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use orbit_platform::{
-    AppDirs, CloudStatus, FileIdentity, Platform, ProtectedPaths, Result, VolumeInfo, VolumeLayout, posix,
+    AppDirs, CloudStatus, FileIdentity, PathAliases, Platform, ProtectedPaths, Result, VolumeInfo, VolumeLayout, posix,
 };
 
 pub use listing::{ListingMode, MacLister};
@@ -107,6 +107,13 @@ impl Platform for MacPlatform {
 
     fn trash(&self, path: &Path) -> Result<Option<PathBuf>> {
         system::trash(path)
+    }
+
+    fn path_aliases(&self) -> PathAliases {
+        PathAliases {
+            data_volume: Some(firmlinks::DATA_VOLUME.as_bytes().to_vec()),
+            hidden_prefix: Some(b"/private".to_vec()),
+        }
     }
 
     fn machine_identity(&self) -> Option<String> {

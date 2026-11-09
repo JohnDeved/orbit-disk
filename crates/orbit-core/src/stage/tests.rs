@@ -566,8 +566,7 @@ impl Fixture {
         let base = tmp.path().canonicalize().unwrap();
         let root = base.join("root");
         std::fs::create_dir(&root).unwrap();
-        let paths =
-            IndexPaths { cache: base.join("cache"), locks: base.join("support"), staging: base.join("support") };
+        let paths = IndexPaths::under(&base);
         Self { _dir: tmp, root, paths, platform: Arc::new(Native::default()) }
     }
 

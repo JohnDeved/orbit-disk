@@ -15,8 +15,8 @@
 //! [`RefreshFacts`], so it stays pure. Index lookups are cached per call with byte-exact keys
 //! (NFC and NFD spellings are different paths); filesystem checks are not cached.
 
+use crate::paths::standardize;
 use crate::paths::{SEP, is_within};
-use crate::policy::standardize;
 use crate::{CoreError, Result};
 use orbit_platform::Cancellation;
 use std::collections::{HashMap, HashSet};

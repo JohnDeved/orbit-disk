@@ -31,7 +31,6 @@ pub mod canonical;
 mod delete;
 mod run;
 pub mod schema;
-pub(crate) mod sys;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -46,6 +45,7 @@ pub use run::{
 use crate::paths;
 use crate::types::{CoreError, ScanRemoval};
 use canonical::ParentIdentity;
+use orbit_platform::posix::{self as sys, LockMode};
 use orbit_platform::posix::{join, path_from_bytes};
 use orbit_platform::{Cancellation, FileIdentity, PlatformError};
 use parking_lot::Mutex;
@@ -65,6 +65,10 @@ const DB_NAME: &[u8] = b"journal.sqlite";
 const OPERATION_SUFFIX: &str = ".operation";
 /// Largest page any journal query accepts.
 pub const MAX_PAGE: usize = 512;
+/// Mode of every journal file.
+const FILE_MODE: u32 = 0o600;
+/// Mode of the journal directory.
+const DIR_MODE: u32 = 0o700;
 /// Poll interval while another process holds the fence.
 const LOCK_POLL: Duration = Duration::from_millis(10);
 
@@ -120,7 +124,8 @@ impl From<JournalError> for CoreError {
             JournalError::Io(e) => CoreError::Io(e),
             JournalError::Target(e) => e,
             JournalError::Busy => CoreError::InUse("the removal journal".into()),
-            JournalError::JournalChanged | JournalError::ChangedDuringReconciliation => CoreError::SnapshotChanged,
+            JournalError::JournalChanged => CoreError::JournalChanged,
+            JournalError::ChangedDuringReconciliation => CoreError::ChangedDuringReconciliation,
             other => CoreError::Invalid(other.to_string()),
         }
     }
@@ -182,11 +187,11 @@ impl Journal {
             use std::os::unix::fs::DirBuilderExt;
             std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
         }
-        let (parent_fd, _) = sys::open_dir(parent).map_err(|_| unsafe_err("journal parent"))?;
+        let (parent_fd, _) = sys::open_root(parent).map_err(|_| unsafe_err("journal parent"))?;
         let name = DIRECTORY_NAME.as_bytes();
         let mut created = false;
         if write {
-            match sys::mkdir_at(parent_fd.as_fd(), name, sys::DIR_MODE) {
+            match sys::mkdir_at(parent_fd.as_fd(), name, DIR_MODE) {
                 Ok(()) => created = true,
                 Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
                 Err(_) => return Err(unsafe_err("journal directory")),
@@ -197,10 +202,10 @@ impl Journal {
             .map_err(|_| unsafe_err("open journal directory"))?;
         if created {
             // The umask may have narrowed the mode; the journal requires exactly 0700.
-            sys::fchmod(dir_fd.as_fd(), sys::DIR_MODE).map_err(|_| unsafe_err("journal directory mode"))?;
+            sys::fchmod(dir_fd.as_fd(), DIR_MODE).map_err(|_| unsafe_err("journal directory mode"))?;
         }
         let info = sys::fstat(dir_fd.as_fd()).map_err(|_| unsafe_err("journal directory identity"))?;
-        if !info.is_dir() || !info.is_private(sys::DIR_MODE) {
+        if !info.is_dir() || !info.is_private(DIR_MODE) {
             return Err(unsafe_err("journal directory identity"));
         }
         let journal = Self {
@@ -229,7 +234,7 @@ impl Journal {
         let held = sys::fstat(self.dir_fd.as_fd()).map_err(|_| replaced())?;
         let actual = sys::lstat(&self.directory).map_err(|_| replaced())?;
         if !actual.is_dir()
-            || !actual.is_private(sys::DIR_MODE)
+            || !actual.is_private(DIR_MODE)
             || actual.identity != self.dir_identity
             || held.identity != self.dir_identity
         {
@@ -247,26 +252,26 @@ impl Journal {
         let flags = if write { flags } else { flags & !libc::O_CREAT & !libc::O_EXCL };
         let dir = self.dir_fd.as_fd();
         let (fd, created) = if create && flags & libc::O_EXCL == 0 {
-            match sys::open_at(dir, name, flags | libc::O_CREAT | libc::O_EXCL, sys::FILE_MODE) {
+            match sys::open_at(dir, name, flags | libc::O_CREAT | libc::O_EXCL, FILE_MODE) {
                 Ok(fd) => (Ok(fd), true),
                 Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-                    (sys::open_at(dir, name, flags & !libc::O_CREAT, sys::FILE_MODE), false)
+                    (sys::open_at(dir, name, flags & !libc::O_CREAT, FILE_MODE), false)
                 }
                 Err(e) => (Err(e), false),
             }
         } else {
-            let fd = sys::open_at(dir, name, flags, sys::FILE_MODE);
+            let fd = sys::open_at(dir, name, flags, FILE_MODE);
             let created = create && fd.is_ok();
             (fd, created)
         };
         let fd = fd.map_err(|_| JournalError::Unsafe(format!("open {label}")))?;
         if created {
-            sys::fchmod(fd.as_fd(), sys::FILE_MODE).map_err(|_| JournalError::Unsafe(format!("mode {label}")))?;
+            sys::fchmod(fd.as_fd(), FILE_MODE).map_err(|_| JournalError::Unsafe(format!("mode {label}")))?;
         }
         let unsafe_file = || JournalError::Unsafe(format!("unsafe {label}"));
         let held = sys::fstat(fd.as_fd()).map_err(|_| unsafe_file())?;
-        let actual = sys::stat_at(dir, name).map_err(|_| unsafe_file())?;
-        if !held.is_file() || !held.is_private(sys::FILE_MODE) || held.identity != actual.identity {
+        let actual = sys::fstat_at(dir, name).map_err(|_| unsafe_file())?;
+        if !held.is_file() || !held.is_private(FILE_MODE) || held.identity != actual.identity {
             return Err(unsafe_file());
         }
         if created {
@@ -279,9 +284,9 @@ impl Journal {
         self.validate_directory()?;
         let replaced = || JournalError::Unsafe("journal file replaced".into());
         let held = sys::fstat(fd.as_fd()).map_err(|_| replaced())?;
-        let actual = sys::stat_at(self.dir_fd.as_fd(), name).map_err(|_| replaced())?;
+        let actual = sys::fstat_at(self.dir_fd.as_fd(), name).map_err(|_| replaced())?;
         if !actual.is_file()
-            || !actual.is_private(sys::FILE_MODE)
+            || !actual.is_private(FILE_MODE)
             || held.identity != expected
             || actual.identity != expected
         {
@@ -294,8 +299,8 @@ impl Journal {
         for suffix in [&b"-wal"[..], b"-shm", b"-journal"] {
             let mut name = DB_NAME.to_vec();
             name.extend_from_slice(suffix);
-            match sys::stat_at(self.dir_fd.as_fd(), &name) {
-                Ok(info) if info.is_file() && info.is_private(sys::FILE_MODE) => {}
+            match sys::fstat_at(self.dir_fd.as_fd(), &name) {
+                Ok(info) if info.is_file() && info.is_private(FILE_MODE) => {}
                 Ok(_) => return Err(JournalError::Unsafe("journal sidecar identity".into())),
                 Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
                 Err(_) => return Err(JournalError::Unsafe("journal sidecar".into())),
@@ -306,7 +311,9 @@ impl Journal {
 
     fn wait_lock(&self, fd: &OwnedFd, cancel: &Cancellation, shared: bool) -> JournalResult<()> {
         let path = self.directory.join("journal.lock");
-        while !sys::try_lock(fd.as_fd(), shared, &path).map_err(|_| JournalError::Unsafe("journal lock".into()))? {
+        while !sys::try_flock(fd.as_fd(), if shared { LockMode::Shared } else { LockMode::Exclusive }, &path)
+            .map_err(|_| JournalError::Unsafe("journal lock".into()))?
+        {
             if cancel.is_cancelled() {
                 return Err(JournalError::Cancelled);
             }
@@ -717,7 +724,9 @@ impl<'j> Fence<'j> {
         }
         let (fd, identity) = self.journal.checked_file(name.as_bytes(), libc::O_RDWR, false)?;
         let path = self.journal.directory.join(&name);
-        if !sys::try_lock(fd.as_fd(), false, &path).map_err(|_| JournalError::Unsafe("operation lock".into()))? {
+        if !sys::try_flock(fd.as_fd(), LockMode::Exclusive, &path)
+            .map_err(|_| JournalError::Unsafe("operation lock".into()))?
+        {
             return Ok(true);
         }
         self.journal.validate_file(name.as_bytes(), &fd, identity)?;

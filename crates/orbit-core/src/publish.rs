@@ -85,7 +85,7 @@ impl<P: Platform> Stage<P> {
             return Err(CoreError::Cancelled);
         }
         self.writer().checkpoint_for_clone(options.checkpoint_timeout, &cancel)?;
-        let source = self.lease().database_path().to_path_buf();
+        let source = self.database().to_path_buf();
         let destination = crate::store::saved_map_path(&paths.cache, &root);
         let temporary = paths.cache.join(format!(".orbit-stage-{}.sqlite", uuid::Uuid::new_v4().hyphenated()));
         let mut created: Option<(u64, u64)> = None;
@@ -99,12 +99,12 @@ impl<P: Platform> Stage<P> {
             let copied = crate::lease::sys::lstat(&temporary).map_err(fail)?;
             let euid = crate::lease::sys::euid();
             if let Some(info) = copied
-                && info.is_regular()
+                && info.is_file()
                 && info.uid == euid
             {
-                created = Some((info.dev, info.ino));
+                created = Some((info.identity.dev, info.identity.ino));
             }
-            if !copied.is_some_and(|i| i.is_regular() && i.uid == euid && i.nlink == 1 && i.permissions() == 0o600) {
+            if !copied.is_some_and(|i| i.is_file() && i.uid == euid && i.nlink == 1 && i.permissions() == 0o600) {
                 return Err(fail(CoreError::Invalid("unsafe stage copy".into())));
             }
             if let Some(boundary) = options.boundary.as_mut()
@@ -148,8 +148,8 @@ impl<P: Platform> Stage<P> {
             Err(Ok(error)) => {
                 if let Some((dev, ino)) = created
                     && let Ok(Some(info)) = crate::lease::sys::lstat(&temporary)
-                    && info.dev == dev
-                    && info.ino == ino
+                    && info.identity.dev == dev
+                    && info.identity.ino == ino
                 {
                     let _ = std::fs::remove_file(&temporary);
                 }

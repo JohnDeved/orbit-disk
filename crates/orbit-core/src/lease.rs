@@ -79,7 +79,7 @@ mod unix {
     }
 
     fn private_file(info: &Stat) -> bool {
-        info.is_regular() && info.uid == sys::euid() && info.permissions() == 0o600 && info.nlink == 1
+        info.is_file() && info.uid == sys::euid() && info.permissions() == 0o600 && info.nlink == 1
     }
 
     fn private_dir(info: &Stat) -> bool {
@@ -305,201 +305,109 @@ mod unix {
         }
     }
 
+    /// Adapters over [`orbit_platform::posix`] with the lease's conventions: `&str` names,
+    /// missing files as `None`, errors as [`CoreError`].
     pub(crate) mod sys {
-        use crate::{CoreError, Result};
-        use std::ffi::CString;
-        use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-        use std::os::unix::ffi::OsStrExt;
+        use crate::Result;
+        use orbit_platform::posix;
+        use std::os::fd::{BorrowedFd, OwnedFd};
         use std::path::Path;
 
-        const DIR_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub struct Stat {
-            pub dev: u64,
-            pub ino: u64,
-            pub mode: u32,
-            pub uid: u32,
-            pub nlink: u64,
-            pub size: i64,
-            pub mtime: (i64, i64),
-            pub ctime: (i64, i64),
-        }
-
-        impl Stat {
-            pub fn is_regular(&self) -> bool {
-                self.mode & libc::S_IFMT as u32 == libc::S_IFREG as u32
-            }
-            pub fn is_dir(&self) -> bool {
-                self.mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32
-            }
-            pub fn permissions(&self) -> u32 {
-                self.mode & 0o777
-            }
-            pub fn same_file(&self, other: &Stat) -> bool {
-                self.dev == other.dev && self.ino == other.ino
-            }
-        }
-
-        #[allow(clippy::unnecessary_cast)]
-        fn convert(info: &libc::stat) -> Stat {
-            let id = orbit_platform::posix::stat_identity(info);
-            Stat {
-                dev: id.dev,
-                ino: id.ino,
-                mode: info.st_mode as u32,
-                uid: info.st_uid as u32,
-                nlink: info.st_nlink as u64,
-                size: info.st_size as i64,
-                mtime: (info.st_mtime as i64, info.st_mtime_nsec as i64),
-                ctime: (info.st_ctime as i64, info.st_ctime_nsec as i64),
-            }
-        }
-
-        fn c(name: &[u8]) -> std::io::Result<CString> {
-            CString::new(name).map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))
-        }
-
-        fn fd_result(fd: libc::c_int) -> std::io::Result<OwnedFd> {
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // SAFETY: the caller passes a descriptor freshly returned by open/openat.
-            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-        }
-
-        pub fn euid() -> u32 {
-            // SAFETY: geteuid has no preconditions.
-            unsafe { libc::geteuid() }
-        }
+        pub use posix::{Stat, euid, fsync};
 
         pub fn open_dir(path: &Path) -> std::io::Result<OwnedFd> {
-            let path = c(path.as_os_str().as_bytes())?;
-            // SAFETY: NUL-terminated path.
-            fd_result(unsafe { libc::open(path.as_ptr(), DIR_FLAGS) })
+            posix::open_root(path)
+                .map(|(fd, _)| fd)
+                .map_err(|e| std::io::Error::from_raw_os_error(e.code().unwrap_or(libc::EIO)))
         }
 
-        pub fn mkdirat(dir: BorrowedFd<'_>, name: &str, mode: libc::mode_t) -> std::io::Result<()> {
-            let name = c(name.as_bytes())?;
-            // SAFETY: live descriptor and NUL-terminated name.
-            if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), mode) } != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EEXIST) {
-                    return Err(error);
-                }
+        /// `mkdirat`, treating an existing entry as success (callers validate it afterwards).
+        pub fn mkdirat(dir: BorrowedFd<'_>, name: &str, mode: u32) -> std::io::Result<()> {
+            match posix::mkdir_at(dir, name.as_bytes(), mode) {
+                Err(error) if error.raw_os_error() != Some(libc::EEXIST) => Err(error),
+                _ => Ok(()),
             }
-            Ok(())
         }
 
         pub fn openat_dir(dir: BorrowedFd<'_>, name: &str) -> std::io::Result<OwnedFd> {
-            let name = c(name.as_bytes())?;
-            // SAFETY: live descriptor and NUL-terminated name.
-            fd_result(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), DIR_FLAGS) })
+            posix::open_dir_at(dir, name.as_bytes())
         }
 
         /// Opens (optionally creating, mode 0600) a regular file without following symlinks.
         pub fn openat_file(dir: BorrowedFd<'_>, name: &str, create: bool) -> std::io::Result<OwnedFd> {
-            let name = c(name.as_bytes())?;
-            let flags =
-                libc::O_NOFOLLOW | libc::O_CLOEXEC | if create { libc::O_CREAT | libc::O_RDWR } else { libc::O_RDONLY };
-            // SAFETY: live descriptor and NUL-terminated name; mode is passed as the variadic arg.
-            fd_result(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600 as libc::c_uint) })
+            let flags = if create { libc::O_CREAT | libc::O_RDWR } else { libc::O_RDONLY };
+            posix::open_at(dir, name.as_bytes(), flags, 0o600)
         }
 
         pub fn create_exclusive(dir: BorrowedFd<'_>, name: &str) -> std::io::Result<OwnedFd> {
-            let name = c(name.as_bytes())?;
-            let flags = libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-            // SAFETY: live descriptor and NUL-terminated name.
-            fd_result(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o600 as libc::c_uint) })
+            posix::create_exclusive_at(dir, name.as_bytes(), 0o600)
         }
 
         pub fn fstat(fd: BorrowedFd<'_>) -> Result<Stat> {
-            // SAFETY: zeroed stat is valid POD.
-            let mut info: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: live descriptor, writable out-param.
-            if unsafe { libc::fstat(fd.as_raw_fd(), &mut info) } != 0 {
-                return Err(CoreError::Io(std::io::Error::last_os_error()));
-            }
-            Ok(convert(&info))
+            Ok(posix::fstat(fd)?)
         }
 
         /// `fstatat(AT_SYMLINK_NOFOLLOW)`; `None` when the name does not exist.
         pub fn fstatat(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Stat>> {
-            let name = c(name.as_bytes())?;
-            // SAFETY: zeroed stat is valid POD.
-            let mut info: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: live descriptor, NUL-terminated name, writable out-param.
-            if unsafe { libc::fstatat(dir.as_raw_fd(), name.as_ptr(), &mut info, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
-                let error = std::io::Error::last_os_error();
-                return if error.raw_os_error() == Some(libc::ENOENT) { Ok(None) } else { Err(error.into()) };
-            }
-            Ok(Some(convert(&info)))
+            Ok(posix::optional(posix::fstat_at(dir, name.as_bytes()))?)
         }
 
         /// `lstat`; `None` when the path does not exist.
         pub fn lstat(path: &Path) -> Result<Option<Stat>> {
-            let path = c(path.as_os_str().as_bytes())?;
-            // SAFETY: zeroed stat is valid POD.
-            let mut info: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: NUL-terminated path, writable out-param.
-            if unsafe { libc::lstat(path.as_ptr(), &mut info) } != 0 {
-                let error = std::io::Error::last_os_error();
-                return if error.raw_os_error() == Some(libc::ENOENT) { Ok(None) } else { Err(error.into()) };
-            }
-            Ok(Some(convert(&info)))
+            Ok(posix::optional(posix::lstat(path))?)
         }
 
         pub fn unlinkat(dir: BorrowedFd<'_>, name: &str) -> Result<()> {
-            let name = c(name.as_bytes())?;
-            // SAFETY: live descriptor and NUL-terminated name.
-            if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(())
+            Ok(posix::unlink_at(dir, name.as_bytes(), false)?)
         }
 
         pub fn renameat(dir: BorrowedFd<'_>, from: &str, to: &str) -> Result<()> {
-            let (from, to) = (c(from.as_bytes())?, c(to.as_bytes())?);
-            // SAFETY: live descriptor and NUL-terminated names.
-            if unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(())
-        }
-
-        pub fn fsync(fd: BorrowedFd<'_>) -> Result<()> {
-            // SAFETY: live descriptor.
-            if unsafe { libc::fsync(fd.as_raw_fd()) } != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(())
+            Ok(posix::rename_at(dir, from.as_bytes(), to.as_bytes())?)
         }
 
         pub fn read(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> Result<usize> {
-            // SAFETY: live descriptor; the buffer is writable for its full length.
-            let count = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
-            if count < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(count as usize)
+            Ok(posix::read(fd, buffer)?)
         }
 
-        pub fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> Result<()> {
-            while !bytes.is_empty() {
-                // SAFETY: live descriptor; `bytes` is readable for its full length.
-                let count = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
-                if count <= 0 {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-                bytes = &bytes[count as usize..];
-            }
-            Ok(())
+        pub fn write_all(fd: BorrowedFd<'_>, bytes: &[u8]) -> Result<()> {
+            Ok(posix::write_all(fd, bytes)?)
         }
     }
 }
 
 #[cfg(unix)]
 pub(crate) use unix::sys;
+
+/// The invalidation generation of `root` read without taking its lock (Swift
+/// `MappingCoverage.generation`): `"0"` before the first invalidation, `None` when the lock
+/// directory or marker is unsafe or unreadable. For advisory checks only; writers validate
+/// under [`RootMutationLease`].
+#[cfg(unix)]
+pub fn read_invalidation_generation(locks: &Path, root: &[u8]) -> Option<String> {
+    use orbit_platform::posix;
+    use std::os::fd::AsFd;
+    let (parent, _) = posix::open_root(locks).ok()?;
+    let dir = posix::open_dir_at(parent.as_fd(), LOCKS_DIR.as_bytes()).ok()?;
+    let info = posix::fstat(dir.as_fd()).ok()?;
+    if !info.is_dir() || info.uid != posix::euid() || info.permissions() != 0o700 {
+        return None;
+    }
+    let name = format!("{}.lock.generation", crate::schema::root_digest(root));
+    let file = match posix::open_at(dir.as_fd(), name.as_bytes(), libc::O_RDONLY, 0) {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Some("0".into()),
+        Err(_) => return None,
+    };
+    let held = posix::fstat(file.as_fd()).ok()?;
+    let named = posix::fstat_at(dir.as_fd(), name.as_bytes()).ok()?;
+    if !held.is_file() || !held.is_private(0o600) || !held.same_file(&named) {
+        return None;
+    }
+    let mut buffer = [0u8; 64];
+    let count = posix::read(file.as_fd(), &mut buffer).ok()?;
+    let text = std::str::from_utf8(&buffer[..count]).ok()?;
+    (count > 0 && count < buffer.len() && uuid::Uuid::parse_str(text).is_ok()).then(|| text.to_string())
+}
 
 /// Creates `path` (and parents) with mode `0700` and checks the result is a directory we own.
 pub fn create_private_dir(path: &Path) -> Result<()> {
@@ -554,7 +462,7 @@ impl SnapshotExpectation {
     pub fn capture(cache: &Path, root: &[u8]) -> Result<Self> {
         let path = crate::store::saved_map_path(cache, root);
         let Some(info) = sys::lstat(&path)? else { return Ok(Self::Absent) };
-        if !info.is_regular() || info.uid != sys::euid() || info.nlink != 1 {
+        if !info.is_file() || info.uid != sys::euid() || info.nlink != 1 {
             return Err(unsafe_file("saved map"));
         }
         if let Some(snapshot) = crate::store::read_saved_snapshot(&path, root, true) {
@@ -562,7 +470,7 @@ impl SnapshotExpectation {
         }
         Ok(Self::Invalid(format!(
             "{}:{}:{}:{}:{}:{}:{}",
-            info.dev, info.ino, info.size, info.mtime.0, info.mtime.1, info.ctime.0, info.ctime.1
+            info.identity.dev, info.identity.ino, info.size, info.mtime.0, info.mtime.1, info.ctime.0, info.ctime.1
         )))
     }
 

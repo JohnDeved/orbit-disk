@@ -5,30 +5,22 @@
 //! algorithm must stay byte-for-byte compatible with the Swift app so `canonical` columns written
 //! by Swift journals keep matching after an update.
 
-use super::sys;
 use crate::paths;
 use orbit_platform::FileIdentity;
+use orbit_platform::posix as sys;
 use orbit_platform::posix::path_from_bytes;
 use std::os::unix::ffi::OsStrExt;
 
-/// OS volume aliases that make one folder reachable under several absolute paths. Supplied by the
-/// platform layer (macOS: `VolumeLayout::boot.data_path` and `/private`); empty elsewhere.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CanonicalAliases {
-    /// Mount path of the writable data volume whose folders also appear at `/` (macOS:
-    /// `/System/Volumes/Data`).
-    pub data_volume: Option<Vec<u8>>,
-    /// A prefix the OS hides from resolved paths when the shorter path exists (macOS: `/private`,
-    /// matching Foundation's `resolvingSymlinksInPath`).
-    pub hidden_prefix: Option<Vec<u8>>,
+/// OS volume aliases that make one folder reachable under several absolute paths, from
+/// [`orbit_platform::Platform::path_aliases`] (macOS: the boot Data volume and `/private`, matching
+/// Foundation's `resolvingSymlinksInPath`); empty elsewhere.
+pub type CanonicalAliases = orbit_platform::PathAliases;
+
+trait Spellings {
+    fn spellings(&self, resolved: &[u8]) -> Vec<Vec<u8>>;
 }
 
-impl CanonicalAliases {
-    /// The aliases macOS uses on its boot volume group.
-    pub fn macos_boot() -> Self {
-        Self { data_volume: Some(b"/System/Volumes/Data".to_vec()), hidden_prefix: Some(b"/private".to_vec()) }
-    }
-
+impl Spellings for CanonicalAliases {
     /// Every known spelling of an already resolved path (Swift `exclusionPaths([resolved])`).
     fn spellings(&self, resolved: &[u8]) -> Vec<Vec<u8>> {
         let mut bases = vec![resolved.to_vec()];
@@ -83,12 +75,12 @@ fn matches_through_ancestor(first: &[u8], second: &[u8]) -> bool {
 
 /// Identity of a path, following symlinks, if it is a directory.
 pub(crate) fn directory_identity(path: &[u8]) -> Option<FileIdentity> {
-    sys::stat(path_from_bytes(path)).ok().filter(sys::Meta::is_dir).map(|m| m.identity)
+    sys::stat(path_from_bytes(path)).ok().filter(sys::Stat::is_dir).map(|m| m.identity)
 }
 
 /// Identity of a path if it is a directory itself (a final symlink is not followed).
 pub(crate) fn directory_identity_no_follow(path: &[u8]) -> Option<FileIdentity> {
-    sys::lstat(path_from_bytes(path)).ok().filter(sys::Meta::is_dir).map(|m| m.identity)
+    sys::lstat(path_from_bytes(path)).ok().filter(sys::Stat::is_dir).map(|m| m.identity)
 }
 
 /// `realpath` of a directory reduced to its lexicographically smallest alias, or `None` when the

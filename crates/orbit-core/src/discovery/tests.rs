@@ -491,7 +491,7 @@ impl ListingCacheReader for FakeReader {
 
     fn listing(&mut self, path: &[u8], identity: FileIdentity) -> Option<CachedListing> {
         if path == self.dirty {
-            return Some(CachedListing { records: None, revision: 7, generation: 3 });
+            return Some(CachedListing { records: None, revision: 7, generation: 3, import: false });
         }
         if path != self.path {
             return None;
@@ -506,7 +506,7 @@ impl ListingCacheReader for FakeReader {
             allocated: 4096,
             is_mount_point: false,
         });
-        Some(CachedListing { records: Some(records), revision: 0, generation: 3 })
+        Some(CachedListing { records: Some(records), revision: 0, generation: 3, import: false })
     }
 }
 

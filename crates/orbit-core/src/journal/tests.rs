@@ -599,7 +599,10 @@ fn swift_journal_is_migrated_with_identity_cursor_and_live_operations() {
     let held =
         std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(journal_dir.join(live_lock)).unwrap();
     std::fs::set_permissions(journal_dir.join(live_lock), std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
-    assert!(sys::try_lock(held.as_fd(), false, &journal_dir).unwrap());
+    assert!(
+        orbit_platform::posix::try_flock(held.as_fd(), orbit_platform::posix::LockMode::Exclusive, &journal_dir)
+            .unwrap()
+    );
 
     let journal = fx.journal();
     let root = bytes(&fx.path("root"));

@@ -33,33 +33,7 @@ pub const HIDDEN_FOLDER: &str = "Hidden configuration folders are protected.";
 /// Followed by the error description.
 pub const NO_LONGER_ACCESSIBLE: &str = "This item is no longer accessible: ";
 
-/// Lexically normalizes an absolute path: drops empty and `.` components, applies `..` (never
-/// above `/`), removes a trailing slash. `None` for relative or empty paths. Does not touch the
-/// filesystem and never changes component bytes.
-pub fn standardize(path: &[u8]) -> Option<Vec<u8>> {
-    if path.first() != Some(&SEP) {
-        return None;
-    }
-    let mut components: Vec<&[u8]> = Vec::new();
-    for component in path.split(|b| *b == SEP) {
-        match component {
-            b"" | b"." => {}
-            b".." => {
-                components.pop();
-            }
-            name => components.push(name),
-        }
-    }
-    let mut out = Vec::with_capacity(path.len());
-    for component in &components {
-        out.push(SEP);
-        out.extend_from_slice(component);
-    }
-    if out.is_empty() {
-        out.push(SEP);
-    }
-    Some(out)
-}
+pub use crate::paths::standardize;
 
 /// `path` lies inside (or is) one of `roots`.
 pub fn is_within_any<R: AsRef<[u8]>>(path: &[u8], roots: &[R]) -> bool {

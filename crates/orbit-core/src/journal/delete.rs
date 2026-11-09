@@ -10,8 +10,8 @@
 //! under the same name between the identity check and `unlinkat` would be removed instead.
 //! Directories are opened with an identity check, so their contents are always the checked ones.
 
-use super::sys;
 use crate::paths;
+use orbit_platform::posix as sys;
 use orbit_platform::posix::{self, join, path_from_bytes};
 use orbit_platform::{FileIdentity, PlatformError};
 use std::io;
@@ -36,7 +36,7 @@ pub fn remove_no_follow(
     if name.is_empty() || name == b"." || name == b".." {
         return Err(PlatformError::os(path_from_bytes(path), libc::EINVAL));
     }
-    let (parent_fd, parent_identity) = sys::open_dir(path_from_bytes(parent)).map_err(|e| match e {
+    let (parent_fd, parent_identity) = sys::open_root(path_from_bytes(parent)).map_err(|e| match e {
         PlatformError::Os { code, .. } if code == libc::ELOOP || code == libc::ENOTDIR => {
             PlatformError::IdentityChanged { path: path_from_bytes(parent).to_path_buf() }
         }
@@ -45,7 +45,7 @@ pub fn remove_no_follow(
     if expected_parent.is_some_and(|p| p != parent_identity) {
         return Err(PlatformError::IdentityChanged { path: path_from_bytes(parent).to_path_buf() });
     }
-    let info = sys::stat_at(parent_fd.as_fd(), name).map_err(|e| os_error(path, &e))?;
+    let info = sys::fstat_at(parent_fd.as_fd(), name).map_err(|e| os_error(path, &e))?;
     if info.identity != expected {
         return Err(PlatformError::IdentityChanged { path: path_from_bytes(path).to_path_buf() });
     }
@@ -84,7 +84,7 @@ fn empty_directory(dir: OwnedFd, path: &[u8], device: u64) -> Result<(), Platfor
             continue;
         };
         let child_path = join(&top.path, &name);
-        let info = match sys::stat_at(top.fd.as_fd(), &name) {
+        let info = match sys::fstat_at(top.fd.as_fd(), &name) {
             Ok(info) => info,
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
             Err(e) => {

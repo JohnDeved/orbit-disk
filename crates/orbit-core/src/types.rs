@@ -18,6 +18,13 @@ pub enum CoreError {
     /// The saved map changed underneath an operation that expected a specific snapshot.
     #[error("the saved map changed; refresh and try again")]
     SnapshotChanged,
+    /// The removal journal was replaced or moved past the cursor an operation was fenced on
+    /// (Swift `RemovalRecoveryError.journalChanged`): re-plan from the stored cursor.
+    #[error("the removal journal changed")]
+    JournalChanged,
+    /// Removals were recorded while a repair was being prepared; it was not published.
+    #[error("the removal journal changed during reconciliation")]
+    ChangedDuringReconciliation,
     #[error("{0}")]
     Invalid(String),
 }
