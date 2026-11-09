@@ -4182,6 +4182,7 @@ dependencies = [
  "orbit-platform",
  "orbit-sunburst",
  "serde_json",
+ "unicode-segmentation",
 ]
 
 [[package]]

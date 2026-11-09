@@ -10,6 +10,7 @@ use orbit_app_state::model::ScanState;
 use orbit_app_state::{Event, Item, ReviewToken};
 
 use super::{ConfirmKind, Layer, SheetButton, SheetsLayer, card, noun, send, sheet_button, title};
+use crate::components::tooltip;
 use crate::host::Host;
 use crate::icons::{Icon, icon};
 use crate::theme;
@@ -18,16 +19,23 @@ fn incomplete(item: &Item) -> bool {
     item.is_dir() && item.meta.state != ScanState::Complete
 }
 
-/// One review row: kind, name, full path, size and Remove.
-fn review_row(index: usize, item: &Item, updating: bool, remove: Option<(Host, ReviewToken)>) -> AnyElement {
-    let size = if item.is_dir() && updating {
+/// One review row: kind, name, full path, size and Remove (disabled with "Removing from
+/// collection…" while the item is being removed in the background).
+fn review_row(
+    index: usize,
+    item: &Item,
+    updating: bool,
+    removing: bool,
+    remove: Option<(Host, ReviewToken)>,
+) -> AnyElement {
+    let size = if updating {
         "Updating…".to_owned()
     } else if incomplete(item) {
         format!("{} so far", theme::format_bytes(item.meta.size))
     } else {
         theme::format_bytes(item.meta.size)
     };
-    let enabled = remove.is_some();
+    let enabled = remove.is_some() && !removing;
     let path = Arc::clone(&item.path);
     div()
         .h(theme::REVIEW_ROW_HEIGHT)
@@ -59,19 +67,26 @@ fn review_row(index: usize, item: &Item, updating: bool, remove: Option<(Host, R
         .child(theme::monospaced_digits(
             div().w(theme::REVIEW_SIZE_WIDTH).flex_none().flex().justify_end().whitespace_nowrap().child(size),
         ))
-        .child(sheet_button(
-            format!("review-remove-{index}"),
-            "Remove",
-            Some(Icon::CircleMinus),
-            SheetButton::Bordered,
-            enabled,
-            move |_, _, cx| {
-                if let Some((host, review)) = &remove {
-                    let event = Event::Uncollect { path: Arc::clone(&path), review: Some(review.clone()) };
-                    send(host, event, cx);
-                }
-            },
-        ))
+        .child(
+            sheet_button(
+                format!("review-remove-{index}"),
+                "Remove",
+                Some(if removing { Icon::Loader } else { Icon::CircleMinus }),
+                SheetButton::Bordered,
+                enabled,
+                move |_, _, cx| {
+                    if let Some((host, review)) = &remove {
+                        let event = Event::Uncollect { path: Arc::clone(&path), review: Some(review.clone()) };
+                        send(host, event, cx);
+                    }
+                },
+            )
+            .tooltip(tooltip(if removing {
+                "Removing from collection…"
+            } else {
+                "Remove from collection"
+            })),
+        )
         .into_any_element()
 }
 
@@ -89,7 +104,8 @@ impl SheetsLayer {
         let validating = state.is_validating_collection();
         let updating = state.updating_removal_sizes();
         let editable = token.is_some() && !removing;
-        let removable = editable && !validating && !items.is_empty();
+        let edit_pending = state.is_updating_collection();
+        let removable = editable && !validating && !edit_pending && !items.is_empty();
 
         let error =
             done_token.as_ref().filter(|t| state.review_has_owner(t)).and_then(|_| state.error()).map(str::to_owned);
@@ -187,8 +203,17 @@ impl SheetsLayer {
         let rows = {
             let items = Arc::clone(&items);
             let remove = token.clone().filter(|_| editable).map(|token| (self.host.clone(), token));
-            uniform_list("review-items", items.len(), move |range, _: &mut Window, _: &mut App| {
-                range.map(|index| review_row(index, &items[index], updating, remove.clone())).collect::<Vec<_>>()
+            let host = self.host.clone();
+            uniform_list("review-items", items.len(), move |range, _: &mut Window, cx: &mut App| {
+                let state = host.state(cx);
+                range
+                    .map(|index| {
+                        let item = &items[index];
+                        let updating = updating && state.updating_removal_size(&item.path, item.is_dir());
+                        let removing = state.is_removing_from_collection(&item.path);
+                        review_row(index, item, updating, removing, remove.clone())
+                    })
+                    .collect::<Vec<_>>()
             })
             .size_full()
         };
@@ -221,7 +246,7 @@ impl SheetsLayer {
                 "Clear Collection",
                 None,
                 SheetButton::Bordered,
-                editable && !validating,
+                editable && !validating && !edit_pending,
                 cx.listener(move |this, _, _, cx| {
                     if let Some(review) = clear_token.clone() {
                         this.send(Event::ClearCollection { review }, cx);

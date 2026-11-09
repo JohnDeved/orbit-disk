@@ -43,7 +43,7 @@ pub use center::CenterText;
 use layers::{Fills, Marks};
 
 use crate::actions::OpenFolder;
-use crate::components::{ButtonStyle, CollectionDrag, DragPreview, button};
+use crate::components::{ButtonStyle, CollectionDrag, DragPreview, button, truncate_middle};
 use crate::frame_stats;
 use crate::host::Host;
 use crate::icons::{Icon, icon};
@@ -129,6 +129,8 @@ pub struct MapPanel {
     refresh_hover: bool,
     can_go_up: bool,
     center: CenterText,
+    /// The middle-truncated center name for (name, slot width, lines).
+    center_name: Option<((SharedString, Pixels, usize), SharedString)>,
     stats: MapStats,
     next_id: u64,
     _subscriptions: Vec<Subscription>,
@@ -154,6 +156,7 @@ impl MapPanel {
             refresh_hover: false,
             can_go_up: false,
             center: CenterText::default(),
+            center_name: None,
             stats: MapStats::default(),
             next_id: ID_BASE,
             _subscriptions: host.observe(REGIONS, cx),
@@ -178,6 +181,23 @@ impl MapPanel {
     /// The center's current text.
     pub fn center_text(&self) -> &CenterText {
         &self.center
+    }
+
+    /// `name` shortened in the middle to fit the center's name slot at hole `radius` (native
+    /// `.truncationMode(.middle)`: a long name keeps its start and its extension). Two-line slots
+    /// get a budget of a little less than two lines so the wrapped text never needs a third.
+    fn center_name(&mut self, name: &SharedString, radius: f32, window: &Window) -> SharedString {
+        let (width, lines) = center::name_slot(radius);
+        let key = (name.clone(), width, lines);
+        if let Some((cached, truncated)) = &self.center_name
+            && *cached == key
+        {
+            return truncated.clone();
+        }
+        let budget = if lines == 1 { width } else { width * (lines as f32 - 0.2) };
+        let truncated = truncate_middle(name, budget, theme::TEXT_ROW, theme::WEIGHT_MEDIUM, window);
+        self.center_name = Some((key, truncated.clone()));
+        truncated
     }
 
     fn layout_revision(&self) -> Option<u64> {
@@ -549,7 +569,14 @@ fn prepaint_chart(
     let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
     let (text, metrics) = entity.update(cx, |map, cx| {
         map.prepare(bounds, window, cx);
-        (map.presentation.is_some().then(|| map.center.clone()), map.chart.map(|(_, metrics)| metrics))
+        let metrics = map.chart.map(|(_, metrics)| metrics);
+        let text = map.presentation.is_some().then(|| map.center.clone()).map(|mut text| {
+            if let Some(metrics) = metrics {
+                text.name = map.center_name(&text.name, metrics.inner_radius as f32, window);
+            }
+            text
+        });
+        (text, metrics)
     });
     let center = text.zip(metrics).map(|(text, metrics)| {
         let radius = metrics.inner_radius as f32;
@@ -687,7 +714,14 @@ fn center_text(state: &AppState, presentation: &Presentation<NodeIx>, active: Op
     };
     let Some(folder) = state.folder() else { return CenterText::default() };
     let root = folder.folder_meta();
-    let updating = state.updating_removal_sizes();
+    let updating = state.updating_removal_sizes()
+        && match (&subject.kind, active.and_then(|index| presentation.layout.segments().get(index))) {
+            (SubjectKind::Node { is_dir }, Some(segment)) => {
+                segment.node.is_some_and(|ix| state.updating_removal_size(&folder.path(ix), *is_dir))
+            }
+            // The folder itself, or a group whose members it sums.
+            _ => state.updating_removal_size(folder.folder_path(), true),
+        };
     let value = if updating {
         "Updating…".to_owned()
     } else if subject.scan == ScanState::Pending {
@@ -723,7 +757,7 @@ fn center_text(state: &AppState, presentation: &Presentation<NodeIx>, active: Op
 }
 
 impl Render for MapPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         frame_stats::rendered(REGIONS);
         self.sync(cx);
         let root = div().size_full().flex().flex_col().track_focus(&self.focus).on_key_down(cx.listener(
@@ -736,13 +770,30 @@ impl Render for MapPanel {
         ));
         let state = self.host.state(cx);
         let Some(folder) = state.folder() else {
-            let waiting = state.is_scanning() || state.is_opening();
-            let title = state.title();
-            let path: SharedString = theme::display(state.scan_path()).into();
-            return root.child(if waiting { scanning(title, path) } else { welcome() });
+            if !(state.is_scanning() || state.is_opening()) {
+                return root.child(welcome());
+            }
+            // Progress notifies this region only until the first folder is shown.
+            let opening = Opening {
+                title: state.title(),
+                count: theme::format_count(state.progress_count()),
+                bytes: if state.updating_removal_sizes() {
+                    "Updating…".to_owned()
+                } else {
+                    theme::format_bytes(state.progress_bytes())
+                },
+                path: truncate_middle(
+                    &theme::display(state.scan_path()),
+                    px(OPENING_PATH_WIDTH),
+                    theme::TEXT_SMALL,
+                    gpui::FontWeight::NORMAL,
+                    window,
+                ),
+            };
+            return root.child(scanning(opening));
         };
         let meta = *folder.folder_meta();
-        let updating = state.updating_removal_sizes();
+        let updating = state.updating_removal_size(folder.folder_path(), true);
         let complete = meta.state == ScanState::Complete;
         let value = |bytes: u64| {
             if updating {
@@ -846,9 +897,21 @@ fn welcome() -> gpui::Div {
         )))
 }
 
-/// Opening or mapping before the first folder is available (Swift `scanningView`; counts are
-/// in the footer, which observes progress).
-fn scanning(title: &'static str, path: SharedString) -> gpui::Div {
+/// Widest path line of the opening view (Swift `frame(maxWidth: 520)`).
+const OPENING_PATH_WIDTH: f32 = 520.;
+
+/// What the opening view shows before the first folder is available.
+struct Opening {
+    title: &'static str,
+    count: String,
+    bytes: String,
+    /// The folder being read, middle-truncated.
+    path: SharedString,
+}
+
+/// Opening or mapping before the first folder is available (Swift `scanningView`): the title,
+/// items found and their file size so far, and the folder being read.
+fn scanning(opening: Opening) -> gpui::Div {
     div()
         .size_full()
         .flex()
@@ -858,13 +921,24 @@ fn scanning(title: &'static str, path: SharedString) -> gpui::Div {
         .gap(px(20.))
         .px(px(24.))
         .child(icon(Icon::Loader).size(px(28.)).text_color(theme::color(theme::SLATE)))
-        .child(div().text_size(px(26.)).font_weight(theme::WEIGHT_MEDIUM).child(title))
+        .child(div().text_size(px(26.)).font_weight(theme::WEIGHT_MEDIUM).child(opening.title))
         .child(
             div()
-                .max_w(px(520.))
+                .id("opening-metrics")
+                .debug_selector(|| "opening-metrics".into())
+                .flex()
+                .flex_row()
+                .gap(px(24.))
+                .child(metric("Items found", opening.count, false))
+                .child(metric("File size", opening.bytes, false)),
+        )
+        .child(
+            div()
+                .max_w(px(OPENING_PATH_WIDTH))
                 .text_size(theme::TEXT_SMALL)
                 .text_color(theme::color(theme::SLATE))
-                .truncate()
-                .child(path),
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(opening.path),
         )
 }

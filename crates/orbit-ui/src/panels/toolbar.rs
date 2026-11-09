@@ -7,7 +7,9 @@
 //! reserved but empty. Observes [`Regions::HEADER`].
 //!
 //! [`SearchField`]: a GPUI text input (key context `TextInput`, so Space types a space). Every edit
-//! sends `QueryChanged`; app-state debounces the search. Escape clears, the clear button too. A
+//! sends `QueryChanged`; app-state debounces the search. Grapheme-cluster cursor movement, ⌥
+//! word motion and deletion, ⌘Z / ⇧⌘Z undo and redo ([`TextEdit`]). Escape clears, the clear
+//! button too; a focused field always consumes Escape (it never stops mapping). A
 //! keystroke re-renders the field (and its toolbar parent) plus what app-state notifies for the
 //! query (list, inspector, header) — nothing else.
 //!
@@ -29,11 +31,12 @@ use orbit_core::paths::file_name;
 use orbit_core::types::ScanState;
 use orbit_core::view::FolderTree;
 
-use crate::actions::{Copy, Cut, OpenFolder, Paste, SelectAll, TEXT_INPUT_CONTEXT};
+use crate::actions::{Copy, Cut, OpenFolder, Paste, Redo, SelectAll, TEXT_INPUT_CONTEXT, Undo};
 use crate::components::{ButtonStyle, activity_indicator, button, tooltip, truncate_middle};
 use crate::frame_stats;
 use crate::host::Host;
 use crate::icons::{Icon, icon};
+use crate::text_edit::{EditKind, TextEdit};
 use crate::theme;
 
 pub const REGIONS: Regions = Regions::HEADER;
@@ -197,14 +200,12 @@ impl Render for ToolbarPanel {
 // ---------------------------------------------------------------------------------------------
 // Search field.
 
-/// The toolbar's search text input (after GPUI's `examples/input.rs`, char boundaries).
+/// The toolbar's search text input (after GPUI's `examples/input.rs`). Editing, grapheme and
+/// word motion and undo/redo live in [`TextEdit`].
 pub struct SearchField {
     host: Host,
     focus: FocusHandle,
-    content: String,
-    /// Selection in UTF-8 bytes.
-    selected: Range<usize>,
-    reversed: bool,
+    edit: TextEdit,
     /// IME composition range.
     marked: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
@@ -221,9 +222,7 @@ impl SearchField {
         Self {
             host: host.clone(),
             focus: cx.focus_handle(),
-            content: String::new(),
-            selected: 0..0,
-            reversed: false,
+            edit: TextEdit::default(),
             marked: None,
             last_layout: None,
             last_bounds: None,
@@ -235,120 +234,113 @@ impl SearchField {
     }
 
     pub fn text(&self) -> &str {
-        &self.content
+        self.edit.text()
     }
 
     /// Takes the state's query when it changed elsewhere (not while composing).
     fn sync(&mut self, query: &str, partial: bool, enabled: bool) {
         self.partial = partial;
         self.enabled = enabled;
-        if self.content != query && self.marked.is_none() {
-            self.content = query.to_owned();
-            self.selected = self.content.len()..self.content.len();
-            self.reversed = false;
+        if self.edit.text() != query && self.marked.is_none() {
+            self.edit.reset(query);
         }
     }
 
-    fn set_text(&mut self, text: String, cursor: usize, cx: &mut Context<Self>) {
-        let changed = text != self.content;
-        self.content = text;
-        self.selected = cursor..cursor;
-        self.reversed = false;
+    /// Tells the state about a changed query.
+    fn edited(&mut self, changed: bool, cx: &mut Context<Self>) {
         cx.notify();
         if changed {
-            self.host.send(Event::QueryChanged(self.content.clone()), cx);
+            self.host.send(Event::QueryChanged(self.edit.text().to_owned()), cx);
         }
     }
 
     fn clear(&mut self, cx: &mut Context<Self>) {
         self.marked = None;
-        self.set_text(String::new(), 0, cx);
+        self.edit.end_composition();
+        let changed = self.edit.replace(0..self.edit.text().len(), "", EditKind::Other);
+        self.edited(changed, cx);
     }
 
-    fn cursor(&self) -> usize {
-        if self.reversed { self.selected.start } else { self.selected.end }
-    }
-
-    fn previous_boundary(&self, offset: usize) -> usize {
-        self.content[..offset].char_indices().next_back().map_or(0, |(i, _)| i)
-    }
-
-    fn next_boundary(&self, offset: usize) -> usize {
-        self.content[offset..].chars().next().map_or(self.content.len(), |c| offset + c.len_utf8())
-    }
-
-    fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        self.selected = offset..offset;
-        self.reversed = false;
-        cx.notify();
-    }
-
-    fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        if self.reversed {
-            self.selected.start = offset;
-        } else {
-            self.selected.end = offset;
-        }
-        if self.selected.end < self.selected.start {
-            self.reversed = !self.reversed;
-            self.selected = self.selected.end..self.selected.start;
-        }
-        cx.notify();
-    }
-
-    fn replace(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
-        let mut next = String::with_capacity(self.content.len() + text.len());
-        next.push_str(&self.content[..range.start]);
-        next.push_str(&text.replace('\n', " "));
-        next.push_str(&self.content[range.end..]);
-        let cursor = range.start + text.len();
+    fn replace(&mut self, range: Range<usize>, text: &str, kind: EditKind, cx: &mut Context<Self>) {
         self.marked = None;
-        self.set_text(next, cursor, cx);
+        let changed = self.edit.replace(range, &text.replace('\n', " "), kind);
+        self.edited(changed, cx);
+    }
+
+    /// Deletes the selection, or from the cursor to `target` when nothing is selected.
+    fn delete_to(&mut self, target: usize, cx: &mut Context<Self>) {
+        let selected = self.edit.selected();
+        let range = if selected.is_empty() {
+            let cursor = self.edit.cursor();
+            cursor.min(target)..cursor.max(target)
+        } else {
+            selected
+        };
+        self.replace(range, "", EditKind::Deletion, cx);
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            // A focused text input owns Escape: it clears the query and never stops mapping.
+            if self.enabled && self.marked.is_none() && !self.edit.text().is_empty() {
+                self.clear(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         if !self.enabled || self.marked.is_some() {
             return;
         }
         let modifiers = event.keystroke.modifiers;
-        let shift = modifiers.shift;
-        let handled = match event.keystroke.key.as_str() {
-            "escape" if !self.content.is_empty() => {
-                self.clear(cx);
-                true
-            }
+        let (shift, word, line) = (modifiers.shift, modifiers.alt, modifiers.platform);
+        let edit = &self.edit;
+        let cursor = edit.cursor();
+        let handled = match key {
             "backspace" => {
-                if self.selected.is_empty() {
-                    let start = if modifiers.platform { 0 } else { self.previous_boundary(self.cursor()) };
-                    self.selected = start..self.selected.end;
-                }
-                self.replace(self.selected.clone(), "", cx);
+                let target = if line {
+                    0
+                } else if word {
+                    edit.previous_word(cursor)
+                } else {
+                    edit.previous_grapheme(cursor)
+                };
+                self.delete_to(target, cx);
                 true
             }
             "delete" => {
-                if self.selected.is_empty() {
-                    self.selected = self.selected.start..self.next_boundary(self.cursor());
-                }
-                self.replace(self.selected.clone(), "", cx);
+                let len = edit.text().len();
+                let target = if line {
+                    len
+                } else if word {
+                    edit.next_word(cursor)
+                } else {
+                    edit.next_grapheme(cursor)
+                };
+                self.delete_to(target, cx);
                 true
             }
             "left" | "right" | "home" | "end" | "up" | "down" => {
-                let key = event.keystroke.key.as_str();
+                let selected = edit.selected();
+                let len = edit.text().len();
                 let target = match key {
                     "home" | "up" => 0,
-                    "end" | "down" => self.content.len(),
-                    "left" if modifiers.platform => 0,
-                    "right" if modifiers.platform => self.content.len(),
-                    "left" if !shift && !self.selected.is_empty() => self.selected.start,
-                    "right" if !shift && !self.selected.is_empty() => self.selected.end,
-                    "left" => self.previous_boundary(self.cursor()),
-                    _ => self.next_boundary(self.cursor()),
+                    "end" | "down" => len,
+                    "left" if line => 0,
+                    "right" if line => len,
+                    "left" if word => edit.previous_word(cursor),
+                    "right" if word => edit.next_word(cursor),
+                    "left" if !shift && !selected.is_empty() => selected.start,
+                    "right" if !shift && !selected.is_empty() => selected.end,
+                    "left" => edit.previous_grapheme(cursor),
+                    _ => edit.next_grapheme(cursor),
                 };
                 if shift {
-                    self.select_to(target, cx)
+                    self.edit.select_to(target);
                 } else {
-                    self.move_to(target, cx)
+                    self.edit.move_to(target);
                 }
+                cx.notify();
                 true
             }
             _ => false,
@@ -359,21 +351,22 @@ impl SearchField {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.selected = 0..self.content.len();
-        self.reversed = false;
+        self.edit.select_all();
         cx.notify();
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.content[self.selected.clone()].to_owned()));
+        let selected = self.edit.selected();
+        if !selected.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(self.edit.text()[selected].to_owned()));
         }
     }
 
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected.is_empty() && self.enabled {
-            cx.write_to_clipboard(ClipboardItem::new_string(self.content[self.selected.clone()].to_owned()));
-            self.replace(self.selected.clone(), "", cx);
+        let selected = self.edit.selected();
+        if !selected.is_empty() && self.enabled {
+            cx.write_to_clipboard(ClipboardItem::new_string(self.edit.text()[selected.clone()].to_owned()));
+            self.replace(selected, "", EditKind::Other, cx);
         }
     }
 
@@ -381,19 +374,32 @@ impl SearchField {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
             && self.enabled
         {
-            self.replace(self.selected.clone(), &text, cx);
+            self.replace(self.edit.selected(), &text, EditKind::Other, cx);
+        }
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.enabled && self.marked.is_none() && self.edit.undo() {
+            self.edited(true, cx);
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.enabled && self.marked.is_none() && self.edit.redo() {
+            self.edited(true, cx);
         }
     }
 
     fn index_for_position(&self, position: Point<Pixels>) -> usize {
         let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref()) else { return 0 };
-        if self.content.is_empty() || position.y < bounds.top() {
+        let text = self.edit.text();
+        if text.is_empty() || position.y < bounds.top() {
             return 0;
         }
         if position.y > bounds.bottom() {
-            return self.content.len();
+            return text.len();
         }
-        line.closest_index_for_x(position.x - bounds.left() + self.scroll_x)
+        self.edit.snap(line.closest_index_for_x(position.x - bounds.left() + self.scroll_x))
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -404,13 +410,13 @@ impl SearchField {
         self.selecting = true;
         let index = self.index_for_position(event.position);
         if event.click_count >= 2 {
-            self.selected = 0..self.content.len();
-            cx.notify();
+            self.edit.select_all();
         } else if event.modifiers.shift {
-            self.select_to(index, cx);
+            self.edit.select_to(index);
         } else {
-            self.move_to(index, cx);
+            self.edit.move_to(index);
         }
+        cx.notify();
     }
 
     fn mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
@@ -419,23 +425,18 @@ impl SearchField {
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.selecting {
-            self.select_to(self.index_for_position(event.position), cx);
+            self.edit.select_to(self.index_for_position(event.position));
+            cx.notify();
         }
     }
 
     fn utf16_to_utf8(&self, offset: usize) -> usize {
-        let mut utf16 = 0;
-        for (i, c) in self.content.char_indices() {
-            if utf16 >= offset {
-                return i;
-            }
-            utf16 += c.len_utf16();
-        }
-        self.content.len()
+        utf16_to_utf8_in(self.edit.text(), offset)
     }
 
     fn utf8_to_utf16(&self, offset: usize) -> usize {
-        self.content[..offset.min(self.content.len())].chars().map(char::len_utf16).sum()
+        let text = self.edit.text();
+        text[..offset.min(text.len())].chars().map(char::len_utf16).sum()
     }
 
     fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
@@ -445,6 +446,17 @@ impl SearchField {
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
         self.utf8_to_utf16(range.start)..self.utf8_to_utf16(range.end)
     }
+}
+
+fn utf16_to_utf8_in(text: &str, offset: usize) -> usize {
+    let mut utf16 = 0;
+    for (i, c) in text.char_indices() {
+        if utf16 >= offset {
+            return i;
+        }
+        utf16 += c.len_utf16();
+    }
+    text.len()
 }
 
 impl Focusable for SearchField {
@@ -463,11 +475,11 @@ impl EntityInputHandler for SearchField {
     ) -> Option<String> {
         let range = self.range_from_utf16(&range);
         actual.replace(self.range_to_utf16(&range));
-        Some(self.content[range].to_owned())
+        Some(self.edit.text()[range].to_owned())
     }
 
     fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
-        Some(UTF16Selection { range: self.range_to_utf16(&self.selected), reversed: self.reversed })
+        Some(UTF16Selection { range: self.range_to_utf16(&self.edit.selected()), reversed: self.edit.reversed() })
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
@@ -476,6 +488,7 @@ impl EntityInputHandler for SearchField {
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
         self.marked = None;
+        self.edit.end_composition();
     }
 
     fn replace_text_in_range(
@@ -492,8 +505,8 @@ impl EntityInputHandler for SearchField {
             .as_ref()
             .map(|range| self.range_from_utf16(range))
             .or(self.marked.clone())
-            .unwrap_or(self.selected.clone());
-        self.replace(range, text, cx);
+            .unwrap_or(self.edit.selected());
+        self.replace(range, text, EditKind::Typing, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -511,18 +524,16 @@ impl EntityInputHandler for SearchField {
             .as_ref()
             .map(|range| self.range_from_utf16(range))
             .or(self.marked.clone())
-            .unwrap_or(self.selected.clone());
-        // Composition text is shown but not searched until committed.
-        self.content = format!("{}{}{}", &self.content[..range.start], text, &self.content[range.end..]);
+            .unwrap_or(self.edit.selected());
+        // Composition text is shown but neither searched nor recorded until committed.
+        let current = self.edit.text();
+        let content = format!("{}{}{}", &current[..range.start], text, &current[range.end..]);
         self.marked = (!text.is_empty()).then(|| range.start..range.start + text.len());
-        self.selected = selected
+        let selection = selected
             .as_ref()
-            .map(|sel| {
-                let start = range.start + self.utf16_to_utf8_in(text, sel.start);
-                let end = range.start + self.utf16_to_utf8_in(text, sel.end);
-                start..end
-            })
+            .map(|sel| range.start + utf16_to_utf8_in(text, sel.start)..range.start + utf16_to_utf8_in(text, sel.end))
             .unwrap_or_else(|| range.start + text.len()..range.start + text.len());
+        self.edit.compose(content, selection);
         cx.notify();
     }
 
@@ -554,23 +565,10 @@ impl EntityInputHandler for SearchField {
     }
 }
 
-impl SearchField {
-    fn utf16_to_utf8_in(&self, text: &str, offset: usize) -> usize {
-        let mut utf16 = 0;
-        for (i, c) in text.char_indices() {
-            if utf16 >= offset {
-                return i;
-            }
-            utf16 += c.len_utf16();
-        }
-        text.len()
-    }
-}
-
 impl Render for SearchField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus.is_focused(window);
-        let has_text = !self.content.is_empty();
+        let has_text = !self.edit.text().is_empty();
         let enabled = self.enabled;
         div()
             .id("search")
@@ -599,6 +597,8 @@ impl Render for SearchField {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
+            .when(self.edit.can_undo(), |el| el.on_action(cx.listener(Self::undo)))
+            .when(self.edit.can_redo(), |el| el.on_action(cx.listener(Self::redo)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
@@ -672,16 +672,17 @@ impl Element for TextLine {
         let field = self.field.read(cx);
         let style = window.text_style();
         let placeholder = if field.partial { "Search mapped files" } else { "Search indexed files" };
-        let (text, color): (SharedString, gpui::Hsla) = if field.content.is_empty() {
+        let content = field.edit.text();
+        let (text, color): (SharedString, gpui::Hsla) = if content.is_empty() {
             (placeholder.into(), theme::color(theme::SLATE).into())
         } else {
-            (field.content.clone().into(), theme::color(theme::TEXT).into())
+            (content.to_owned().into(), theme::color(theme::TEXT).into())
         };
         let mut font = style.font();
         font.family = theme::FONT_FAMILY.into();
         let run =
             TextRun { len: text.len(), font, color, background_color: None, underline: None, strikethrough: None };
-        let runs = match field.marked.as_ref().filter(|_| !field.content.is_empty()) {
+        let runs = match field.marked.as_ref().filter(|_| !content.is_empty()) {
             Some(marked) => [
                 TextRun { len: marked.start, ..run.clone() },
                 TextRun {
@@ -699,7 +700,7 @@ impl Element for TextLine {
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line = window.text_system().shape_line(text, font_size, &runs, None);
         let (cursor, selected) =
-            if field.content.is_empty() { (0, 0..0) } else { (field.cursor(), field.selected.clone()) };
+            if content.is_empty() { (0, 0..0) } else { (field.edit.cursor(), field.edit.selected()) };
         // Keep the caret visible in a query longer than the field.
         let cursor_x = line.x_for_index(cursor);
         let width = bounds.size.width - px(2.);
@@ -776,7 +777,7 @@ impl BreadcrumbBar {
             host: host.clone(),
             scroll: ScrollHandle::new(),
             rendered_folder: None,
-            _subscriptions: host.observe(REGIONS, cx),
+            _subscriptions: host.observe(REGIONS, cx).into_iter().chain([theme::observe_motion(cx)]).collect(),
         }
     }
 }

@@ -36,6 +36,8 @@ struct Inputs {
     filtering: bool,
     scanning: bool,
     updating_sizes: bool,
+    /// The removal overlay (which folders show "Updating…").
+    removal_epoch: u64,
 }
 
 impl Inputs {
@@ -47,6 +49,7 @@ impl Inputs {
             filtering: state.filtering(),
             scanning: state.is_scanning(),
             updating_sizes: state.updating_removal_sizes(),
+            removal_epoch: state.active_epoch(),
         }
     }
 }
@@ -92,7 +95,7 @@ fn format_row(state: &AppState, display: usize) -> Option<RowText> {
     let row = state.row(display)?;
     let meta = *row.meta();
     let filtering = state.filtering();
-    let updating = state.updating_removal_sizes() && meta.flags.is_dir;
+    let updating = meta.flags.is_dir && state.updating_removal_size(&row.path(), true);
     let name = row.name();
     let mark = match row {
         RowView::Hit(item) => state.collection_state(&item.path),

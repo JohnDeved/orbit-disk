@@ -346,8 +346,15 @@ impl ContentsPanel {
         }
         window.focus(&self.focus);
         let state = self.host.state(cx);
-        let Some(display) = self.row_at(event.position, state) else { return };
-        let Some(row) = state.row(display) else { return };
+        let Some(row) = self.row_at(event.position, state).and_then(|display| state.row(display).map(|r| (display, r)))
+        else {
+            // A click on the empty space below the rows clears the selection (native lists).
+            if state.selected().is_some() {
+                self.host.send(Event::Select { path: None }, cx);
+            }
+            return;
+        };
+        let (display, row) = row;
         let path: Arc<[u8]> = row.path().into();
         let (is_dir, size) = (row.meta().flags.is_dir, row.meta().size);
         let label: SharedString = theme::display(row.name()).into();
@@ -426,6 +433,15 @@ impl ContentsPanel {
             }
         });
         cx.notify();
+    }
+
+    /// Closes an open row or sort menu (Escape). Returns whether one was open.
+    pub fn dismiss_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        let open = self.menu.take().is_some();
+        if open {
+            cx.notify();
+        }
+        open
     }
 
     /// Escape during a row drag: the drag ends without a drop.

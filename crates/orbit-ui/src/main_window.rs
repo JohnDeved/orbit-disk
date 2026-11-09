@@ -13,16 +13,22 @@
 //!
 //! Every panel is a cached view: the root re-renders cheaply each frame something below it
 //! changed, and only notified panels run their `render`.
+//!
+//! While a sheet is open the window actions are not registered, so their menu items are
+//! disabled and their shortcuts do nothing (native sheets block their window). Escape stops
+//! mapping (the footer's Stop) when nothing else consumes it: sheets, drags, text inputs and
+//! context menus come first. Finder folders dropped on the explorer area are added to Places.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    AnyView, App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, PathPromptOptions, Render, StyleRefinement, Styled, Subscription, TitlebarOptions, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, div, point, prelude::*, px, size,
+    AnyView, App, AppContext, Bounds, Context, DragMoveEvent, ExternalPaths, FocusHandle, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, ParentElement, PathPromptOptions, Render, StyleRefinement, Styled,
+    Subscription, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowOptions, div,
+    point, prelude::*, px, size,
 };
-use orbit_app_state::{Event, Regions};
+use orbit_app_state::{AppState, Event, FooterAction, Regions};
 
 use crate::actions::*;
 use crate::frame_stats::{self, timed};
@@ -30,6 +36,7 @@ use crate::harness::{FrameHarness, HarnessScript};
 use crate::host::{Host, path_bytes};
 use crate::lifecycle;
 use crate::panels::Panels;
+use crate::panels::sidebar::{FolderDropHover, add_dropped_folders, track_folder_drag};
 use crate::theme;
 
 pub struct MainWindow {
@@ -44,9 +51,11 @@ impl MainWindow {
     pub fn new(host: Host, harness: Option<HarnessScript>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus);
-        // Action availability follows the header (navigation) and inspector (selection) state.
-        let subscriptions = host.observe(Regions::HEADER | Regions::INSPECTOR, cx);
+        // Action availability follows the header (navigation) and inspector (selection) state,
+        // and whether a sheet is open.
+        let mut subscriptions = host.observe(Regions::HEADER | Regions::INSPECTOR, cx);
         let panels = Panels::new(&host, cx);
+        subscriptions.push(cx.observe(&panels.sheets, |_, _, cx| cx.notify()));
         let harness =
             harness.map(|script| Rc::new(RefCell::new(FrameHarness::new(host.clone(), panels.clone(), script))));
         Self { host, focus, panels, harness, _subscriptions: subscriptions }
@@ -81,6 +90,37 @@ impl MainWindow {
     fn send(&self, event: Event, cx: &mut App) {
         self.host.send(event, cx);
     }
+
+    /// Escape that reached the window root: nothing focused below consumed it (sheets, the
+    /// search field and drags stop it on the way). Closes an open context menu first, then
+    /// stops mapping like the footer's Stop button (Swift `.keyboardShortcut(.cancelAction)`).
+    fn escape(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key != "escape" || event.keystroke.modifiers.modified() {
+            return;
+        }
+        if self.panels.sheets.read(cx).is_open(cx) || cx.has_active_drag() {
+            return;
+        }
+        let closed_menu = self.panels.sidebar.update(cx, |sidebar, cx| sidebar.dismiss_menu(cx))
+            | self.panels.contents.update(cx, |contents, cx| contents.dismiss_menu(cx));
+        if closed_menu {
+            cx.stop_propagation();
+            return;
+        }
+        let state = self.host.state(cx);
+        if escape_stops_mapping(state) && state.drag_id().is_none() {
+            cx.stop_propagation();
+            self.send(Event::Pause, cx);
+        }
+    }
+}
+
+/// The footer offers Stop (mapping is still finding files).
+pub fn escape_stops_mapping(state: &AppState) -> bool {
+    match state.footer() {
+        Some(footer) => footer.action == FooterAction::Stop,
+        None => state.is_scanning(),
+    }
 }
 
 /// A panel slot: the cached view sized by `style`, wrapped in frame timing.
@@ -90,6 +130,12 @@ fn slot(region: Regions, view: impl Into<AnyView>, style: StyleRefinement) -> im
 
 fn style() -> StyleRefinement {
     StyleRefinement::default()
+}
+
+impl gpui::Focusable for MainWindow {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
 }
 
 impl Render for MainWindow {
@@ -108,6 +154,8 @@ impl Render for MainWindow {
         let has_selection = selected.is_some();
         let selected_dir = selected.is_some_and(|item| item.is_dir());
         let can_collect = state.can_collect_selection();
+        // A sheet blocks the window: its actions (and their menu items) are unavailable.
+        let window_actions = !self.panels.sheets.read(cx).is_open(cx);
         let panels = &self.panels;
 
         let titlebar_drag = |el: gpui::Div| {
@@ -130,31 +178,36 @@ impl Render for MainWindow {
             .font_family(theme::FONT_FAMILY)
             .key_context(WINDOW_CONTEXT)
             .track_focus(&self.focus)
-            .on_action(cx.listener(Self::open_folder))
-            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
-                this.panels.toolbar.update(cx, |toolbar, cx| toolbar.focus_search(window, cx));
-            }))
+            .on_key_down(cx.listener(Self::escape))
             .on_action(|_: &Minimize, window, _| window.minimize_window())
             .on_action(|_: &Zoom, window, _| window.zoom_window())
-            .on_action(cx.listener(|this, _: &CloseWindow, window, cx| {
-                if lifecycle::may_quit(&this.host, cx) {
-                    window.remove_window();
-                }
-            }))
-            .when(can_refresh, |el| {
+            .when(window_actions, |el| {
+                el.on_action(cx.listener(Self::open_folder))
+                    .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                        this.panels.toolbar.update(cx, |toolbar, cx| toolbar.focus_search(window, cx));
+                    }))
+                    .on_action(cx.listener(|this, _: &CloseWindow, window, cx| {
+                        if lifecycle::may_quit(&this.host, cx) {
+                            window.remove_window();
+                        }
+                    }))
+            })
+            .when(window_actions && can_refresh, |el| {
                 el.on_action(cx.listener(|this, _: &RefreshFullMap, _, cx| this.send(Event::Refresh, cx)))
             })
-            .when(can_go_up, |el| el.on_action(cx.listener(|this, _: &GoUp, _, cx| this.send(Event::GoUp, cx))))
-            .when(selected_dir, |el| {
+            .when(window_actions && can_go_up, |el| {
+                el.on_action(cx.listener(|this, _: &GoUp, _, cx| this.send(Event::GoUp, cx)))
+            })
+            .when(window_actions && selected_dir, |el| {
                 el.on_action(cx.listener(|this, _: &OpenSelectedFolder, _, cx| this.send(Event::OpenSelection, cx)))
             })
-            .when(has_selection, |el| {
+            .when(window_actions && has_selection, |el| {
                 el.on_action(cx.listener(|this, _: &RevealInFinder, _, cx| this.send(Event::RevealSelection, cx)))
             })
-            .when(has_selection && !selected_dir, |el| {
+            .when(window_actions && has_selection && !selected_dir, |el| {
                 el.on_action(cx.listener(|this, _: &QuickLook, _, cx| this.send(Event::PreviewSelection, cx)))
             })
-            .when(can_collect, |el| {
+            .when(window_actions && can_collect, |el| {
                 el.on_action(cx.listener(|this, _: &AddToCollection, _, cx| {
                     if let Some(item) = this.host.state(cx).selected() {
                         let paths = vec![item.path.clone()];
@@ -193,11 +246,20 @@ impl Render for MainWindow {
                         style().h(theme::BREADCRUMB_HEIGHT).w_full().flex_none(),
                     ))
                     .child(
+                        // The explorer area: Finder folders dropped here are added to Places.
                         div()
+                            .id("explorer")
                             .flex_1()
                             .min_h_0()
                             .flex()
                             .flex_row()
+                            .on_drag_move(|event: &DragMoveEvent<ExternalPaths>, _, cx| {
+                                track_folder_drag(event, |hover, inside| hover.content = inside, cx)
+                            })
+                            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                                FolderDropHover::update(|hover| *hover = FolderDropHover::default(), cx);
+                                add_dropped_folders(&this.host, paths.paths(), cx);
+                            }))
                             .child(slot(Regions::MAP, panels.map.clone(), style().flex_1().min_w_0().h_full()))
                             .child(
                                 div()

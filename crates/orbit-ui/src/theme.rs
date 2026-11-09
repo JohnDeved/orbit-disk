@@ -185,8 +185,9 @@ pub fn display(bytes: &[u8]) -> String {
 // --- chrome panels ---
 // Motion, footer timings and relative ages used by the toolbar, sidebar, footer and tray.
 
-/// The OS "Reduce Motion" preference (`Shell::reduce_motion`), installed once at launch with
-/// [`set_reduce_motion`]. Absent (tests, harness) means full motion.
+/// The OS "Reduce Motion" preference (`Shell::reduce_motion`), installed at launch with
+/// [`set_reduce_motion`] and re-read whenever the main window becomes active (the user may have
+/// changed it in System Settings meanwhile). Absent (tests, harness) means full motion.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Motion {
     pub reduce: bool,
@@ -194,8 +195,16 @@ pub struct Motion {
 
 impl gpui::Global for Motion {}
 
+/// Sets the preference; panels that animate ([`observe_motion`]) re-render only when it changed.
 pub fn set_reduce_motion(reduce: bool, cx: &mut gpui::App) {
-    cx.set_global(Motion { reduce });
+    if cx.try_global::<Motion>().is_none_or(|motion| motion.reduce != reduce) {
+        cx.set_global(Motion { reduce });
+    }
+}
+
+/// Re-renders the view `V` when the Reduce Motion preference changes.
+pub fn observe_motion<V: 'static>(cx: &mut gpui::Context<V>) -> gpui::Subscription {
+    cx.observe_global::<Motion>(|_, cx| cx.notify())
 }
 
 /// Reduce Motion: no fill transitions, static activity symbols.

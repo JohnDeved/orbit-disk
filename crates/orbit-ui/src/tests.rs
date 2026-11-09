@@ -217,6 +217,65 @@ fn quit_and_close_are_refused_while_removal_runs(cx: &mut TestAppContext) {
     assert!(cx.update(|cx| lifecycle::may_quit(&idle, cx)));
 }
 
+/// Escape stops mapping (the footer's Stop) only when nothing else takes it, in order: an open
+/// sheet closes, a focused search field clears (and keeps Escape even when empty), and only
+/// then does mapping stop. While a sheet is open the window's actions (and menu items) are off.
+#[gpui::test]
+fn escape_stops_mapping_only_after_sheets_and_text_input(cx: &mut TestAppContext) {
+    use gpui::Focusable;
+
+    use crate::actions::OpenFolder;
+
+    let mut h = Harness::new(Config::new(b"/home".to_vec()));
+    h.backend.add_file(b"/r/docs/x.txt", 30);
+    h.backend.add_file(b"/r/file1", 10);
+    h.open(b"/r");
+    h.preview(b"/r");
+    h.run();
+    let backend = h.backend.clone();
+    let host = host_with(h.state, h.backend, cx);
+    let (root, cx) = cx.add_window_view({
+        let host = host.clone();
+        move |window, cx| MainWindow::new(host, None, window, cx)
+    });
+    cx.run_until_parked();
+    let stops = || backend.log().iter().filter(|line| *line == "stop").count();
+    let escape = |cx: &mut gpui::VisualTestContext| {
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+    };
+    let window_actions = |cx: &mut gpui::VisualTestContext| cx.update(|w, cx| w.is_action_available(&OpenFolder, cx));
+    assert!(cx.read(|cx| crate::main_window::escape_stops_mapping(host.state(cx))));
+    assert!(window_actions(cx));
+
+    // An open sheet takes Escape; meanwhile the window's actions are unavailable.
+    let sheets = cx.read(|cx| root.read(cx).panels().sheets.clone());
+    cx.update(|_, cx| sheets.update(cx, |layer, cx| layer.open_skipped_items(cx)));
+    cx.run_until_parked();
+    assert!(!window_actions(cx), "menu items are disabled while a sheet is open");
+    escape(cx);
+    assert!(!cx.read(|cx| sheets.read(cx).is_open(cx)));
+    assert!(window_actions(cx));
+    assert_eq!(stops(), 0);
+
+    // The focused search field clears its query, then still keeps Escape.
+    let toolbar = cx.read(|cx| root.read(cx).panels().toolbar.clone());
+    cx.update(|window, cx| toolbar.update(cx, |toolbar, cx| toolbar.focus_search(window, cx)));
+    cx.simulate_input("ab");
+    cx.run_until_parked();
+    assert_eq!(cx.read(|cx| host.state(cx).query().to_owned()), "ab");
+    escape(cx);
+    assert_eq!(cx.read(|cx| host.state(cx).query().to_owned()), "");
+    escape(cx);
+    assert_eq!(stops(), 0, "a focused text input never stops mapping");
+
+    // Nothing else consumes it: mapping stops.
+    cx.update(|window, cx| window.focus(&root.read(cx).focus_handle(cx)));
+    escape(cx);
+    assert_eq!(stops(), 1);
+    assert!(!cx.read(|cx| crate::main_window::escape_stops_mapping(host.state(cx))), "the footer offers Resume");
+}
+
 /// The frame harness without a display (`cargo nextest run -p orbit-ui --run-ignored only
 /// headless`): the fixture app in a test window, the built-in script, and the CPU time of each
 /// frame's effects + render + layout + prepaint + paint (no GPU, no vsync). Use it when the live

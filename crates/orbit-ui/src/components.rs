@@ -6,6 +6,8 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 
+use unicode_segmentation::UnicodeSegmentation;
+
 use crate::icons::{Icon, icon};
 use crate::theme;
 
@@ -249,6 +251,9 @@ pub fn activity_indicator(
 
 /// `text` shortened in the middle with "…" to fit `max_width` at `font_size`/`weight` in the
 /// system font (native `.truncationMode(.middle)`: paths keep both their start and their name).
+/// Binary search over the number of kept grapheme clusters (never splitting one), half from
+/// the start and half from the end, measured with the window's text system. Callers cache the
+/// result per text and width.
 pub fn truncate_middle(
     text: &str,
     max_width: gpui::Pixels,
@@ -256,34 +261,21 @@ pub fn truncate_middle(
     weight: gpui::FontWeight,
     window: &Window,
 ) -> SharedString {
-    let mut font = window.text_style().font();
-    font.family = theme::FONT_FAMILY.into();
-    font.weight = weight;
-    let width = |candidate: &str| {
-        let run = gpui::TextRun {
-            len: candidate.len(),
-            font: font.clone(),
-            color: gpui::black(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        window.text_system().shape_line(SharedString::from(candidate.to_owned()), font_size, &[run], None).width
-    };
+    let width = |candidate: &str| text_width(candidate, font_size, weight, window);
     if text.is_empty() || width(text) <= max_width {
         return SharedString::from(text.to_owned());
     }
-    let chars: Vec<char> = text.chars().collect();
+    let clusters: Vec<&str> = text.graphemes(true).collect();
     let candidate = |keep: usize| {
         let head = keep.div_ceil(2);
         let tail = keep - head;
-        let mut out: String = chars[..head].iter().collect();
+        let mut out: String = clusters[..head].concat();
         out.push('…');
-        out.extend(&chars[chars.len() - tail..]);
+        out.push_str(&clusters[clusters.len() - tail..].concat());
         out
     };
-    // The largest number of kept characters that still fits.
-    let (mut low, mut high) = (0, chars.len() - 1);
+    // The largest number of kept clusters that still fits.
+    let (mut low, mut high) = (0, clusters.len() - 1);
     while low < high {
         let mid = (low + high).div_ceil(2);
         if width(&candidate(mid)) <= max_width {
@@ -293,4 +285,61 @@ pub fn truncate_middle(
         }
     }
     candidate(low).into()
+}
+
+/// Width of `text` on one line in the system font at `font_size`/`weight`.
+pub fn text_width(text: &str, font_size: gpui::Pixels, weight: gpui::FontWeight, window: &Window) -> gpui::Pixels {
+    let mut font = window.text_style().font();
+    font.family = theme::FONT_FAMILY.into();
+    font.weight = weight;
+    let run = gpui::TextRun {
+        len: text.len(),
+        font,
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window.text_system().shape_line(SharedString::from(text.to_owned()), font_size, &[run], None).width
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Empty, TestAppContext, px};
+    use unicode_segmentation::UnicodeSegmentation;
+
+    use super::{text_width, truncate_middle};
+    use crate::theme;
+
+    /// Middle truncation fits the width, keeps a prefix and a suffix of the name around one
+    /// ellipsis, never splits a grapheme cluster, and leaves names that fit alone.
+    #[gpui::test]
+    fn middle_truncation_fits_the_width_and_keeps_both_ends_whole(cx: &mut TestAppContext) {
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let name = format!("Quarterly report {family} final FINAL draft e\u{301}te\u{301} (3).pdf");
+        let (_, cx) = cx.add_window_view(|_, _| Empty);
+        cx.update(|window, _| {
+            let (size, weight) = (theme::TEXT_ROW, theme::WEIGHT_MEDIUM);
+            let full = text_width(&name, size, weight, window);
+            assert_eq!(truncate_middle(&name, full, size, weight, window).as_ref(), name);
+            for max in [px(30.), px(60.), full * 0.4, full * 0.75, full - px(1.)] {
+                let out = truncate_middle(&name, max, size, weight, window);
+                assert!(text_width(&out, size, weight, window) <= max, "{out:?} wider than {max:?}");
+                let (head, tail) = out.split_once('…').expect("one ellipsis");
+                assert!(name.starts_with(head) && name.ends_with(tail), "{out:?}");
+                let clusters: Vec<&str> = name.graphemes(true).collect();
+                let whole = |part: &str, from_start: bool| {
+                    let mut taken = String::new();
+                    let mut iter: Box<dyn Iterator<Item = &&str>> =
+                        if from_start { Box::new(clusters.iter()) } else { Box::new(clusters.iter().rev()) };
+                    while taken.len() < part.len() {
+                        let cluster = iter.next().expect("within the name");
+                        taken = if from_start { taken + cluster } else { format!("{cluster}{taken}") };
+                    }
+                    taken == part
+                };
+                assert!(whole(head, true) && whole(tail, false), "{out:?} splits a cluster");
+            }
+        });
+    }
 }

@@ -30,7 +30,8 @@ pub struct TrayPanel {
 
 impl TrayPanel {
     pub fn new(host: &Host, cx: &mut Context<Self>) -> Self {
-        Self { host: host.clone(), reported: None, _subscriptions: host.observe(REGIONS, cx) }
+        let subscriptions = host.observe(REGIONS, cx).into_iter().chain([theme::observe_motion(cx)]).collect();
+        Self { host: host.clone(), reported: None, _subscriptions: subscriptions }
     }
 
     fn drag_moved(&mut self, event: &DragMoveEvent<CollectionDrag>, _: &mut Window, cx: &mut Context<Self>) {
@@ -63,12 +64,15 @@ impl Render for TrayPanel {
         let is_dragging = dragging.is_some();
         let ready = state.drop_target_active();
         let validating = state.is_validating_collection();
+        let updating = state.is_updating_collection();
         let title = if ready {
             "Release to collect".to_owned()
         } else if is_dragging {
             "Drop here to collect".to_owned()
         } else if validating {
             "Checking collection…".to_owned()
+        } else if updating {
+            "Removing from collection…".to_owned()
         } else if count == 0 {
             "Drag files and folders here".to_owned()
         } else {
@@ -82,8 +86,8 @@ impl Render for TrayPanel {
                 format!("{}{}", theme::format_bytes(collection.size()), if state.is_partial() { " so far" } else { "" })
             }
         };
-        let can_review = count > 0 && !state.is_removing() && !is_dragging;
-        let glyph = if !is_dragging && validating {
+        let can_review = count > 0 && !state.is_removing() && !updating && !is_dragging;
+        let glyph = if !is_dragging && (validating || updating) {
             activity_indicator("tray-activity", px(18.), reduce_motion, Icon::Loader)
         } else {
             icon(Icon::TrayDown).size(px(28.)).text_color(theme::color(theme::CORAL)).into_any_element()
