@@ -7,7 +7,9 @@ use std::time::Duration;
 use orbit_sunburst::SegmentIndex;
 
 use crate::backend::{Reply, Request};
+use crate::collection::CollectionSnapshot;
 use crate::folder::PreparedFolder;
+use crate::hash::FxHashSet;
 use crate::ids::{DragId, GestureId, LeaseId, RequestId, SessionId};
 use crate::model::{Item, ProgressSnapshot, ScanRemoval, SnapshotInfo, SortOrder};
 use crate::review::ReviewToken;
@@ -208,12 +210,19 @@ pub struct Timer {
 pub enum ComputeJob {
     /// Name sort of ≥ 2,000 rows; returns the display order (indices into the rows).
     NameSort { rows: SortRows, compare: fn(&[u8], &[u8]) -> Ordering },
+    /// A large collection without `remove`, under a new `revision`.
+    CollectionWithout { collection: CollectionSnapshot, remove: Arc<FxHashSet<Arc<[u8]>>>, revision: u64 },
 }
 
 impl std::fmt::Debug for ComputeJob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NameSort { rows, .. } => f.debug_struct("NameSort").field("rows", &rows.len()).finish(),
+            Self::CollectionWithout { collection, remove, .. } => f
+                .debug_struct("CollectionWithout")
+                .field("items", &collection.len())
+                .field("remove", &remove.len())
+                .finish(),
         }
     }
 }
@@ -248,6 +257,10 @@ impl ComputeJob {
     pub fn run(self) -> Computed {
         match self {
             Self::NameSort { rows, compare } => Computed::NameOrder(name_order(&rows, compare)),
+            Self::CollectionWithout { collection, remove, revision } => {
+                let remove: FxHashSet<&[u8]> = remove.iter().map(|path| &**path).collect();
+                Computed::Collection(collection.without(&remove, revision))
+            }
         }
     }
 }
@@ -322,6 +335,7 @@ impl NameOrder {
 #[derive(Clone, Debug)]
 pub enum Computed {
     NameOrder(NameOrder),
+    Collection(CollectionSnapshot),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

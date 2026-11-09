@@ -273,3 +273,44 @@ fn nested_items_mark_ancestors_and_totals_saturate() {
     assert_eq!(total.size(), u64::MAX);
     assert_eq!(total.without(&std::iter::once(&b"/a"[..]).collect(), 2).size(), u64::MAX - 1);
 }
+
+/// Removing items from a large collection rebuilds it off the UI thread: the tray reports it,
+/// review waits, further removals join the pending edit, and a collection change that lands
+/// meanwhile makes the edit re-apply to the new revision instead of losing either change.
+#[test]
+fn large_collection_edits_run_in_the_background_and_survive_concurrent_changes() {
+    let mut h = harness();
+    let count = crate::BACKGROUND_EDIT_ITEMS + 2;
+    let paths: Vec<String> = (0..count).map(|i| format!("/r/many/f{i:05}")).collect();
+    for path in &paths {
+        h.backend.add_file(path.as_bytes(), 1);
+    }
+    h.open_mapped(b"/r");
+    collect(&mut h, &paths.iter().map(String::as_str).collect::<Vec<_>>());
+    h.run();
+    assert_eq!(h.collection().len(), count);
+
+    h.send(Event::Uncollect { path: p(&paths[0]), review: None });
+    assert!(h.state.is_updating_collection() && h.state.is_removing_from_collection(paths[0].as_bytes()));
+    assert_eq!(h.collection().len(), count, "nothing changes until the rebuilt collection arrives");
+    h.send(Event::BeginReview);
+    assert!(!h.state.show_review(), "review waits for the edit");
+    h.send(Event::Uncollect { path: p(&paths[1]), review: None });
+    assert!(h.state.is_removing_from_collection(paths[1].as_bytes()), "a second removal joins the edit");
+
+    // An addition commits while the edit is computed: the edit's result is stale.
+    let held = std::mem::take(&mut h.computes);
+    collect(&mut h, &["/r/file1"]);
+    h.run();
+    assert_eq!(h.collection().len(), count + 1);
+    for (id, job) in held {
+        h.send(Event::Computed { id, result: job.run() });
+    }
+    assert!(h.state.is_updating_collection(), "the stale result is re-applied, not installed");
+    h.run();
+    assert!(!h.state.is_updating_collection());
+    let collection = h.collection();
+    assert_eq!(collection.len(), count - 1);
+    assert!(collection.contains(&"/r/file1".to_owned()));
+    assert!(!collection.contains(&paths[0]) && !collection.contains(&paths[1]));
+}

@@ -56,6 +56,8 @@ const WRITER_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const WRITER_IDLE_WAIT: Duration = Duration::from_millis(100);
 /// Wait between settlement attempts once the stage has no work (Swift: 50 ms).
 const SETTLE_WAIT: Duration = Duration::from_millis(50);
+/// The folder being listed is recorded at most this often (progress footer and opening view).
+pub const CURRENT_PATH_INTERVAL: Duration = Duration::from_millis(50);
 
 // --- Notifications --------------------------------------------------------------------------
 
@@ -198,14 +200,62 @@ impl Gate {
     }
 }
 
+/// The folder a discovery worker started listing most recently, sampled at most once per
+/// interval (latest value, no history). Workers race for the sample with one compare-exchange,
+/// so at most one of them copies a path per interval and none ever waits for another.
+pub(crate) struct CurrentPath {
+    clock: Instant,
+    interval_ms: u64,
+    /// Milliseconds since `clock` before which no new sample is taken.
+    next_ms: AtomicU64,
+    path: Mutex<Vec<u8>>,
+}
+
+impl CurrentPath {
+    pub(crate) fn new(interval: Duration) -> Self {
+        Self {
+            clock: Instant::now(),
+            interval_ms: interval.as_millis().min(u128::from(u64::MAX)) as u64,
+            next_ms: AtomicU64::new(0),
+            path: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn offer(&self, path: &[u8]) {
+        self.offer_at(path, self.clock.elapsed().as_millis() as u64);
+    }
+
+    /// Records `path` if the interval since the last sample has passed at `now_ms`.
+    fn offer_at(&self, path: &[u8], now_ms: u64) {
+        let due = self.next_ms.load(Ordering::Relaxed);
+        if now_ms < due {
+            return;
+        }
+        let next = now_ms.saturating_add(self.interval_ms);
+        if self.next_ms.compare_exchange(due, next, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let mut slot = self.path.lock();
+        slot.clear();
+        slot.extend_from_slice(path);
+    }
+
+    pub(crate) fn get(&self) -> Option<Vec<u8>> {
+        let path = self.path.lock();
+        (!path.is_empty()).then(|| path.clone())
+    }
+}
+
 struct GateHooks {
     gate: Arc<Gate>,
     cancel: Cancellation,
+    current: Arc<CurrentPath>,
     inner: Option<Arc<dyn DiscoveryHooks>>,
 }
 
 impl DiscoveryHooks for GateHooks {
     fn before_directory(&self, path: &[u8], ticket: u64) {
+        self.current.offer(path);
         self.gate.pass_unless(Some(&self.cancel));
         if let Some(inner) = &self.inner {
             inner.before_directory(path, ticket);
@@ -286,6 +336,8 @@ pub struct SessionOptions {
     pub before_publish: Option<Arc<dyn Fn() + Send + Sync>>,
     /// How long to retry a stage another session holds before failing with `InUse`.
     pub busy_retry: Duration,
+    /// Sampling interval of [`MappingSession::current_path`].
+    pub current_path_interval: Duration,
 }
 
 impl Default for SessionOptions {
@@ -303,6 +355,7 @@ impl Default for SessionOptions {
             hooks: None,
             before_publish: None,
             busy_retry: STAGE_BUSY_RETRY,
+            current_path_interval: CURRENT_PATH_INTERVAL,
         }
     }
 }
@@ -373,6 +426,7 @@ struct Shared<P: Platform> {
     finished: Condvar,
     clock: Instant,
     reused: Vec<ReuseCandidate>,
+    current: Arc<CurrentPath>,
 }
 
 impl<P: Platform> Shared<P> {
@@ -703,6 +757,7 @@ impl<P: Platform> MappingSession<P> {
             finished: Condvar::new(),
             clock: Instant::now(),
             reused,
+            current: Arc::new(CurrentPath::new(options.current_path_interval)),
         });
         if blocked {
             // Swift: discovery is not started while the replay withholds the stage.
@@ -720,6 +775,7 @@ impl<P: Platform> MappingSession<P> {
                 hooks: Some(Arc::new(GateHooks {
                     gate: gate.clone(),
                     cancel: discovery_cancel.clone(),
+                    current: shared.current.clone(),
                     inner: options.hooks.clone(),
                 })),
                 ..DiscoveryOptions::default()
@@ -840,6 +896,12 @@ impl<P: Platform> MappingSession<P> {
             SessionOutcome::Published(snapshot) => Some(snapshot.clone()),
             _ => None,
         }
+    }
+
+    /// The folder discovery started listing most recently (sampled every
+    /// [`SessionOptions::current_path_interval`]); `None` before the first listing.
+    pub fn current_path(&self) -> Option<Vec<u8>> {
+        self.shared.current.get()
     }
 
     /// Discovery counters (files, records, frontier, save work) as of now.

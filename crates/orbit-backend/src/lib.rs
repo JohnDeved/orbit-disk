@@ -74,6 +74,8 @@ pub struct BackendOptions {
     pub busy_retry: Duration,
     /// Discovery hooks for tests and diagnostics.
     pub hooks: Option<Arc<dyn DiscoveryHooks>>,
+    /// How often the folder being listed is sampled for `ProgressSnapshot::current_path`.
+    pub current_path_interval: Duration,
 }
 
 impl std::fmt::Debug for BackendOptions {
@@ -98,6 +100,7 @@ impl BackendOptions {
             monitor_changes: true,
             busy_retry: orbit_core::session::STAGE_BUSY_RETRY,
             hooks: None,
+            current_path_interval: orbit_core::session::CURRENT_PATH_INTERVAL,
         }
     }
 }
@@ -222,6 +225,7 @@ impl<P: Platform> Inner<P> {
             root_identity: node.meta.identity,
             indexed_at: SystemTime::UNIX_EPOCH + Duration::from_secs_f64(snapshot.scanned_at.max(0.0)),
             skipped_count: snapshot.skipped,
+            issues: snapshot.issues.iter().cloned().collect(),
             needs_boot_upgrade: convert::needs_boot_upgrade(snapshot),
         };
         Ok((info, node.meta.file_count))

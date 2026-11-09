@@ -48,6 +48,8 @@ pub struct SnapshotInfo {
     pub root_identity: Option<FileIdentity>,
     pub indexed_at: SystemTime,
     pub skipped_count: u64,
+    /// Why items were skipped (`"path: reason"`), at most the first 100 the engine kept.
+    pub issues: Arc<[String]>,
     /// The saved map was made by an older boot-volume traversal and must be re-mapped with a
     /// preview instead of being kept on screen during the refresh.
     pub needs_boot_upgrade: bool,

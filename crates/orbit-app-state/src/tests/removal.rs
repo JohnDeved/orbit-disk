@@ -33,6 +33,11 @@ fn removal_locks_the_collection_and_merges_into_its_owner_after_a_switch() {
     review_and_confirm(&mut h, true);
     assert!(h.state.removal_active() && h.state.is_removing());
     assert_eq!(status(&h).as_deref(), Some("Deleting collected items permanently…"));
+    // Only folders that contain removed items show "Updating…"; files never do.
+    let updating = |h: &Harness, path: &str, is_dir| h.state.updating_removal_size(path.as_bytes(), is_dir);
+    assert!(updating(&h, "/r/docs", true) && updating(&h, "/r", true));
+    assert!(!updating(&h, "/r/big", true) && !updating(&h, "/r/docs/deep", true));
+    assert!(!updating(&h, "/r/file1", false));
     let removal = h.take(is_remove).unwrap();
     // Collection editing is locked while removal runs; additions queue without validating.
     h.send(Event::Uncollect { path: p("/r/docs/x.txt"), review: None });

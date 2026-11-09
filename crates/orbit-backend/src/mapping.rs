@@ -88,6 +88,7 @@ pub(crate) fn run<P: Platform>(
         prepare_search: false,
         hooks: inner.options.hooks.clone(),
         busy_retry: inner.options.busy_retry,
+        current_path_interval: inner.options.current_path_interval,
         ..SessionOptions::default()
     };
     let session = match MappingSession::start(Arc::clone(&inner.platform), inner.maps.paths().clone(), &root, options) {
@@ -174,7 +175,11 @@ fn forward<P: Platform>(
             preview_revision = Some(revision);
             out.emit(MappingEvent::PreviewChanged { revision, search_ready: true });
         }
-        let snapshot = convert::progress(&session.progress(), &session.discovery_progress(), session.root());
+        let snapshot = convert::progress(
+            &session.progress(),
+            &session.discovery_progress(),
+            session.current_path().as_deref().unwrap_or(session.root()),
+        );
         if last_progress.as_ref() != Some(&snapshot) {
             out.emit(MappingEvent::Progress(snapshot.clone()));
             last_progress = Some(snapshot);

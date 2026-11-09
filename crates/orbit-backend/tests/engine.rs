@@ -521,3 +521,37 @@ fn monitored_changes_refresh_the_saved_map() {
     assert_eq!(app.state.error(), None);
     assert!(!app.state.updates_paused(), "automatic updates are available");
 }
+
+/// While mapping, progress names the folder being read (the opening view and footer show it);
+/// a folder that cannot be read reaches the published snapshot as a skipped path.
+#[test]
+fn progress_names_the_folder_being_read_and_skipped_paths_reach_the_snapshot() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    let root = fx.tree("root");
+    let locked = root.join("docs/locked");
+    write(&locked.join("secret.txt"), 10);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let unreadable = std::fs::read_dir(&locked).is_err(); // false when running as root
+    let gate = Arc::new(Gate::default());
+    gate.block(&root.join("slow"));
+    let mut options = fx.options(Some(Arc::clone(&gate)));
+    options.workers = 1;
+    options.current_path_interval = Duration::ZERO;
+    let mut app = App::with_options(&fx, options);
+
+    app.open(&root);
+    let slow = bytes(&root.join("slow"));
+    app.until("the held folder as the folder being read", |a| a.state.scan_path() == slow.as_slice());
+    assert!(app.state.progress_count() > 0);
+    gate.release();
+    app.until("the saved map", |a| a.published(&root));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let snapshot = app.state.snapshot().expect("a published map").clone();
+    if unreadable {
+        let locked = locked.to_string_lossy().into_owned();
+        assert!(snapshot.skipped_count >= 1);
+        assert!(snapshot.issues.iter().any(|issue| issue.starts_with(&locked)), "{:?}", snapshot.issues);
+    }
+}

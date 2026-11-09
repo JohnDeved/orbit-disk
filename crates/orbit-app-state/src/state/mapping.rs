@@ -294,6 +294,7 @@ impl AppState {
         self.requested_path = Some(route.clone());
         if let Some(progress) = progress {
             self.item_count = progress.item_count;
+            self.progress_bytes = progress.bytes_scanned;
             self.scan_path = progress.current_path;
         }
         if finished {
@@ -374,6 +375,7 @@ impl AppState {
         self.title = if force { TITLE_MAPPING } else { TITLE_OPENING };
         self.scan_path = root.clone();
         self.item_count = 0;
+        self.progress_bytes = 0;
         self.set_error(None);
         self.set_status(keep_map.then(|| "Refreshing the full map…".to_owned()));
         if !keep_map && self.search.query == query {
@@ -404,6 +406,7 @@ impl AppState {
                 if !force {
                     if let Some(progress) = prior.progress.as_ref() {
                         self.item_count = progress.item_count;
+                        self.progress_bytes = progress.bytes_scanned;
                         self.scan_path = progress.current_path.clone();
                     }
                     session.progress = prior.progress.map(|p| crate::model::ProgressSnapshot {
@@ -1149,13 +1152,16 @@ impl AppState {
                 let visible = active && !session.stopped && !session.finished;
                 if visible {
                     self.item_count = progress.item_count;
+                    self.progress_bytes = progress.bytes_scanned;
                     self.scan_path = progress.current_path.clone();
                 }
                 if let Some(session) = self.session_mut(id) {
                     session.progress = Some(progress);
                 }
-                // Footer only: the map and list are not notified for progress.
-                self.notify(Regions::FOOTER);
+                // The footer, plus the map's opening view until the first folder is shown. The
+                // list is never notified for progress.
+                let opening_view = visible && self.folder.is_none();
+                self.notify(if opening_view { Regions::FOOTER | Regions::MAP } else { Regions::FOOTER });
             }
             MappingEvent::PreviewChanged { revision, search_ready } => {
                 session.preview_revision = session.preview_revision.max(revision);

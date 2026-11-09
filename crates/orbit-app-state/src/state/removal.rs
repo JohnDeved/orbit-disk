@@ -55,7 +55,7 @@ impl AppState {
     /// Starts removing the displayed collection. Returns the removal id, or `None` when the
     /// collection is empty, another removal of this session runs, or the map is not the active one.
     pub(crate) fn start_removal(&mut self, permanently: bool) -> Option<RemovalId> {
-        if !self.displayed_matches_active() || self.is_removing() {
+        if !self.displayed_matches_active() || self.is_removing() || self.is_updating_collection() {
             return None;
         }
         let limit = self.cfg.recovery_parent_limit;

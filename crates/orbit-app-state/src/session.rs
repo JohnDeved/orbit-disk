@@ -47,6 +47,8 @@ pub(crate) struct Session {
     pub saved: Option<SnapshotInfo>,
     pub collection: CollectionSnapshot,
     pub job: Option<CollectJob>,
+    /// Items being removed from a large collection in the background.
+    pub edit: Option<crate::state::CollectionEdit>,
     pub collection_status: Option<String>,
     pub collection_error: Option<String>,
     pub presented_collection_error: Option<String>,
@@ -87,6 +89,7 @@ impl Session {
             saved: None,
             collection,
             job: None,
+            edit: None,
             collection_status: None,
             collection_error: None,
             presented_collection_error: None,

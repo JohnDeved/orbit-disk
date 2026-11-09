@@ -171,6 +171,7 @@ impl FakeBackend {
             root_identity: fs.entries.get(root).map(|e| e.identity),
             indexed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + fs.snapshot_ids),
             skipped_count: 0,
+            issues: Arc::from([]),
             needs_boot_upgrade: false,
         };
         fs.saved.insert(root.to_vec(), snapshot.clone());
