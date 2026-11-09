@@ -256,3 +256,31 @@ pub fn format_age(age: std::time::Duration) -> String {
         "less than a minute".to_owned()
     }
 }
+
+// --- sheets ---
+// Window-modal sheets and alerts (Swift `CollectionView`, `issuesView`, `NSAlert`).
+
+/// Destructive text (native `systemRed` in dark mode): "Delete Permanently".
+pub const DESTRUCTIVE: u32 = 0xff6961;
+/// Dim of the window behind the lowest open sheet.
+pub const SHEET_BACKDROP_ALPHA: f32 = 0.45;
+/// Collection review (720 × 470).
+pub const REVIEW_SHEET: (f32, f32) = (720., 470.);
+/// Permanent-delete confirmation (640 × 430).
+pub const PERMANENT_SHEET: (f32, f32) = (640., 430.);
+/// Skipped-items details (650 × 420).
+pub const SKIPPED_SHEET: (f32, f32) = (650., 420.);
+/// Alerts (trash confirmation, errors, app dialogs) are this wide; their height follows the text.
+pub const ALERT_WIDTH: Pixels = px(400.);
+/// Sheet padding (`.padding(26)`; the skipped-items sheet uses 28).
+pub const SHEET_PADDING: Pixels = px(26.);
+/// Sheet titles (`.system(size: 23, weight: .semibold)`).
+pub const TEXT_SHEET_TITLE: Pixels = px(23.);
+/// Reserved height of the review header's size / error region.
+pub const REVIEW_STATUS_HEIGHT: Pixels = px(56.);
+/// Review rows: 40 points of content plus 6 above and below.
+pub const REVIEW_ROW_HEIGHT: Pixels = px(52.);
+/// Width of the review's size column.
+pub const REVIEW_SIZE_WIDTH: Pixels = px(110.);
+/// Height of sheet buttons (`.controlSize(.large)`).
+pub const SHEET_BUTTON_HEIGHT: Pixels = px(30.);

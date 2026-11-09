@@ -1,5 +1,6 @@
-//! The Settings window (Swift `UpdateSettingsView`): automatic update checks, a manual check,
-//! and what restarting means. Uses `Shell::updater`; builds without an updater say so.
+//! The Settings window (Swift `UpdateSettingsView`, 420 points wide): automatic update checks,
+//! the daily schedule, a manual check, and what restarting means (the current collection is not
+//! saved). Uses `Shell::updater`; builds without an updater say so.
 
 use std::rc::Rc;
 
@@ -23,9 +24,12 @@ pub struct SettingsWindow {
 }
 
 impl SettingsWindow {
-    pub fn new(shell: Rc<dyn Shell>, host: Host, cx: &mut Context<Self>) -> Self {
-        let subscription = cx.subscribe(host.entity(), |_, _, _: &HostEvent, cx| cx.notify());
-        Self { shell, host, _subscriptions: vec![subscription] }
+    pub fn new(shell: Rc<dyn Shell>, host: Host, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let removal = cx.subscribe(host.entity(), |_, _, _: &HostEvent, cx| cx.notify());
+        // The updater has no change notifications: re-read its state whenever the window
+        // becomes key (a check may have finished or started meanwhile).
+        let activation = cx.observe_window_activation(window, |_, _, cx| cx.notify());
+        Self { shell, host, _subscriptions: vec![removal, activation] }
     }
 }
 
@@ -43,7 +47,7 @@ impl Render for SettingsWindow {
             .font_family(theme::FONT_FAMILY)
             .text_size(theme::TEXT_ROW)
             .on_action(|_: &CloseWindow, window, _| window.remove_window())
-            .child(div().text_size(theme::TEXT_HEADING).font_weight(theme::WEIGHT_SEMIBOLD).child("Updates"));
+            .child(div().text_size(theme::TEXT_ROW).font_weight(theme::WEIGHT_SEMIBOLD).child("Updates"));
         let Some(updater) = self.shell.updater() else {
             return root.child(
                 div()
@@ -85,11 +89,12 @@ impl Render for SettingsWindow {
         root.child(toggle)
             .child(
                 div()
-                    .text_size(theme::TEXT_SMALL)
+                    .text_size(theme::TEXT_BODY)
                     .text_color(theme::color(theme::SLATE))
                     .child("Checks for updates daily while Orbit Disk is open."),
             )
-            .child(div().h(px(36.)).text_size(theme::TEXT_SMALL).text_color(theme::color(theme::SLATE)).child(
+            // Reserved height: the text changes while a removal postpones the restart.
+            .child(div().h(px(36.)).text_size(theme::TEXT_BODY).text_color(theme::color(theme::SLATE)).child(
                 if state.waiting_for_removal {
                     "The update will restart Orbit Disk after file removal finishes."
                 } else {
@@ -125,7 +130,7 @@ pub fn open(shell: Rc<dyn Shell>, host: Host, cx: &mut App) -> gpui::Result<Wind
             show: true,
             ..Default::default()
         },
-        |_, cx| cx.new(|cx| SettingsWindow::new(shell, host, cx)),
+        |window, cx| cx.new(|cx| SettingsWindow::new(shell, host, window, cx)),
     )
 }
 

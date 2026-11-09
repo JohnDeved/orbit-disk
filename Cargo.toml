@@ -18,6 +18,7 @@ orbit-shell-macos = { path = "crates/orbit-shell-macos" }
 orbit-native = { path = "crates/orbit-native" }
 orbit-core = { path = "crates/orbit-core" }
 orbit-app-state = { path = "crates/orbit-app-state" }
+orbit-backend = { path = "crates/orbit-backend" }
 orbit-sunburst = { path = "crates/orbit-sunburst" }
 orbit-ui = { path = "crates/orbit-ui" }
 orbit-automation = { path = "crates/orbit-automation" }

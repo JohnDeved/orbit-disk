@@ -19,6 +19,7 @@ runtime-shaders = ["orbit-ui/runtime-shaders"]
 gpui.workspace = true
 orbit-ui = { workspace = true, default-features = false }
 orbit-app-state.workspace = true
+orbit-backend.workspace = true
 orbit-core.workspace = true
 orbit-platform.workspace = true
 orbit-native.workspace = true

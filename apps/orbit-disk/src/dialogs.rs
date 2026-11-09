@@ -1,6 +1,7 @@
 //! App-menu dialogs: AI Integration… and Clear Cache… (Swift `AutomationIntegration`,
 //! `OrbitDiskApp.clearCache`, `MappingCacheReset`).
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -10,23 +11,18 @@ use orbit_platform::{AppDirs, Shell};
 use orbit_ui::Host;
 use orbit_ui::lifecycle;
 use orbit_ui::settings::SettingsStore;
+use orbit_ui::sheets::{self, Alert, AlertRole};
 
-/// Shows a platform alert on `window`; returns the chosen answer's index.
-fn prompt(
-    window: AnyWindowHandle,
-    level: PromptLevel,
-    message: String,
-    detail: Option<String>,
-    answers: &'static [&'static str],
-    cx: &mut App,
-) -> Option<futures::channel::oneshot::Receiver<usize>> {
-    window.update(cx, |_, window, cx| window.prompt(level, &message, detail.as_deref(), answers, cx)).ok()
+/// Shows `alert` inside `window` (a main window: outside clicks and Escape cancel it, it waits
+/// behind earlier alerts), or as a platform prompt on any other window.
+fn show(window: AnyWindowHandle, alert: Alert, level: PromptLevel, cx: &mut App) {
+    if let Err(alert) = sheets::present_alert(window, alert, cx) {
+        alert.prompt(window, level, cx);
+    }
 }
 
 fn inform(window: AnyWindowHandle, message: &str, detail: &str, cx: &mut App) {
-    if let Some(answer) = prompt(window, PromptLevel::Info, message.into(), Some(detail.into()), &["OK"], cx) {
-        cx.background_executor().spawn(async move { answer.await.ok() }).detach();
-    }
+    show(window, Alert::ok(message.to_owned(), detail.to_owned()), PromptLevel::Info, cx);
 }
 
 fn control_tool() -> PathBuf {
@@ -34,54 +30,76 @@ fn control_tool() -> PathBuf {
     executable.parent().unwrap_or(Path::new("/")).join("OrbitControl")
 }
 
+thread_local! {
+    /// Connecting Codex or installing the tool is running (Swift `AutomationIntegration.working`).
+    static SETUP_RUNNING: Cell<bool> = const { Cell::new(false) };
+}
+
 /// "Connect your AI assistant": Codex, MCP settings, or the command line tool.
 pub fn ai_integration(window: AnyWindowHandle, cx: &mut App) {
-    let Some(answer) = prompt(
-        window,
-        PromptLevel::Info,
-        "Connect your AI assistant".into(),
-        Some(
-            "Let Codex use your maps and collection in a new chat. For another assistant, copy the MCP settings. \
-             Your assistant must ask you to approve the exact files before removing them."
-                .into(),
-        ),
-        &["Connect to Codex", "Copy MCP Settings", "Install Command Line Tool", "Cancel"],
-        cx,
-    ) else {
+    if SETUP_RUNNING.with(Cell::get) {
+        inform(window, "Setup is in progress", "Wait for the current setup to finish.", cx);
         return;
-    };
-    cx.spawn(async move |cx| {
-        let Ok(choice) = answer.await else { return };
-        let installer = IntegrationInstaller::for_current_user(control_tool());
-        let (title_ok, result) = match choice {
-            0 => (
-                "Orbit Disk is connected",
-                cx.background_executor().spawn(async move { installer.connect_codex() }).await,
-            ),
-            1 => match installer.mcp_settings() {
-                Ok(settings) => {
-                    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(settings))).ok();
-                    (
-                        "MCP settings copied",
-                        Ok("Add the orbit-disk entry to your AI client’s MCP settings, then reconnect that client."
-                            .into()),
-                    )
-                }
-                Err(error) => ("", Err(error)),
-            },
-            2 => (
-                "Command line tool installed",
-                cx.background_executor().spawn(async move { installer.install_command_line_tool() }).await,
-            ),
-            _ => return,
-        };
-        cx.update(|cx| match result {
-            Ok(detail) => inform(window, title_ok, &detail, cx),
-            Err(error) => inform(window, "Setup couldn’t finish", &error.to_string(), cx),
-        })
-        .ok();
-    })
-    .detach();
+    }
+    let alert = Alert::new(
+        "Connect your AI assistant",
+        "Let Codex use your maps and collection in a new chat. For another assistant, copy the MCP settings. \
+         Your assistant must ask you to approve the exact files before removing them.",
+    )
+    .button("Connect to Codex", AlertRole::Default)
+    .button("Copy MCP Settings", AlertRole::Normal)
+    .button("Install Command Line Tool", AlertRole::Normal)
+    .button("Cancel", AlertRole::Cancel)
+    .on_choice(move |choice, cx| run_integration(window, choice, cx));
+    show(window, alert, PromptLevel::Info, cx);
+}
+
+fn run_integration(window: AnyWindowHandle, choice: usize, cx: &mut App) {
+    let installer = IntegrationInstaller::for_current_user(control_tool());
+    match choice {
+        1 => match installer.mcp_settings() {
+            Ok(settings) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(settings));
+                inform(
+                    window,
+                    "MCP settings copied",
+                    "Add the orbit-disk entry to your AI client’s MCP settings, then reconnect that client.",
+                    cx,
+                );
+            }
+            Err(error) => inform(window, "Couldn’t copy settings", &error.to_string(), cx),
+        },
+        0 | 2 => {
+            if SETUP_RUNNING.with(Cell::get) {
+                return;
+            }
+            SETUP_RUNNING.with(|running| running.set(true));
+            let connect = choice == 0;
+            cx.spawn(async move |cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        if connect { installer.connect_codex() } else { installer.install_command_line_tool() }
+                    })
+                    .await;
+                cx.update(|cx| {
+                    SETUP_RUNNING.with(|running| running.set(false));
+                    match result {
+                        Ok(detail) => inform(
+                            window,
+                            if connect { "Orbit Disk is connected" } else { "Command line tool installed" },
+                            &detail,
+                            cx,
+                        ),
+                        Err(error) => inform(window, "Setup couldn’t finish", &error.to_string(), cx),
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        _ => {}
+    }
 }
 
 /// "Clear cached maps?": flags the reset, relaunches and quits (refused while removing).
@@ -89,52 +107,46 @@ pub fn clear_cache(window: AnyWindowHandle, host: Host, shell: Rc<dyn Shell>, cx
     if host.state(cx).removal_active() {
         return;
     }
-    let Some(answer) = prompt(
-        window,
-        PromptLevel::Warning,
-        "Clear cached maps?".into(),
-        Some(
-            "Orbit Disk will restart. Saved maps and the current collection will be cleared. \
-             Your files and Places will stay unchanged."
-                .into(),
-        ),
-        &["Clear Cache and Restart", "Cancel"],
-        cx,
-    ) else {
-        return;
-    };
-    cx.spawn(async move |cx| {
-        if answer.await != Ok(0) {
-            return;
+    let alert = Alert::new(
+        "Clear cached maps?",
+        "Orbit Disk will restart. Saved maps and the current collection will be cleared. \
+         Your files and Places will stay unchanged.",
+    )
+    .button("Clear Cache and Restart", AlertRole::Default)
+    .button("Cancel", AlertRole::Cancel)
+    .on_choice(move |choice, cx| {
+        if choice == 0 {
+            restart_clearing_cache(window, &host, &*shell, cx);
         }
-        cx.update(|cx| {
-            if host.state(cx).removal_active() {
-                return;
+    });
+    show(window, alert, PromptLevel::Warning, cx);
+}
+
+fn restart_clearing_cache(window: AnyWindowHandle, host: &Host, shell: &dyn Shell, cx: &mut App) {
+    // A removal may have started while the alert was open.
+    if host.state(cx).removal_active() {
+        return;
+    }
+    let saved = host.update(cx, |host, _| {
+        let store = host.settings_mut();
+        store.update(|settings| settings.clear_cache_on_launch = true);
+        store.save_now()
+    });
+    match saved.and_then(|()| shell.relaunch()) {
+        Ok(handle) => {
+            if lifecycle::may_quit(host, cx) {
+                // Dropping the handle leaves the relaunch armed.
+                drop(handle);
+                cx.quit();
+            } else {
+                handle.cancel();
             }
-            let saved = host.update(cx, |host, _| {
-                let store = host.settings_mut();
-                store.update(|settings| settings.clear_cache_on_launch = true);
-                store.save_now()
-            });
-            let relaunch = saved.and_then(|()| shell.relaunch());
-            match relaunch {
-                Ok(handle) => {
-                    if lifecycle::may_quit(&host, cx) {
-                        // Dropping the handle leaves the relaunch armed.
-                        drop(handle);
-                        cx.quit();
-                    } else {
-                        handle.cancel();
-                    }
-                }
-                Err(error) => host.update(cx, |host, cx| {
-                    host.set_notice(Some(format!("Couldn’t restart Orbit Disk: {error}").into()), cx)
-                }),
-            }
-        })
-        .ok();
-    })
-    .detach();
+        }
+        Err(error) => {
+            // The flag stays set: the next launch still clears the cache.
+            inform(window, "Orbit Disk", &format!("Couldn’t restart Orbit Disk: {error}"), cx);
+        }
+    }
 }
 
 /// At launch, before anything reads the cache: completes a confirmed "Clear Cache…".

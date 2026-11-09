@@ -21,8 +21,10 @@ use orbit_ui::{Assets, Host, HostEvent, HostOptions, actions, lifecycle, main_wi
 
 /// The real orbit-core backend, once the integrator wires it. Until then every run uses the
 /// fixture backend (and the fixture settings file).
+/// The production engine: orbit-core over this OS's platform layer.
 fn real_backend() -> Option<Arc<dyn Backend>> {
-    None
+    let platform = Arc::new(orbit_native::Native::new());
+    Some(Arc::new(orbit_backend::EngineBackend::new(platform)))
 }
 
 fn home() -> Vec<u8> {
@@ -67,6 +69,7 @@ fn main() {
     Application::new().with_assets(Assets).run(move |cx: &mut App| {
         let shell: Rc<dyn Shell> = Rc::new(shell::create());
         orbit_ui::theme::set_reduce_motion(shell.reduce_motion(), cx);
+        orbit_ui::sheets::set_privacy_settings_url(shell.privacy_settings_url(), cx);
 
         // First launch: import the Swift app's Places and last location.
         if !fixture_mode && !settings.settings().legacy_imported {

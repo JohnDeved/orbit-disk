@@ -418,9 +418,13 @@ fn skipped(state: &AppState) -> Option<impl IntoElement> {
             .id("footer-skipped")
             .flex_none()
             .whitespace_nowrap()
+            .cursor(gpui::CursorStyle::PointingHand)
             .text_color(theme::color(theme::CORAL))
+            .hover(|s| s.underline())
             .child(format!("{} skipped", theme::format_count(skipped)))
-            .tooltip(tooltip("Some items could not be scanned. The map includes accessible items only."))
+            .tooltip(tooltip("Some items could not be scanned. Show details"))
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, window, cx| crate::sheets::show_skipped_items(window, cx))
     })
 }
 
