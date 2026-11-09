@@ -183,8 +183,7 @@ pub fn display(bytes: &[u8]) -> String {
 }
 
 // --- chrome panels ---
-// Motion, footer timings and relative ages used by the toolbar, sidebar, footer, tray and welcome
-// panels.
+// Motion, footer timings and relative ages used by the toolbar, sidebar, footer and tray.
 
 /// The OS "Reduce Motion" preference (`Shell::reduce_motion`), installed once at launch with
 /// [`set_reduce_motion`]. Absent (tests, harness) means full motion.

@@ -6,10 +6,11 @@
 //! - "Places": Home, Downloads, Documents, Applications, the user's folders ("Remove from Places"
 //!   on right click) and "Choose a folder…". The highlighted place is the deepest one containing
 //!   the current folder, compared by whole path components.
-//! - Folders dropped from Finder onto the column (or onto the explorer, see
-//!   [`crate::panels::welcome`]) are added with `AddPlaces`; the backend keeps directories only and
-//!   app-state drops duplicates and built-in places. While such a drag hovers either target the
-//!   label reads "Release to add folders".
+//! - Folders dropped from Finder onto the column are added with `AddPlaces`; the backend keeps
+//!   directories only and app-state drops duplicates and built-in places. While such a drag hovers
+//!   a folder drop target the label reads "Release to add folders". An explorer-area target (Swift
+//!   also accepts drops on the map) can reuse [`add_dropped_folders`] and [`track_folder_drag`]
+//!   with [`FolderDropHover::content`].
 //!
 //! Observes [`Regions::SIDEBAR`]; [`Regions::HEADER`] only re-renders it when the current folder
 //! changed (the selection follows it), so typing a search does not redraw Places.
@@ -34,11 +35,12 @@ use crate::theme;
 
 pub const REGIONS: Regions = Regions::SIDEBAR.union(Regions::HEADER);
 
-/// Which folder drop targets a Finder drag hovers (the sidebar and the explorer area share the
-/// "Release to add folders" label).
+/// Which folder drop targets a Finder drag hovers (the sidebar and an explorer-area target share
+/// the "Release to add folders" label).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FolderDropHover {
     pub sidebar: bool,
+    /// An explorer-area drop target (none is mounted yet).
     pub content: bool,
 }
 

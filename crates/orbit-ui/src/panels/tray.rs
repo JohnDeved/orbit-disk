@@ -167,8 +167,9 @@ mod tests {
     use orbit_app_state::{Config, DragId, DragSource, Event};
 
     use super::TrayPanel;
-    use crate::components::CollectionDrag;
+    use crate::components::{CollectionDrag, DragPreview};
     use crate::host::{AppHost, Host};
+    use crate::icons::Icon;
     use crate::settings::{Settings, SettingsStore};
 
     /// A drag source above the tray, standing in for a map sector or file row.
@@ -189,7 +190,9 @@ mod tests {
                         .debug_selector(|| "drag-source".into())
                         .h(px(120.))
                         .w_full()
-                        .on_drag(self.payload.clone(), |payload, _, _, cx| cx.new(|_| payload.clone())),
+                        .on_drag(self.payload.clone(), |payload, offset, _, cx| {
+                            cx.new(|_| DragPreview::new(payload, offset))
+                        }),
                 )
                 .child(div().h(px(104.)).w_full().child(self.tray.clone()))
         }
@@ -211,7 +214,7 @@ mod tests {
         let (_bench, cx) = cx.add_window_view({
             let host = host.clone();
             move |_, cx| DragBench {
-                payload: CollectionDrag { drag, label: "file1".into() },
+                payload: CollectionDrag { drag, label: "file1".into(), detail: "10 bytes".into(), icon: Icon::File },
                 tray: cx.new(|cx| TrayPanel::new(&host, cx)),
             }
         });

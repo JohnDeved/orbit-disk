@@ -86,44 +86,88 @@ pub fn placeholder_tag(owner: &'static str) -> Div {
 
 use gpui::prelude::FluentBuilder as _;
 
-// --- chrome panels ---
-// Shared by the toolbar, sidebar, footer, tray and welcome panels; the collection drag payload is
-// also the contract between the drag sources (map, list) and the tray.
+// --- map panel ---
 
-/// The typed payload of an in-app collection drag (map sectors, file rows, search results).
-///
-/// Sources start the GPUI drag with `.on_drag(CollectionDrag { drag, label }, |payload, _, _, cx|
-/// cx.new(|_| payload.clone()))` and send `Event::DragBegin { drag, .. }` when it starts; they send
-/// `Event::DragEnd { drag }` when it ends anywhere but the tray (Escape, released elsewhere). The
-/// tray accepts it with `on_drop::<CollectionDrag>`, sends `DragOverTray` while the pointer
-/// crosses it and `DragDrop` on release. The payload doubles as the drag preview (a label pill).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Payload of an in-app collection drag (GPUI typed drag). The app state already holds the real
+/// source (`Event::DragBegin`); a drop target only needs the id: `on_drop::<CollectionDrag>` →
+/// `Event::DragDrop { drag }`, `on_drag_move::<CollectionDrag>` → `Event::DragOverTray`.
+#[derive(Clone, Debug)]
 pub struct CollectionDrag {
     pub drag: orbit_app_state::DragId,
     pub label: SharedString,
+    /// Secondary line (the dragged size).
+    pub detail: SharedString,
+    pub icon: Icon,
 }
 
-impl gpui::Render for CollectionDrag {
-    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.))
-            .max_w(px(260.))
-            .px(px(10.))
-            .py(px(5.))
-            .rounded(px(6.))
-            .bg(theme::with_alpha(theme::PANEL, 0.95))
-            .border_1()
-            .border_color(theme::with_alpha(theme::CORAL, 0.6))
-            .text_size(theme::TEXT_BODY)
-            .text_color(theme::color(theme::TEXT))
-            .font_family(theme::FONT_FAMILY)
-            .child(icon(Icon::TrayDown).size(px(12.)).text_color(theme::color(theme::CORAL)))
-            .child(div().min_w_0().truncate().child(self.label.clone()))
+/// The drag preview (Swift `dragPreview`): a 240 × 56 card 12 points right of the pointer,
+/// vertically centered on it. `offset` is the pointer position inside the dragged element when
+/// the drag started (GPUI draws the view at `pointer − offset`).
+pub struct DragPreview {
+    payload: CollectionDrag,
+    offset: gpui::Point<gpui::Pixels>,
+}
+
+impl DragPreview {
+    pub const SIZE: (f32, f32) = (240., 56.);
+
+    pub fn new(payload: &CollectionDrag, offset: gpui::Point<gpui::Pixels>) -> Self {
+        Self { payload: payload.clone(), offset }
     }
 }
+
+impl gpui::Render for DragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        let (width, height) = Self::SIZE;
+        div()
+            .pl(self.offset.x + px(12.))
+            .pt((self.offset.y - px(height / 2.)).max(px(0.)))
+            .font_family(theme::FONT_FAMILY)
+            .child(
+                div()
+                    .w(px(width))
+                    .h(px(height))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(11.))
+                    .pl(px(13.))
+                    .pr(px(14.))
+                    .rounded(px(8.))
+                    .bg(theme::with_alpha(0x242424, 0.98))
+                    .border_1()
+                    .border_color(theme::color(0x858585))
+                    .child(icon(self.payload.icon).size(px(20.)).text_color(theme::color(theme::TEXT)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(theme::TEXT_ROW)
+                                    .font_weight(theme::WEIGHT_MEDIUM)
+                                    .text_color(theme::color(theme::TEXT))
+                                    .truncate()
+                                    .child(self.payload.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(theme::TEXT_SMALL)
+                                    .text_color(theme::color(0xc7c7c7))
+                                    .truncate()
+                                    .child(self.payload.detail.clone()),
+                            ),
+                    ),
+            )
+    }
+}
+
+// --- chrome panels ---
+// Shared by the toolbar, sidebar, footer and tray. The tray accepts the map panel's
+// [`CollectionDrag`].
 
 /// A compact bordered button (native `.controlSize(.small)`): 20 points tall and `width` wide, so
 /// changing its label never moves its neighbours.

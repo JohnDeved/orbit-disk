@@ -15,7 +15,6 @@ pub mod map;
 pub mod sidebar;
 pub mod toolbar;
 pub mod tray;
-pub mod welcome;
 
 use gpui::{AppContext, Context, Entity};
 
