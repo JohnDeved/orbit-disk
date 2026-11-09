@@ -609,7 +609,12 @@ impl ContentsPanel {
             .gap(px(6.))
             .rounded(px(4.))
             .text_color(fg)
-            .child(div().w(px(12.)).flex_none().when(checked, |el| el.child(icon(Icon::Check).size(px(12.)))))
+            .child(
+                div()
+                    .w(px(12.))
+                    .flex_none()
+                    .when(checked, |el| el.child(icon(Icon::Check).size(px(12.)).text_color(fg))),
+            )
             .child(label)
             .when(enabled, |el| {
                 el.cursor(CursorStyle::PointingHand).hover(|s| s.bg(theme::white(0.1))).on_click(cx.listener(
@@ -838,7 +843,7 @@ impl ContentsPanel {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_row(display, revision, cx)))
                 .tooltip(row_help(self.host.clone(), display, revision, true))
-                .child(icon(Icon::ChevronRight).size(px(12.)).text_color(theme::color(theme::TEXT)))
+                .child(icon(Icon::ChevronRight).size(px(17.)).text_color(theme::color(theme::TEXT)))
                 .into_any_element()
         } else {
             div()
@@ -848,7 +853,7 @@ impl ContentsPanel {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(icon(Icon::File).size(px(10.)).text_color(slate))
+                .child(icon(Icon::File).size(px(12.)).text_color(slate))
                 .into_any_element()
         };
         div()
@@ -882,7 +887,7 @@ impl ContentsPanel {
                                 div()
                                     .h(px(15.))
                                     .text_size(theme::TEXT_BODY)
-                                    .font_weight(theme::WEIGHT_MEDIUM)
+                                    .font_weight(theme::WEIGHT_SEMIBOLD)
                                     .truncate()
                                     .child(text.name),
                             )
@@ -925,7 +930,7 @@ impl ContentsPanel {
                                 div()
                                     .h(px(15.))
                                     .text_size(theme::TEXT_BODY)
-                                    .font_weight(theme::WEIGHT_MEDIUM)
+                                    .font_weight(theme::WEIGHT_SEMIBOLD)
                                     .whitespace_nowrap()
                                     .child(text.size),
                             ))
@@ -1149,15 +1154,22 @@ impl Render for ContentsPanel {
             .pb(px(10.))
             .child(div().flex_1().text_size(theme::TEXT_HEADING).font_weight(theme::WEIGHT_SEMIBOLD).child(title))
             .child(
+                // A borderless pop-up menu button: coral arrow, label and menu chevron. Fixed
+                // width, so switching between "Size" and "Name" never moves the title.
                 div()
                     .id("contents-sort")
-                    .w(px(58.))
+                    .w(px(72.))
+                    .h(px(22.))
                     .flex()
                     .flex_row()
                     .items_center()
                     .justify_end()
-                    .gap(px(4.))
-                    .text_size(theme::TEXT_SMALL)
+                    .gap(px(3.))
+                    .text_size(theme::TEXT_ROW)
+                    .font_weight(theme::WEIGHT_MEDIUM)
+                    .text_color(theme::color(theme::CORAL))
+                    .rounded(px(5.))
+                    .hover(|s| s.text_color(theme::with_alpha(theme::CORAL, 0.8)))
                     .cursor(CursorStyle::PointingHand)
                     .tooltip(tooltip("Sort contents"))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -1165,8 +1177,9 @@ impl Render for ContentsPanel {
                         this.menu = Some(OpenMenu { menu: Menu::Sort, position: event.position() });
                         cx.notify();
                     }))
-                    .child(icon(Icon::ArrowDown).size(px(11.)))
-                    .child(sort),
+                    .child(icon(Icon::ArrowDown).size(px(14.)).text_color(theme::color(theme::CORAL)))
+                    .child(sort)
+                    .child(icon(Icon::ChevronDown).size(px(10.)).text_color(theme::color(theme::CORAL))),
             );
 
         let status = div()
@@ -1186,7 +1199,7 @@ impl Render for ContentsPanel {
                         .flex_row()
                         .gap(px(4.))
                         .text_color(theme::color(theme::CORAL))
-                        .child(icon(Icon::Pointer).size(px(11.)).mt(px(1.)))
+                        .child(icon(Icon::Pointer).size(px(11.)).mt(px(1.)).text_color(theme::color(theme::CORAL)))
                         .child(div().flex_1().min_w_0().line_clamp(2).child(text))
                 } else {
                     div().text_color(slate).line_clamp(2).child(text)

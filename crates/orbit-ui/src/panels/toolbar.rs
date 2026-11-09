@@ -26,7 +26,7 @@ use gpui::{
     Render, ScrollHandle, ShapedLine, SharedString, StatefulInteractiveElement, Style, Styled, Subscription, TextRun,
     UTF16Selection, UnderlineStyle, Window, div, fill, point, prelude::*, px, relative, size,
 };
-use orbit_app_state::{Event, Regions};
+use orbit_app_state::{AppState, Event, Regions};
 use orbit_core::paths::file_name;
 use orbit_core::types::ScanState;
 use orbit_core::view::FolderTree;
@@ -82,9 +82,14 @@ impl Render for ToolbarPanel {
             Some(folder) => {
                 let tree = folder.tree();
                 let path = folder.folder_path();
-                let name = tree.name(FolderTree::FOLDER);
-                let name = if name.is_empty() { file_name(path) } else { name };
-                (theme::display(if name.is_empty() { path } else { name }), theme::display(path))
+                let name = if let Some(name) = state.place_name(path) {
+                    name.to_owned()
+                } else {
+                    let name = tree.name(FolderTree::FOLDER);
+                    let name = if name.is_empty() { file_name(path) } else { name };
+                    theme::display(if name.is_empty() { path } else { name })
+                };
+                (name, theme::display(path))
             }
             None => (String::new(), String::new()),
         };
@@ -782,8 +787,9 @@ impl BreadcrumbBar {
     }
 }
 
-/// `(path, name)` from the mapped root down to the current folder.
-fn crumbs(folder: &orbit_app_state::PreparedFolder) -> Vec<(Vec<u8>, Vec<u8>)> {
+/// `(path, name)` from the mapped root down to the current folder. Home and volume roots use
+/// their place names ("Home", "Macintosh HD"); the path line keeps the real path.
+fn crumbs(folder: &orbit_app_state::PreparedFolder, state: &AppState) -> Vec<(Vec<u8>, Vec<u8>)> {
     let root = folder.root_path();
     let current = folder.folder_path();
     let mut paths = vec![root.to_vec()];
@@ -805,6 +811,10 @@ fn crumbs(folder: &orbit_app_state::PreparedFolder) -> Vec<(Vec<u8>, Vec<u8>)> {
         .into_iter()
         .enumerate()
         .map(|(i, path)| {
+            if let Some(name) = state.place_name(&path) {
+                let name = name.as_bytes().to_vec();
+                return (path, name);
+            }
             let name = if named && !names[i].is_empty() { names[i] } else { file_name(&path) };
             let name = if name.is_empty() { path.clone() } else { name.to_vec() };
             (path, name)
@@ -832,7 +842,7 @@ impl Render for BreadcrumbBar {
                         if meta.state == ScanState::Complete { "" } else { " found" }
                     )
                 };
-                (crumbs(folder), files)
+                (crumbs(folder, state), files)
             }
             None => (Vec::new(), String::new()),
         };
@@ -892,7 +902,7 @@ impl Render for BreadcrumbBar {
                         "go-up",
                         "Up",
                         Some(Icon::ArrowUp),
-                        ButtonStyle::Bordered,
+                        ButtonStyle::Tinted,
                         can_go_up,
                         move |_, _, cx| up.send(Event::GoUp, cx),
                     )),

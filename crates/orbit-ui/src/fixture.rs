@@ -26,10 +26,11 @@ use orbit_core::view::{
 };
 use orbit_platform::{Cancellation, FileIdentity};
 
-/// The fixture volume root.
-pub const ROOT: &[u8] = b"/Fixture";
+/// The fixture volume root: the startup volume, so the sidebar shows the fixture volume's card
+/// (not an extra "Mac" fallback) and the built-in places resolve inside the fixture.
+pub const ROOT: &[u8] = b"/";
 /// The fixture user's home (use as `Config::home`).
-pub const HOME: &[u8] = b"/Fixture/Users/demo";
+pub const HOME: &[u8] = b"/Users/demo";
 
 /// The tree the fixture serves.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -104,10 +105,10 @@ const NONE: u32 = u32::MAX;
 impl Tree {
     fn add(&mut self, parent: u32, name: &[u8], is_dir: bool, size: u64) -> u32 {
         let mut path = if parent == NONE { Vec::new() } else { self.nodes[parent as usize].path.to_vec() };
-        let name_at = path.len() as u32 + u32::from(parent != NONE);
-        if parent != NONE {
+        if parent != NONE && path.last() != Some(&b'/') {
             path.push(b'/');
         }
+        let name_at = path.len() as u32;
         path.extend_from_slice(name);
         let id = self.nodes.len() as u32;
         let path: Box<[u8]> = path.into();
@@ -352,10 +353,7 @@ fn grow(tree: &mut Tree, rng: &mut Rng, parent: u32, budget: usize, depth: u32, 
 fn generate(options: &FixtureOptions) -> Tree {
     let mut tree = Tree::default();
     let mut rng = Rng(options.seed | 1);
-    let root = tree.add(NONE, ROOT, true, 0);
-    // Root path is `/Fixture`, its name `Fixture`.
-    tree.nodes[0].name_at = 1;
-    tree.nodes[0].folded = fold(b"Fixture").into();
+    let root = add_root(&mut tree);
     let n = options.entries;
     let users = tree.add(root, b"Users", true, 0);
     let home = tree.add(users, b"demo", true, 0);
@@ -433,11 +431,17 @@ pub mod sample {
     }
 }
 
+/// The volume root `/`: its name is empty, like the last path component of `/`.
+fn add_root(tree: &mut Tree) -> u32 {
+    let root = tree.add(NONE, ROOT, true, 0);
+    tree.nodes[root as usize].name_at = ROOT.len() as u32;
+    tree.nodes[root as usize].folded = "".into();
+    root
+}
+
 fn generate_sample() -> Tree {
     let mut tree = Tree::default();
-    let root = tree.add(NONE, ROOT, true, 0);
-    tree.nodes[0].name_at = 1;
-    tree.nodes[0].folded = fold(b"Fixture").into();
+    let root = add_root(&mut tree);
     let users = tree.add(root, b"Users", true, 0);
     let home = tree.add(users, b"demo", true, 0);
     for &(relative, size) in sample::FILES {

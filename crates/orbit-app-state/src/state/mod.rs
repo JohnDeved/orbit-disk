@@ -799,12 +799,18 @@ impl AppState {
     // ---------------------------------------------------------------------------------------
     // Footer.
 
-    fn root_display_name(&self, root: &[u8]) -> String {
-        if root == &*self.cfg.home {
-            return "Home".into();
+    /// The name the interface gives a location instead of its last path component: "Home" for
+    /// the user's home folder, the volume name for a volume root (`/` reads "Macintosh HD").
+    pub fn place_name(&self, path: &[u8]) -> Option<&str> {
+        if path == &*self.cfg.home {
+            return Some("Home");
         }
-        if let Some(volume) = self.volumes.iter().find(|v| v.path == root) {
-            return volume.name.clone();
+        self.volumes.iter().find(|v| v.path == path).map(|volume| volume.name.as_str())
+    }
+
+    fn root_display_name(&self, root: &[u8]) -> String {
+        if let Some(name) = self.place_name(root) {
+            return name.to_owned();
         }
         let name = file_name(root);
         String::from_utf8_lossy(if name.is_empty() { root } else { name }).into_owned()
@@ -875,7 +881,8 @@ impl AppState {
             std::iter::once(Volume::fallback_root()).chain(volumes).collect()
         };
         self.discovering_volumes = false;
-        self.dirty |= Regions::SIDEBAR | Regions::FOOTER;
+        // The header names volume roots after their volume ([`Self::place_name`]).
+        self.dirty |= Regions::SIDEBAR | Regions::FOOTER | Regions::HEADER;
     }
 
     // ---------------------------------------------------------------------------------------

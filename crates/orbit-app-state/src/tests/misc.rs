@@ -114,6 +114,11 @@ fn volume_discovery_coalesces_and_keeps_a_root_fallback() {
     h.run();
     let names: Vec<&str> = h.state.volumes().iter().map(|v| v.name.as_str()).collect();
     assert_eq!(names, ["Macintosh HD", "USB"]);
+    // Volume roots and Home are named as places; other folders have no place name.
+    assert_eq!(h.state.place_name(b"/"), Some("Macintosh HD"));
+    assert_eq!(h.state.place_name(b"/Volumes/USB"), Some("USB"));
+    assert_eq!(h.state.place_name(&h.state.config().home.clone()), Some("Home"));
+    assert_eq!(h.state.place_name(b"/Volumes"), None);
 }
 
 #[test]

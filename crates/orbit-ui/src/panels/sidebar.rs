@@ -183,7 +183,7 @@ impl SidebarPanel {
                             .gap(px(8.))
                             .items_center()
                             .text_size(theme::TEXT_ROW)
-                            .font_weight(theme::WEIGHT_MEDIUM)
+                            .font_weight(theme::WEIGHT_SEMIBOLD)
                             .child(icon(Icon::HardDrive))
                             .child(div().min_w_0().truncate().child(volume.name.clone())),
                     )
@@ -245,14 +245,15 @@ fn place_row(
             .group_hover(group.clone(), move |s| s.bg(hover))
             .group_active(group, move |s| s.bg(pressed))
             .text_size(theme::TEXT_ROW)
+            .font_weight(theme::WEIGHT_MEDIUM)
             .text_color(fg)
-            .child(icon(glyph).text_color(fg))
+            .child(icon(glyph).size(px(15.)).text_color(fg))
             .child(div().min_w_0().whitespace_nowrap().overflow_hidden().child(title)),
     )
 }
 
 /// Width left for a place title: column − row insets − icon − gap.
-const PLACE_TITLE_WIDTH: f32 = 210. - 24. - 24. - 14. - 8. - 2.;
+const PLACE_TITLE_WIDTH: f32 = 210. - 24. - 24. - 15. - 8. - 2.;
 
 impl Render for SidebarPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -281,8 +282,7 @@ impl Render for SidebarPanel {
         for (i, path) in saved.into_iter().enumerate() {
             let selected = self.selected.as_deref() == Some(&path[..]);
             let name = theme::display(if file_name(&path).is_empty() { &path } else { file_name(&path) });
-            let title =
-                truncate_middle(&name, px(PLACE_TITLE_WIDTH), theme::TEXT_ROW, gpui::FontWeight::NORMAL, window);
+            let title = truncate_middle(&name, px(PLACE_TITLE_WIDTH), theme::TEXT_ROW, theme::WEIGHT_MEDIUM, window);
             let menu_path = path.clone();
             let open = cx.listener({
                 let path = path.clone();

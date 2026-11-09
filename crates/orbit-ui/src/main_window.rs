@@ -148,6 +148,9 @@ impl Render for MainWindow {
         }
         let state = self.host.state(cx);
         let has_root = state.root_path().is_some();
+        // Before a folder is shown (welcome, first opening) the map panel's centered welcome or
+        // opening view takes the whole explorer, like the Swift app: no breadcrumbs or Contents.
+        let explorer = state.folder().is_some();
         let can_refresh = has_root && !state.is_scanning() && !state.is_refreshing() && !state.is_removing();
         let can_go_up = state.can_go_up();
         let selected = state.selected();
@@ -240,11 +243,13 @@ impl Render for MainWindow {
                         panels.toolbar.clone(),
                         style().size_full(),
                     )))
-                    .child(slot(
-                        Regions::HEADER,
-                        panels.breadcrumbs.clone(),
-                        style().h(theme::BREADCRUMB_HEIGHT).w_full().flex_none(),
-                    ))
+                    .when(explorer, |el| {
+                        el.child(slot(
+                            Regions::HEADER,
+                            panels.breadcrumbs.clone(),
+                            style().h(theme::BREADCRUMB_HEIGHT).w_full().flex_none(),
+                        ))
+                    })
                     .child(
                         // The explorer area: Finder folders dropped here are added to Places.
                         div()
@@ -261,29 +266,31 @@ impl Render for MainWindow {
                                 add_dropped_folders(&this.host, paths.paths(), cx);
                             }))
                             .child(slot(Regions::MAP, panels.map.clone(), style().flex_1().min_w_0().h_full()))
-                            .child(
-                                div()
-                                    .w(theme::CONTENTS_WIDTH)
-                                    .flex_none()
-                                    .h_full()
-                                    .mr(theme::SPACE_XL)
-                                    .mb(theme::SPACE_L)
-                                    .flex()
-                                    .flex_col()
-                                    .bg(theme::color(theme::PANEL))
-                                    .rounded(theme::RADIUS_PANEL)
-                                    .overflow_hidden()
-                                    .child(slot(
-                                        Regions::LIST,
-                                        panels.contents.clone(),
-                                        style().flex_1().w_full().min_h_0(),
-                                    ))
-                                    .child(slot(
-                                        Regions::INSPECTOR,
-                                        panels.inspector.clone(),
-                                        style().h(theme::INSPECTOR_HEIGHT).w_full().flex_none(),
-                                    )),
-                            ),
+                            .when(explorer, |el| {
+                                el.child(
+                                    div()
+                                        .w(theme::CONTENTS_WIDTH)
+                                        .flex_none()
+                                        .h_full()
+                                        .mr(theme::SPACE_XL)
+                                        .mb(theme::SPACE_L)
+                                        .flex()
+                                        .flex_col()
+                                        .bg(theme::color(theme::PANEL))
+                                        .rounded(theme::RADIUS_PANEL)
+                                        .overflow_hidden()
+                                        .child(slot(
+                                            Regions::LIST,
+                                            panels.contents.clone(),
+                                            style().flex_1().w_full().min_h_0(),
+                                        ))
+                                        .child(slot(
+                                            Regions::INSPECTOR,
+                                            panels.inspector.clone(),
+                                            style().h(theme::INSPECTOR_HEIGHT).w_full().flex_none(),
+                                        )),
+                                )
+                            }),
                     )
                     .child(slot(
                         Regions::FOOTER,

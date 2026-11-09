@@ -670,8 +670,9 @@ fn prepaint_chart(
     });
     let center = text.zip(metrics).map(|(text, metrics)| {
         let radius = metrics.inner_radius as f32;
-        let mut element = center::element(&text, radius);
-        let available = size(AvailableSpace::Definite(px(radius * 1.65)), AvailableSpace::MinContent);
+        let value_size = center::value_font_size(&text.value, radius, window);
+        let mut element = center::element(&text, radius, value_size);
+        let available = size(AvailableSpace::Definite(center::stack_width(radius)), AvailableSpace::MinContent);
         let laid_out = element.layout_as_root(available, window, cx);
         let origin = point(
             px(metrics.center.x as f32) - laid_out.width / 2.,
@@ -753,8 +754,12 @@ impl Subject {
             let meta = folder.folder_meta();
             let path = folder.folder_path();
             let name = folder.name(FolderTree::FOLDER);
+            let name = match state.place_name(path) {
+                Some(place) => place.to_owned(),
+                None => theme::display(if name.is_empty() { path } else { name }),
+            };
             return Some(Self {
-                name: theme::display(if name.is_empty() { path } else { name }).into(),
+                name: name.into(),
                 size: meta.size,
                 kind: SubjectKind::Folder,
                 scan: meta.state,
@@ -837,9 +842,9 @@ fn center_text(state: &AppState, presentation: &Presentation<NodeIx>, active: Op
             }
             SubjectKind::Group => "Drag these items to Collection".to_owned(),
             SubjectKind::Node { .. } => {
-                let percent = subject.size as f64 / root.size.max(1) as f64 * 100.0;
+                let percent = theme::format_percent(subject.size as f64 / root.size.max(1) as f64);
                 let total = if root.state == ScanState::Complete { "of this folder" } else { "of mapped bytes" };
-                format!("{percent:.1}% {total}")
+                format!("{percent} {total}")
             }
         }
     };
@@ -947,7 +952,7 @@ fn metric(title: &'static str, value: String, trailing: bool) -> impl IntoElemen
                 .child(title),
         ))
         .child(theme::monospaced_digits(align(
-            div().h(px(22.)).text_size(theme::TEXT_METRIC).font_weight(theme::WEIGHT_MEDIUM).truncate().child(value),
+            div().h(px(22.)).text_size(theme::TEXT_METRIC).font_weight(theme::WEIGHT_SEMIBOLD).truncate().child(value),
         )))
 }
 
