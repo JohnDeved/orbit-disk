@@ -76,3 +76,20 @@ Seam and wiring changes that agents requested. The integrator applies them once 
   - cumulative overflow across refreshes
   - stage-level recreated identity after a kill
   - a cancel inside `publish_recovery_copy`
+
+## Wave E: polish and parity, collected from the UI panel agents
+- [ ] Live frame harness with the screen unlocked (`OrbitDisk --frame-harness`); target p99 < 8.3 ms. All UI numbers so far are headless.
+- [ ] Visual parity pass against the Swift app and DESIGN.md: screenshots side by side, light and dark art.
+- [ ] Finder folder drops on the explorer area should add Places again. Reuse `sidebar::add_dropped_folders` / `track_folder_drag`.
+- [ ] First-scan full-screen view: item count, path being read, file-size figure. App-state needs to expose progress bytes, and `MappingSession` the current path.
+- [ ] Escape stops mapping (Swift parity) without stealing Escape from sheets and drags.
+- [ ] Tray "Removing from collection…" state: app-state accessor.
+- [ ] Skipped-items sheet lists the affected paths: the engine and app-state need to carry issue paths.
+- [ ] Search field: undo/redo, word-wise movement, grapheme clusters (`unicode-segmentation`).
+- [ ] Reduce Motion re-read at runtime; menu items disabled while a sheet is open.
+- [ ] Map center: middle truncation and round line caps for the badge glyphs (GPUI limits; custom text shaping if needed).
+- [ ] Release pipeline:
+  - `xtask bundle` stamps the version and builds without `runtime-shaders`
+  - swap `scripts/release.sh` and the workflows from SwiftPM to cargo
+  - rewrite `capture-marketing.sh` for GPUI
+- [ ] Idle-machine benchmark rerun of every Rust vs Swift comparison for the cutover report (`docs/benchmarks/rust-port.md`).
