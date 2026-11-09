@@ -4107,6 +4107,7 @@ dependencies = [
  "gpui",
  "orbit-app-state",
  "orbit-automation",
+ "orbit-backend",
  "orbit-core",
  "orbit-native",
  "orbit-platform",

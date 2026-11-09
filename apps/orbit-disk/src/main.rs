@@ -21,8 +21,10 @@ use orbit_ui::{Assets, Host, HostEvent, HostOptions, actions, lifecycle, main_wi
 
 /// The real orbit-core backend, once the integrator wires it. Until then every run uses the
 /// fixture backend (and the fixture settings file).
+/// The production engine: orbit-core over this OS's platform layer.
 fn real_backend() -> Option<Arc<dyn Backend>> {
-    None
+    let platform = Arc::new(orbit_native::Native::new());
+    Some(Arc::new(orbit_backend::EngineBackend::new(platform)))
 }
 
 fn home() -> Vec<u8> {
