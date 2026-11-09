@@ -1,0 +1,15 @@
+[package]
+name = "orbit-ui"
+description = "GPUI views for Orbit Disk."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+orbit-app-state.workspace = true
+orbit-platform.workspace = true
+
+[lints]
+workspace = true

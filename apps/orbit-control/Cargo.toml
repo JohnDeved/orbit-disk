@@ -1,0 +1,17 @@
+[package]
+name = "orbit-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The bundle layout (Contents/MacOS/OrbitControl) is relied on by existing Codex MCP registrations.
+[[bin]]
+name = "OrbitControl"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

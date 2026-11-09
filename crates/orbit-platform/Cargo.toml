@@ -1,0 +1,17 @@
+[package]
+name = "orbit-platform"
+description = "Platform boundary: OS-independent types and the traits every platform layer implements."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

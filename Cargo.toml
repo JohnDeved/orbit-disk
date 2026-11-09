@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*", "xtask"]
+default-members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "1.0.0-alpha.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+orbit-platform = { path = "crates/orbit-platform" }
+orbit-platform-macos = { path = "crates/orbit-platform-macos" }
+orbit-platform-generic = { path = "crates/orbit-platform-generic" }
+orbit-shell-macos = { path = "crates/orbit-shell-macos" }
+orbit-native = { path = "crates/orbit-native" }
+orbit-core = { path = "crates/orbit-core" }
+orbit-app-state = { path = "crates/orbit-app-state" }
+orbit-sunburst = { path = "crates/orbit-sunburst" }
+orbit-ui = { path = "crates/orbit-ui" }
+orbit-automation = { path = "crates/orbit-automation" }
+
+libc = "0.2"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-deque = "0.8"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+memchr = "2"
+smallvec = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+unicode-normalization = "0.1"
+caseless = "0.2"
+tempfile = "3"
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+gpui = "0.2.2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+
+# Benchmarks measure release code but keep symbols for profiling.
+[profile.bench]
+inherits = "release"
+debug = true
+
+# Dependencies stay optimized in dev so debug runs of the scanner remain usable.
+[profile.dev.package."*"]
+opt-level = 2

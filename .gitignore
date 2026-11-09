@@ -8,3 +8,4 @@ Assets/*.iconset/
 *.dSYM/
 __pycache__/
 *.pyc
+/target/
