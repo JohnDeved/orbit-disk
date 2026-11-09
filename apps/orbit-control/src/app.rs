@@ -7,38 +7,12 @@ use orbit_automation::transport::{self, Client};
 use orbit_automation::{Failure, TransportError};
 use serde_json::{Map, Value, json};
 
-/// The per-user runtime directory holding the automation socket. Must match the app's
-/// `AppDirs::runtime`: on macOS `confstr(_CS_DARWIN_USER_TEMP_DIR)/orbit-disk-automation-<euid>`,
-/// identical to the Swift app so either build's OrbitControl reaches either app.
-// TODO(integration): use Platform::app_dirs (`orbit_native::Native::default().app_dirs().runtime`)
-// once MacPlatform implements it.
+/// The per-user runtime directory holding the automation socket, from the platform layer
+/// (`AppDirs::runtime`). On macOS it equals the Swift app's directory, so either build's
+/// OrbitControl reaches either app.
 pub fn runtime_dir() -> PathBuf {
-    // SAFETY: geteuid has no preconditions.
-    let euid = unsafe { libc::geteuid() };
-    temporary_base().join(format!("orbit-disk-automation-{euid}"))
-}
-
-#[cfg(target_os = "macos")]
-fn temporary_base() -> PathBuf {
-    use std::os::unix::ffi::OsStringExt;
-    // SAFETY: a null buffer with length 0 only queries the required size.
-    let length = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
-    let mut bytes = vec![0u8; length.max(1)];
-    // SAFETY: `bytes` is writable for its full length.
-    let written = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, bytes.as_mut_ptr().cast(), bytes.len()) };
-    if written == 0 || written > bytes.len() {
-        return PathBuf::from("/tmp");
-    }
-    bytes.truncate(bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len()));
-    PathBuf::from(std::ffi::OsString::from_vec(bytes))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn temporary_base() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| "/tmp".into())
+    use orbit_platform::Platform;
+    orbit_native::Native::new().app_dirs().runtime
 }
 
 /// This executable with symlinks resolved (so `~/.local/bin/orbitdisk` maps to the bundle).
