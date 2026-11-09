@@ -1975,6 +1975,61 @@ impl Writer {
         })
     }
 
+    /// Starts counting, on this connection only, the inventory changes a repair makes: inserted
+    /// and deleted items and any change of an item other than its listing epoch (name, kind,
+    /// sizes, counts, identity, links). Queue bookkeeping is not counted. Read the count with
+    /// [`Writer::inventory_changes`]; the temporary triggers never reach the database file.
+    pub fn track_inventory_changes(&mut self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS orbit_inventory_changes(singleton INTEGER PRIMARY KEY, n INTEGER NOT NULL);
+             INSERT OR REPLACE INTO temp.orbit_inventory_changes VALUES(1,0);
+             CREATE TEMP TRIGGER IF NOT EXISTS orbit_node_inserted AFTER INSERT ON main.nodes BEGIN
+               UPDATE orbit_inventory_changes SET n=n+1;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS orbit_node_deleted AFTER DELETE ON main.nodes BEGIN
+               UPDATE orbit_inventory_changes SET n=n+1;
+             END;
+             CREATE TEMP TRIGGER IF NOT EXISTS orbit_node_changed AFTER UPDATE ON main.nodes
+               WHEN OLD.parent IS NOT NEW.parent OR OLD.name IS NOT NEW.name OR OLD.search_name IS NOT NEW.search_name
+                 OR OLD.kind IS NOT NEW.kind OR OLD.accessible IS NOT NEW.accessible OR OLD.is_mount IS NOT NEW.is_mount
+                 OR OLD.size IS NOT NEW.size OR OLD.allocated IS NOT NEW.allocated
+                 OR OLD.file_count IS NOT NEW.file_count OR OLD.raw_alloc IS NOT NEW.raw_alloc
+                 OR OLD.dev IS NOT NEW.dev OR OLD.inode IS NOT NEW.inode OR OLD.links IS NOT NEW.links BEGIN
+               UPDATE orbit_inventory_changes SET n=n+1;
+             END;",
+        )?;
+        Ok(())
+    }
+
+    /// Inventory changes counted since [`Writer::track_inventory_changes`].
+    pub fn inventory_changes(&self) -> Result<i64> {
+        Ok(self.conn.query_row("SELECT n FROM temp.orbit_inventory_changes WHERE singleton=1", [], |row| row.get(0))?)
+    }
+
+    /// A hash of everything the map reports as skipped (listing issues, skipped items, blocked
+    /// folders), to tell whether a repair changed it.
+    pub fn issue_fingerprint(&self) -> Result<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for sql in [
+            "SELECT parent,count,messages FROM listing_issues ORDER BY parent",
+            "SELECT path,0,message FROM stage_issues ORDER BY path",
+            "SELECT path,0,NULL FROM blocked_directories ORDER BY path",
+        ] {
+            let mut statement = self.conn.prepare_cached(sql)?;
+            let mut rows = statement.query([])?;
+            let mut count = 0u64;
+            while let Some(row) = rows.next()? {
+                count += 1;
+                row.get_ref(0)?.as_bytes_or_null().unwrap_or_default().hash(&mut hasher);
+                row.get::<_, i64>(1)?.hash(&mut hasher);
+                row.get_ref(2)?.as_bytes_or_null().unwrap_or_default().hash(&mut hasher);
+            }
+            count.hash(&mut hasher);
+        }
+        Ok(hasher.finish())
+    }
+
     /// A queued directory vanished or was replaced: prune it and relist its parent.
     pub fn invalidate_directory(&mut self, path: &[u8]) -> Result<()> {
         let (parent, name) = split_parent(path).ok_or_else(|| sqlite_invalid("invalid directory"))?;
