@@ -3,9 +3,13 @@
 //!
 //! Drawing (one canvas, `DESIGN.md`: "the colored map and collection marks retain their drawing
 //! layer; hover and selection update a separate outline layer"):
-//! - base layer: [`layers::Fills`] keyed by (layout revision, bounds) and [`layers::Marks`] keyed
-//!   additionally by the presentation revision. Neither is rebuilt by hover or selection; a
-//!   collection change rebuilds only the marks. Painting clones a few dozen cached paths.
+//! - base layer: fills, hatching, badges (or the empty placeholder ring) rasterized on a
+//!   background thread at device resolution ([`layers::render`]), keyed by (layout revision,
+//!   presentation revision, bounds, scale factor) and painted as one pixel-aligned image. Hover
+//!   and selection never rebuild it. While a newer raster is being built, frames keep painting
+//!   the previous one (mapped onto the new chart after a resize); no frame ever waits. A newer
+//!   key supersedes (cancels) the pending job; only the latest raster is kept and the GPU
+//!   texture of a replaced one is released (`Window::drop_image`).
 //! - outline layer: the 2 pt white stroke of the active segment (pointer, hovered row, pinned
 //!   group, else the selection) and of the selection, cached by the set of outlined segments.
 //! - center: name, size, detail and Up slots ([`center`]), laid out against the hole radius of
@@ -20,18 +24,21 @@
 //! carrying [`CollectionDrag`]; drop targets send `DragDrop`, Escape cancels.
 
 mod center;
+mod coverage;
 pub mod layers;
 #[cfg(test)]
 mod tests;
 
+use std::cell::Cell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, AvailableSpace, Bounds, Context, CursorStyle, DispatchPhase, Entity, FocusHandle, Hitbox,
+    AnyElement, App, AvailableSpace, Bounds, Context, Corners, CursorStyle, DispatchPhase, Entity, FocusHandle, Hitbox,
     HitboxBehavior, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Path, Pixels, Point, Render, SharedString, Styled, Subscription, Window, canvas, div,
-    fill, point, prelude::*, px, size,
+    MouseUpEvent, ParentElement, Path, Pixels, Point, Render, RenderImage, SharedString, Styled, Subscription, Task,
+    Window, canvas, div, fill, point, prelude::*, px, size,
 };
 use orbit_app_state::gesture::exceeds_drag_threshold;
 use orbit_app_state::{AppState, DragId, DragSource, Event, GestureId, Regions};
@@ -40,7 +47,7 @@ use orbit_core::view::{FolderTree, NodeIx};
 use orbit_sunburst::{CollectionState, Hit, Metrics, Point as SPoint, Presentation, SegmentIndex};
 
 pub use center::CenterText;
-use layers::{Fills, Marks};
+use layers::{Grid, Raster};
 
 use crate::actions::OpenFolder;
 use crate::components::{ButtonStyle, CollectionDrag, DragPreview, button, truncate_middle};
@@ -63,26 +70,54 @@ const ID_BASE: u64 = 1 << 40;
 /// Rebuild counters and timings of the cached layers (tests, measurements).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MapStats {
-    pub geometry_builds: u64,
-    pub marks_builds: u64,
+    /// Base rasters requested (background jobs spawned, including superseded ones).
+    pub raster_jobs: u64,
+    /// Base rasters built and adopted.
+    pub raster_builds: u64,
     pub outline_builds: u64,
-    pub last_geometry: Duration,
-    pub last_marks: Duration,
+    /// Background build time of the last adopted raster (render + pixel conversion).
+    pub last_raster: Duration,
     pub last_outline: Duration,
+    /// UI-thread time of the last chart paint (base image + outlines).
+    pub last_paint: Duration,
+    /// Bytes of the cached raster image (CPU copy; the GPU texture holds as many again).
+    pub raster_bytes: usize,
 }
 
-/// The base layer of the current layout at the current bounds.
-struct Base {
+/// What a base raster depends on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RasterKey {
     layout_revision: u64,
+    /// Presentation revision (layout or collection states).
+    revision: u64,
     bounds: Bounds<Pixels>,
-    fills: Fills,
-    /// Presentation revision the marks were built for.
-    marks_revision: u64,
-    marks: Marks,
+    scale: f32,
+}
+
+/// The latest finished base raster.
+struct Base {
+    key: RasterKey,
+    /// Metrics the raster was drawn for (maps it onto a resized chart while a new one builds).
+    metrics: Metrics,
+    raster: Raster,
+}
+
+/// A base raster being built in the background.
+struct PendingRaster {
+    key: RasterKey,
+    cancelled: Arc<AtomicBool>,
+    _task: Task<()>,
+}
+
+impl Drop for PendingRaster {
+    fn drop(&mut self) {
+        // The job checks this between passes; dropping the task cancels it if not yet started.
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
 }
 
 struct Outlines {
-    key: (u64, Bounds<Pixels>, [Option<SegmentIndex>; 2]),
+    key: (u64, Bounds<Pixels>, u32, [Option<SegmentIndex>; 2]),
     paths: Vec<Path<Pixels>>,
 }
 
@@ -108,7 +143,11 @@ pub struct MapPanel {
     focus: FocusHandle,
     presentation: Option<Presentation<NodeIx>>,
     base: Option<Base>,
+    pending: Option<PendingRaster>,
+    /// Replaced raster images whose GPU textures are released at the next prepaint.
+    retired: Vec<Arc<RenderImage>>,
     outlines: Option<Outlines>,
+    last_paint: Cell<Duration>,
     /// Chart bounds and metrics of the last prepaint.
     chart: Option<(Bounds<Pixels>, Metrics)>,
     /// What the pointer is over (local: drives the cursor, center wash and outline).
@@ -143,7 +182,10 @@ impl MapPanel {
             focus: cx.focus_handle(),
             presentation: None,
             base: None,
+            pending: None,
+            retired: Vec::new(),
             outlines: None,
+            last_paint: Cell::new(Duration::ZERO),
             chart: None,
             pointer: Hit::None,
             hover_sent: None,
@@ -165,7 +207,12 @@ impl MapPanel {
 
     /// Layer rebuild counters (tests, measurements).
     pub fn stats(&self) -> MapStats {
-        self.stats
+        MapStats { last_paint: self.last_paint.get(), ..self.stats }
+    }
+
+    /// A base raster is being built (tests).
+    pub fn raster_pending(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// Chart bounds and metrics of the last frame.
@@ -247,45 +294,36 @@ impl MapPanel {
     fn prepare(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let metrics = layers::metrics(bounds);
         self.chart = Some((bounds, metrics));
-        let Some(presentation) = &self.presentation else {
-            self.base = None;
+        // Textures of replaced rasters: the frame that showed them is already submitted (Metal
+        // retains what in-flight command buffers use), and this frame paints the new one.
+        for image in self.retired.drain(..) {
+            window.drop_image(image).ok();
+        }
+        let Some(presentation) = self.presentation.clone() else {
+            self.pending = None;
+            if let Some(base) = self.base.take() {
+                window.drop_image(base.raster.image).ok();
+            }
             self.outlines = None;
             return;
         };
-        let fresh = self
-            .base
-            .as_ref()
-            .is_some_and(|base| base.layout_revision == presentation.layout_revision && base.bounds == bounds);
-        if !fresh {
-            let start = Instant::now();
-            let fills = Fills::build(&presentation.layout, &metrics);
-            self.stats.geometry_builds += 1;
-            self.stats.last_geometry = start.elapsed();
-            self.base = Some(Base {
-                layout_revision: presentation.layout_revision,
-                bounds,
-                fills,
-                marks_revision: 0,
-                marks: Marks::default(),
-            });
-        }
-        if let Some(base) = self.base.as_mut()
-            && base.marks_revision != presentation.revision
-        {
-            let start = Instant::now();
-            base.marks = Marks::build(&presentation.layout, &presentation.states, &metrics);
-            base.marks_revision = presentation.revision;
-            self.stats.marks_builds += 1;
-            self.stats.last_marks = start.elapsed();
+        let scale = window.scale_factor();
+        let key =
+            RasterKey { layout_revision: presentation.layout_revision, revision: presentation.revision, bounds, scale };
+        let current = self.base.as_ref().is_some_and(|base| base.key == key);
+        let building = self.pending.as_ref().is_some_and(|pending| pending.key == key);
+        if !current && !building {
+            self.pending = None; // Supersedes (cancels) an older job.
+            self.request_raster(key, metrics, cx);
         }
         let segments = self.outlined();
-        let key = (presentation.layout_revision, bounds, segments);
+        let key = (presentation.layout_revision, bounds, scale.to_bits(), segments);
         if self.outlines.as_ref().is_none_or(|outlines| outlines.key != key) {
             let start = Instant::now();
             let paths = segments
                 .iter()
                 .flatten()
-                .filter_map(|&index| layers::outline(&presentation.layout, &metrics, index))
+                .filter_map(|&index| layers::outline(&presentation.layout, &metrics, index, scale))
                 .collect();
             self.outlines = Some(Outlines { key, paths });
             self.stats.outline_builds += 1;
@@ -301,18 +339,69 @@ impl MapPanel {
         }
     }
 
+    /// Builds the base raster for `key` on the background executor; the result is adopted only if
+    /// no newer key superseded it meanwhile.
+    fn request_raster(&mut self, key: RasterKey, metrics: Metrics, cx: &mut Context<Self>) {
+        let Some(presentation) = &self.presentation else { return };
+        let Some(grid) = Grid::new(key.bounds, key.scale) else { return };
+        self.stats.raster_jobs += 1;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let job = cx.background_spawn({
+            let (layout, states) = (Arc::clone(&presentation.layout), Arc::clone(&presentation.states));
+            let cancelled = Arc::clone(&cancelled);
+            async move {
+                let start = Instant::now();
+                let is_cancelled = || cancelled.load(Ordering::Relaxed);
+                let pixels = layers::render(&layout, &states, &metrics, &grid, &is_cancelled)?;
+                let raster = Raster::from_premultiplied(pixels, grid)?;
+                Some((raster, start.elapsed()))
+            }
+        });
+        let task = cx.spawn(async move |map, cx| {
+            let Some((raster, elapsed)) = job.await else { return };
+            map.update(cx, |map, cx| map.adopt_raster(key, metrics, raster, elapsed, cx)).ok();
+        });
+        self.pending = Some(PendingRaster { key, cancelled, _task: task });
+    }
+
+    fn adopt_raster(
+        &mut self,
+        key: RasterKey,
+        metrics: Metrics,
+        raster: Raster,
+        elapsed: Duration,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending.as_ref().is_none_or(|pending| pending.key != key) {
+            return;
+        }
+        self.pending = None;
+        self.stats.raster_builds += 1;
+        self.stats.last_raster = elapsed;
+        self.stats.raster_bytes = raster.bytes();
+        if let Some(old) = self.base.replace(Base { key, metrics, raster }) {
+            self.retired.push(old.raster.image);
+        }
+        cx.notify();
+    }
+
     fn paint(&self, window: &mut Window) {
-        if let Some(base) = &self.base {
-            for (path, color) in &base.fills.paths {
-                window.paint_path(path.clone(), *color);
+        let start = Instant::now();
+        if let (Some(base), Some((bounds, metrics))) = (&self.base, &self.chart) {
+            let mut image_bounds = base.raster.grid.paint_bounds();
+            if base.key.bounds != *bounds || base.key.scale != window.scale_factor() {
+                // A newer raster is on its way: map this one onto the current chart meanwhile.
+                let factor = (metrics.outer_radius() / base.metrics.outer_radius()) as f32;
+                let (from, to) = (base.metrics.center, metrics.center);
+                image_bounds = Bounds::new(
+                    point(
+                        px(to.x as f32 + (f32::from(image_bounds.origin.x) - from.x as f32) * factor),
+                        px(to.y as f32 + (f32::from(image_bounds.origin.y) - from.y as f32) * factor),
+                    ),
+                    size(image_bounds.size.width * factor, image_bounds.size.height * factor),
+                );
             }
-            let ink = theme::color(theme::INK);
-            for path in base.marks.hatch.iter().chain(&base.marks.badges) {
-                window.paint_path(path.clone(), ink);
-            }
-            for path in &base.marks.glyphs {
-                window.paint_path(path.clone(), theme::color(theme::TEXT));
-            }
+            window.paint_image(image_bounds, Corners::default(), Arc::clone(&base.raster.image), 0, false).ok();
         }
         if let Some((_, metrics)) = &self.chart
             && self.pointer == Hit::Center
@@ -328,6 +417,7 @@ impl MapPanel {
                 window.paint_path(path.clone(), theme::white(layers::OUTLINE_ALPHA));
             }
         }
+        self.last_paint.set(start.elapsed());
     }
 
     // -----------------------------------------------------------------------------------------

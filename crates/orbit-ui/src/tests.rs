@@ -322,8 +322,13 @@ fn headless_frame_harness(cx: &mut TestAppContext) {
     let panels = cx.read(|cx| root.read(cx).panels().clone());
     let mut harness = FrameHarness::new(host.clone(), panels, HarnessScript::builtin());
     let mut all = Vec::new();
+    let map = panels_map(&root, cx);
+    let before = cx.read(|cx| map.read(cx).stats());
+    let mut map_paint = Vec::new();
     for step in HarnessScript::builtin().steps {
         let mut work = Vec::new();
+        // The test dispatcher runs background tasks inline: subtract the map's raster builds.
+        let mut ui = Vec::new();
         let handled = cx.read(|cx| host.read(cx).handled());
         let renders = crate::regions::ALL.map(|(region, _)| frame_stats::render_count(region));
         for frame in 0..step.frames() {
@@ -333,8 +338,13 @@ fn headless_frame_harness(cx: &mut TestAppContext) {
                 harness.drive(step, frame, cx);
                 root.update(cx, |_, cx| cx.notify());
             });
+            let builds = cx.read(|cx| map.read(cx).stats().raster_builds);
             cx.run_until_parked();
-            work.push(start.elapsed());
+            let elapsed = start.elapsed();
+            work.push(elapsed);
+            let stats = cx.read(|cx| map.read(cx).stats());
+            map_paint.push(stats.last_paint);
+            ui.push(if stats.raster_builds > builds { elapsed.saturating_sub(stats.last_raster) } else { elapsed });
         }
         let renders: Vec<String> = crate::regions::ALL
             .iter()
@@ -342,13 +352,30 @@ fn headless_frame_harness(cx: &mut TestAppContext) {
             .map(|((region, name), before)| format!("{name}={}", frame_stats::render_count(*region) - before))
             .collect();
         println!(
-            "{:<12} frame work (headless CPU): {} | events {} | renders {}",
+            "{:<12} frame work (headless CPU): {} | excl. background rasters: {} | events {} | renders {}",
             step.name(),
             Percentiles::of(&work),
+            Percentiles::of(&ui),
             cx.read(|cx| host.read(cx).handled()) - handled,
             renders.join(" ")
         );
         all.extend(work);
     }
     println!("{:<12} frame work (headless CPU): {}", "overall", Percentiles::of(&all));
+    let after = cx.read(|cx| map.read(cx).stats());
+    println!(
+        "map paint (UI thread, base image + outlines): {} | raster jobs {} builds {} (last {:.2} ms, {:.1} MB)",
+        Percentiles::of(&map_paint),
+        after.raster_jobs - before.raster_jobs,
+        after.raster_builds - before.raster_builds,
+        after.last_raster.as_secs_f64() * 1e3,
+        after.raster_bytes as f64 / 1e6,
+    );
+}
+
+fn panels_map(
+    root: &gpui::Entity<MainWindow>,
+    cx: &mut gpui::VisualTestContext,
+) -> gpui::Entity<crate::panels::map::MapPanel> {
+    cx.read(|cx| root.read(cx).panels().map.clone())
 }

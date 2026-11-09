@@ -4177,11 +4177,13 @@ version = "1.0.0-alpha.0"
 dependencies = [
  "futures",
  "gpui",
+ "image",
  "orbit-app-state",
  "orbit-core",
  "orbit-platform",
  "orbit-sunburst",
  "serde_json",
+ "tiny-skia",
  "unicode-segmentation",
 ]
 
