@@ -1074,7 +1074,8 @@ fn caption(state: &AppState) -> String {
     } else {
         "largest first"
     };
-    format!("{} items · {order}", theme::format_count(state.row_count() as u64))
+    let rows = state.row_count() as u64;
+    format!("{} {} · {order}", theme::format_count(rows), if rows == 1 { "item" } else { "items" })
 }
 
 /// Second status line: the hovered map path (`true`), or the search limit note.

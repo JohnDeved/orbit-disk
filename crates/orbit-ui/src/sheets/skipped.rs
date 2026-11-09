@@ -29,7 +29,13 @@ impl SheetsLayer {
                 theme::format_count(count),
                 if count == 1 { "item" } else { "items" }
             ),
-            (count, None) => format!("{} items could not be read.", theme::format_count(count)),
+            (count, None) => {
+                format!(
+                    "{} {} could not be read.",
+                    theme::format_count(count),
+                    if count == 1 { "item" } else { "items" }
+                )
+            }
         };
         let (issues, more) = snapshot.map_or((&[][..], 0), |snapshot| listed(&snapshot.issues, skipped));
         let more = (more > 0 && !issues.is_empty()).then(|| format!("and {} more", theme::format_count(more)));
