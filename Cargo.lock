@@ -4036,6 +4036,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "orbit-backend"
+version = "1.0.0-alpha.0"
+dependencies = [
+ "orbit-app-state",
+ "orbit-core",
+ "orbit-native",
+ "orbit-platform",
+ "parking_lot",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "orbit-bench"
 version = "1.0.0-alpha.0"
 dependencies = [
