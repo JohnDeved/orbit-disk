@@ -76,6 +76,7 @@ fn main() {
         let shell: Rc<dyn Shell> = Rc::new(shell::create());
         // Screenshots run without animations, whatever the OS preference.
         let marketing = args.marketing;
+        orbit_ui::native_window::install(Rc::clone(&shell), cx);
         orbit_ui::theme::set_reduce_motion(marketing.is_some() || shell.reduce_motion(), cx);
         orbit_ui::sheets::set_privacy_settings_url(shell.privacy_settings_url(), cx);
 

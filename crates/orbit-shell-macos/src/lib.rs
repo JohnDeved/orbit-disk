@@ -5,6 +5,7 @@
 //! `Sync`.
 #![cfg(target_os = "macos")]
 
+mod color;
 mod legacy;
 mod updater;
 
@@ -94,6 +95,13 @@ impl Shell for MacShell {
 
     fn updater(&self) -> Option<&dyn Updater> {
         self.updater.as_ref().map(|updater| updater as &dyn Updater)
+    }
+
+    fn prepare_window(&self, window: raw_window_handle::RawWindowHandle) {
+        if let raw_window_handle::RawWindowHandle::AppKit(handle) = window {
+            // SAFETY: the handle comes from a live GPUI window on the main thread.
+            unsafe { color::tag_layer_srgb(handle.ns_view.as_ptr()) };
+        }
     }
 
     fn import_legacy_settings(&self) -> Option<LegacySettings> {

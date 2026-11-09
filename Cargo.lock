@@ -4129,6 +4129,7 @@ name = "orbit-platform"
 version = "1.0.0-alpha.0"
 dependencies = [
  "libc",
+ "raw-window-handle",
  "thiserror 2.0.21",
 ]
 
@@ -4162,6 +4163,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "orbit-platform",
+ "raw-window-handle",
 ]
 
 [[package]]
@@ -4182,6 +4184,7 @@ dependencies = [
  "orbit-core",
  "orbit-platform",
  "orbit-sunburst",
+ "raw-window-handle",
  "serde_json",
  "tiny-skia",
  "unicode-segmentation",

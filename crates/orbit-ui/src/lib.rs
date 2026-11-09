@@ -22,6 +22,7 @@ pub mod icons;
 pub mod lifecycle;
 pub mod main_window;
 pub mod marketing;
+pub mod native_window;
 pub mod panels;
 pub mod regions;
 pub mod settings;

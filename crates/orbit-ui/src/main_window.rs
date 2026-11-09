@@ -327,6 +327,7 @@ pub fn open(host: &Host, harness: Option<HarnessScript>, cx: &mut App) -> gpui::
     let options = window_options(cx);
     let host = host.clone();
     cx.open_window(options, move |window, cx| {
+        crate::native_window::prepare(window, cx);
         let guard = host.clone();
         window.on_window_should_close(cx, move |_, cx| lifecycle::may_quit(&guard, cx));
         cx.new(|cx| MainWindow::new(host, harness, window, cx))

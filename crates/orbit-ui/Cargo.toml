@@ -19,6 +19,7 @@ gpui.workspace = true
 orbit-app-state.workspace = true
 orbit-core.workspace = true
 orbit-platform.workspace = true
+raw-window-handle.workspace = true
 orbit-sunburst.workspace = true
 image.workspace = true
 futures = { version = "0.3", default-features = false, features = ["std"] }

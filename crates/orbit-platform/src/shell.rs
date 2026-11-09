@@ -21,6 +21,12 @@ pub trait Shell: 'static {
 
     /// Settings saved by the previous (Swift) app, read once on first launch.
     fn import_legacy_settings(&self) -> Option<LegacySettings>;
+
+    /// Called once for every window right after it is created, with its native handle. The
+    /// macOS shell tags the window's Metal layer as sRGB so colors are color-managed exactly
+    /// like AppKit/SwiftUI content (GPUI leaves the layer untagged, which renders the palette
+    /// with the display's raw primaries).
+    fn prepare_window(&self, _window: raw_window_handle::RawWindowHandle) {}
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

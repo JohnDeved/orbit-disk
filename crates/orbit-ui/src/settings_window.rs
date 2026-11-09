@@ -130,7 +130,10 @@ pub fn open(shell: Rc<dyn Shell>, host: Host, cx: &mut App) -> gpui::Result<Wind
             show: true,
             ..Default::default()
         },
-        |window, cx| cx.new(|cx| SettingsWindow::new(shell, host, window, cx)),
+        |window, cx| {
+            crate::native_window::prepare(window, cx);
+            cx.new(|cx| SettingsWindow::new(shell, host, window, cx))
+        },
     )
 }
 
