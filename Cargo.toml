@@ -42,7 +42,7 @@ objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
-gpui = "0.2.2"
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
