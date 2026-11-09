@@ -140,8 +140,7 @@ fn format_row(state: &AppState, display: usize) -> Option<RowText> {
         "so far".into()
     } else if !filtering && meta.state == ScanState::Complete {
         let parent = state.folder().map_or(0, |f| f.folder_meta().size);
-        let share = if parent > 0 { meta.size as f64 / parent as f64 * 100.0 } else { 0.0 };
-        format!("{share:.1}%").into()
+        theme::format_percent(if parent > 0 { meta.size as f64 / parent as f64 } else { 0.0 }).into()
     } else {
         SharedString::default()
     };

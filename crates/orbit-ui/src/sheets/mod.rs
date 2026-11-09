@@ -406,8 +406,11 @@ pub(crate) fn sheet_button(
             (theme::color(theme::CORAL), theme::with_alpha(theme::CORAL, 0.85), theme::color(theme::CANVAS))
         }
     };
-    let fg = if enabled { fg } else { theme::with_alpha(theme::SLATE, 0.6) };
-    let bg = if enabled || style != SheetButton::Prominent { bg } else { theme::white(0.10) };
+    let (bg, fg) = match (enabled, style) {
+        (true, _) => (bg, fg),
+        (false, SheetButton::Prominent) => (theme::with_alpha(theme::CORAL, 0.42), theme::color(theme::SLATE)),
+        (false, _) => (bg, theme::with_alpha(theme::SLATE, 0.6)),
+    };
     let selector = id.to_string();
     div()
         .id(ElementId::Name(id))
@@ -420,7 +423,8 @@ pub(crate) fn sheet_button(
         .gap(px(6.))
         .h(theme::SHEET_BUTTON_HEIGHT)
         .px(px(14.))
-        .rounded(px(6.))
+        // Large native buttons are capsules.
+        .rounded_full()
         .bg(bg)
         .text_color(fg)
         .text_size(theme::TEXT_ROW)

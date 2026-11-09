@@ -90,7 +90,7 @@ impl Render for TrayPanel {
         let glyph = if !is_dragging && (validating || updating) {
             activity_indicator("tray-activity", px(18.), reduce_motion, Icon::Loader)
         } else {
-            icon(Icon::TrayDown).size(px(28.)).text_color(theme::color(theme::CORAL)).into_any_element()
+            icon(Icon::TrayDown).size(px(34.)).text_color(theme::color(theme::CORAL)).into_any_element()
         };
         let host = self.host.clone();
         let outline = div().absolute().top_0().left_0().size_full().rounded(theme::RADIUS_CARD);
@@ -150,7 +150,7 @@ impl Render for TrayPanel {
                     "tray-review",
                     "Review Collection",
                     Some(Icon::TrayFull),
-                    ButtonStyle::Bordered,
+                    ButtonStyle::Tinted,
                     can_review,
                     move |_, _, cx| host.send(Event::BeginReview, cx),
                 )))

@@ -1,4 +1,5 @@
 <!-- @license lucide-static v0.468.0 - ISC -->
+<!-- Derived: stroke width 0.8 (the 74-point ultralight welcome symbol). -->
 <svg
   class="lucide lucide-chart-pie"
   xmlns="http://www.w3.org/2000/svg"
@@ -7,7 +8,7 @@
   viewBox="0 0 24 24"
   fill="none"
   stroke="currentColor"
-  stroke-width="2"
+  stroke-width="0.8"
   stroke-linecap="round"
   stroke-linejoin="round"
 >

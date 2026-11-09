@@ -122,7 +122,7 @@ impl SheetsLayer {
                         .flex_row()
                         .items_center()
                         .gap(px(6.))
-                        .child(icon(Icon::Warning).size(px(12.)))
+                        .child(icon(Icon::Warning).size(px(12.)).text_color(theme::color(theme::DESTRUCTIVE)))
                         .child(
                             div()
                                 .flex_1()
@@ -259,7 +259,7 @@ impl SheetsLayer {
                 "review-delete",
                 "Delete Permanently…",
                 None,
-                SheetButton::Destructive,
+                SheetButton::Bordered,
                 removable,
                 begin(ConfirmKind::Permanent),
             ))
@@ -329,7 +329,10 @@ impl SheetsLayer {
                             .items_center()
                             .gap(px(6.))
                             .font_weight(theme::WEIGHT_MEDIUM)
-                            .child(icon(if item.is_dir() { Icon::Folder } else { Icon::File }))
+                            .child(
+                                icon(if item.is_dir() { Icon::Folder } else { Icon::File })
+                                    .text_color(theme::color(theme::CORAL)),
+                            )
                             .child(div().min_w_0().truncate().child(item.display_name())),
                     )
                     // Full path, wrapped, never truncated.

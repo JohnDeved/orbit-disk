@@ -128,8 +128,14 @@ pub const TEXT_TRAY: Pixels = px(14.);
 pub const TEXT_HEADING: Pixels = px(15.);
 pub const TEXT_TITLE: Pixels = px(17.);
 pub const TEXT_METRIC: Pixels = px(18.);
-pub const WEIGHT_MEDIUM: FontWeight = FontWeight::MEDIUM;
+/// SF Pro Medium. Core Text reports its weight as 0.23, which font-kit maps to CSS 530; a request
+/// for exactly 500 (`FontWeight::MEDIUM`) prefers the 400 Regular face under the CSS matching
+/// rules (weights at or below 500 search downwards first), so ask for the face itself.
+pub const WEIGHT_MEDIUM: FontWeight = FontWeight(530.);
 pub const WEIGHT_SEMIBOLD: FontWeight = FontWeight::SEMIBOLD;
+pub const WEIGHT_LIGHT: FontWeight = FontWeight::LIGHT;
+/// The rounded system design (`.system(…, design: .rounded)`): the map center value.
+pub const FONT_ROUNDED: &str = ".AppleSystemUIFontRounded";
 
 /// OpenType `tnum`: digits share one width so sizes do not jitter as they change.
 pub fn tabular_digits() -> FontFeatures {
@@ -145,37 +151,7 @@ pub fn monospaced_digits<E: Styled>(mut element: E) -> E {
 // ---------------------------------------------------------------------------------------------
 // Formatting shared by panels.
 
-/// Byte counts like Finder (decimal units): `"1.2 GB"`, `"512 bytes"`.
-pub fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 6] = ["KB", "MB", "GB", "TB", "PB", "EB"];
-    if bytes < 1000 {
-        return if bytes == 1 { "1 byte".into() } else { format!("{bytes} bytes") };
-    }
-    let mut value = bytes as f64 / 1000.0;
-    let mut unit = 0;
-    while value >= 999.95 && unit + 1 < UNITS.len() {
-        value /= 1000.0;
-        unit += 1;
-    }
-    if value >= 100.0 || unit == 0 {
-        format!("{value:.0} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-/// `12,345` (grouped thousands).
-pub fn format_count(count: u64) -> String {
-    let digits = count.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
+pub use crate::format::{format_bytes, format_count, format_percent};
 
 /// Lossy display text for a raw path or name.
 pub fn display(bytes: &[u8]) -> String {

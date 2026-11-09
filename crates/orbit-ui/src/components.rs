@@ -16,11 +16,17 @@ use crate::theme;
 pub enum ButtonStyle {
     /// Bordered neutral button (native `.bordered`).
     Bordered,
+    /// Bordered button with the accent tint (native `.bordered` under `.tint(accent)`): coral
+    /// label and icon on a faint warm fill — the explorer's actions (Up, inspector, tray).
+    Tinted,
     /// Filled coral button (native `.borderedProminent` with the accent tint).
     Prominent,
     /// Text-only.
     Plain,
 }
+
+/// The faint warm fill of [`ButtonStyle::Tinted`] buttons.
+const TINT_FILL: u32 = 0xffd2c4;
 
 /// A labeled button with an optional leading icon. Disabled buttons keep their size, use the
 /// default cursor and ignore clicks. Mouse-down does not propagate (title bar drags, rows).
@@ -34,13 +40,21 @@ pub fn button(
 ) -> impl IntoElement {
     let (bg, hover_bg, fg) = match style {
         ButtonStyle::Bordered => (theme::white(0.08), theme::white(0.14), theme::color(theme::TEXT)),
+        ButtonStyle::Tinted => {
+            (theme::with_alpha(TINT_FILL, 0.10), theme::with_alpha(TINT_FILL, 0.16), theme::color(theme::CORAL))
+        }
         ButtonStyle::Prominent => {
             (theme::color(theme::CORAL), theme::with_alpha(theme::CORAL, 0.85), theme::color(theme::CANVAS))
         }
         ButtonStyle::Plain => (theme::white(0.0), theme::white(0.07), theme::color(theme::TEXT)),
     };
-    let fg = if enabled { fg } else { theme::with_alpha(theme::SLATE, 0.6) };
-    let bg = if enabled || style != ButtonStyle::Prominent { bg } else { theme::white(0.10) };
+    // Disabled: native dims the label; a prominent button keeps a muted coral fill.
+    let (bg, fg) = match (enabled, style) {
+        (true, _) => (bg, fg),
+        (false, ButtonStyle::Prominent) => (theme::with_alpha(theme::CORAL, 0.42), theme::color(theme::SLATE)),
+        (false, ButtonStyle::Tinted) => (theme::with_alpha(TINT_FILL, 0.05), theme::with_alpha(theme::CORAL, 0.38)),
+        (false, _) => (bg, theme::with_alpha(theme::SLATE, 0.6)),
+    };
     let mut element = div()
         .id(id.into())
         .flex()
@@ -51,6 +65,8 @@ pub fn button(
         .h(px(28.))
         .px(px(10.))
         .rounded(px(6.))
+        // The prominent action is a native capsule.
+        .when(style == ButtonStyle::Prominent, |el| el.rounded_full())
         .bg(bg)
         .text_color(fg)
         .text_size(theme::TEXT_ROW)

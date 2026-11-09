@@ -48,8 +48,9 @@ icons! {
     ArrowDown => "arrow-down", "arrow.down";
     ArrowUp => "arrow-up", "arrow.up";
     ArrowUpRight => "arrow-up-right", "arrow.up.forward";
-    ChartPie => "chart-pie", "chart.pie";
+    ChartPie => "chart-pie-light", "chart.pie (ultralight)";
     Check => "check", "checkmark";
+    ChevronDown => "chevron-down", "chevron.down";
     ChevronRight => "chevron-right", "chevron.right";
     ChevronUp => "chevron-up", "chevron.up";
     CircleArrowDown => "circle-arrow-down", "arrow.down.circle";
@@ -86,9 +87,11 @@ icons! {
     Warning => "triangle-alert", "exclamationmark.triangle";
 }
 
-/// A 14 × 14 icon element; size and color it like text (`.size(..)`, `.text_color(..)`).
+/// A 14 × 14 white icon element; size and color it like text (`.size(..)`, `.text_color(..)`).
+/// GPUI paints an SVG only in its own text color (it does not inherit the parent's), so the
+/// default is the primary text color rather than nothing.
 pub fn icon(icon: Icon) -> Svg {
-    svg().path(icon.path()).size(px(14.)).flex_none()
+    svg().path(icon.path()).size(px(14.)).flex_none().text_color(crate::theme::color(crate::theme::TEXT))
 }
 
 /// Compile-time embedded assets (icons). Pass to `Application::with_assets`.
