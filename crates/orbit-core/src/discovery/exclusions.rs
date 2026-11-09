@@ -105,27 +105,13 @@ fn path_bytes(path: &Path) -> Vec<u8> {
     }
 }
 
-/// Removes `.` components, repeated and trailing separators, and resolves `..` lexically.
-pub fn standardize(path: &[u8]) -> Vec<u8> {
-    let mut parts: Vec<&[u8]> = Vec::new();
-    for part in path.split(|b| *b == SEP) {
-        match part {
-            b"" | b"." => {}
-            b".." => {
-                parts.pop();
-            }
-            other => parts.push(other),
-        }
-    }
-    let mut out = Vec::with_capacity(path.len());
-    for part in parts {
-        out.push(SEP);
-        out.extend_from_slice(part);
-    }
-    if out.is_empty() {
-        out.push(SEP);
-    }
-    out
+/// [`crate::paths::standardize`] for exclusion roots, which are absolute; a relative path is
+/// treated as if it started at `/`.
+fn standardize(path: &[u8]) -> Vec<u8> {
+    let mut absolute = Vec::with_capacity(path.len() + 1);
+    absolute.push(SEP);
+    absolute.extend_from_slice(path);
+    crate::paths::standardize(&absolute).expect("absolute")
 }
 
 /// Two spellings reach the same directory, checked through the nearest existing ancestor pair
@@ -149,17 +135,4 @@ fn same_directory<P: Platform>(platform: &P, a: &[u8], b: &[u8]) -> bool {
         }
     }
     false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn standardize_is_lexical() {
-        assert_eq!(standardize(b"/a//b/./c/"), b"/a/b/c");
-        assert_eq!(standardize(b"/a/b/../c"), b"/a/c");
-        assert_eq!(standardize(b"/"), b"/");
-        assert_eq!(standardize(b"/.."), b"/");
-    }
 }

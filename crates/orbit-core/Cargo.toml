@@ -24,12 +24,10 @@ caseless.workspace = true
 hashbrown = { version = "0.15", default-features = false, features = ["inline-more"] }
 foldhash = "0.1"
 # Name-sort collation (numeric, locale-aware); see `collate`.
-icu_collator = "2.4"
-icu_locale_core = "2.4"
+icu_collator.workspace = true
+icu_locale_core.workspace = true
 
-# The removal journal and the stage/root leases need `openat`/`unlinkat`/`fdopendir`/`mkdirat`,
-# which `orbit_platform::posix` does not expose yet. All uses live in `journal::sys` and
-# `lease::sys` and are portable POSIX.
+# Flags and modes for `orbit_platform::posix` (journal, leases, removal); portable POSIX only.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 

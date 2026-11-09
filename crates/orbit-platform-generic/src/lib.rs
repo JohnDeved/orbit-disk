@@ -177,9 +177,12 @@ impl Platform for GenericPlatform {
             .filter(|p| p.is_absolute())
             .map(|dir| dir.join("orbit-disk"))
             .unwrap_or_else(|| std::env::temp_dir().join(format!("orbit-disk-{euid}")));
+        let support = xdg("XDG_DATA_HOME", ".local/share").join("orbit-disk/engine");
         AppDirs {
             cache: xdg("XDG_CACHE_HOME", ".cache").join("orbit-disk/maps"),
-            support: xdg("XDG_DATA_HOME", ".local/share").join("orbit-disk/engine"),
+            removal_journal: support.clone(),
+            obsolete_caches: Vec::new(),
+            support,
             settings: xdg("XDG_CONFIG_HOME", ".config").join("orbit-disk"),
             runtime,
         }

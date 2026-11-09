@@ -25,6 +25,34 @@ pub fn file_name(path: &[u8]) -> &[u8] {
     memchr::memrchr(SEP, path).map_or(path, |i| &path[i + 1..])
 }
 
+/// Lexically normalizes an absolute path: drops empty and `.` components, applies `..` (never
+/// above `/`), removes a trailing slash. `None` for relative or empty paths. Does not touch the
+/// filesystem and never changes component bytes.
+pub fn standardize(path: &[u8]) -> Option<Vec<u8>> {
+    if path.first() != Some(&SEP) {
+        return None;
+    }
+    let mut components: Vec<&[u8]> = Vec::new();
+    for component in path.split(|b| *b == SEP) {
+        match component {
+            b"" | b"." => {}
+            b".." => {
+                components.pop();
+            }
+            name => components.push(name),
+        }
+    }
+    let mut out = Vec::with_capacity(path.len());
+    for component in &components {
+        out.push(SEP);
+        out.extend_from_slice(component);
+    }
+    if out.is_empty() {
+        out.push(SEP);
+    }
+    Some(out)
+}
+
 pub fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(dir.len() + 1 + name.len());
     out.extend_from_slice(dir);

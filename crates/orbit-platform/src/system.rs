@@ -59,12 +59,30 @@ pub struct ProtectedPaths {
     pub volumes_root: Option<PathBuf>,
 }
 
+/// Spellings under which the OS exposes one folder at several absolute paths, independent of
+/// any mapped root. The removal journal canonicalizes item paths with them so records written by
+/// earlier builds keep matching.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PathAliases {
+    /// Mount path of the writable data volume whose folders also appear at `/` (macOS:
+    /// `/System/Volumes/Data`).
+    pub data_volume: Option<Vec<u8>>,
+    /// A prefix the OS hides from resolved paths when the shorter path exists (macOS: `/private`).
+    pub hidden_prefix: Option<Vec<u8>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppDirs {
     /// Rebuildable data: saved maps and search caches.
     pub cache: PathBuf,
-    /// Durable app data: mapping stages, removal journal, locks.
+    /// Durable app data: mapping stages and locks.
     pub support: PathBuf,
+    /// Parent of the cache-wide removal journal (`.orbit-removals`). On macOS this is the Swift
+    /// app's `Mapping` directory so journals written before the update are recovered, never lost.
+    pub removal_journal: PathBuf,
+    /// Cache directories of earlier builds whose contents can never be read again (old formats).
+    /// Deleted once on startup. Never contains anything durable such as the removal journal.
+    pub obsolete_caches: Vec<PathBuf>,
     /// User preferences (Places, last location).
     pub settings: PathBuf,
     /// Per-user private runtime directory for the automation socket (mode 0700).

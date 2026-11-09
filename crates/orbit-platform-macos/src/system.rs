@@ -351,9 +351,14 @@ pub fn user_temp_dir() -> PathBuf {
 pub fn app_dirs() -> AppDirs {
     let home = home_dir();
     let support = home.join("Library/Application Support").join(BUNDLE_ID);
+    let caches = home.join("Library/Caches").join(BUNDLE_ID);
     AppDirs {
-        cache: home.join("Library/Caches").join(BUNDLE_ID).join("Maps"),
+        cache: caches.join("Maps"),
         support: support.join("Engine"),
+        // Swift `IndexLocations.locks(for:)`: the removal journal lives in `<support>/Mapping`.
+        removal_journal: support.join("Mapping"),
+        // Swift format-5 saved maps; the user chose to discard them rather than migrate.
+        obsolete_caches: vec![caches.join("Indexes")],
         settings: support.join("Settings"),
         // Must match the Swift automation endpoint so existing clients find the socket.
         // SAFETY: geteuid has no preconditions.
