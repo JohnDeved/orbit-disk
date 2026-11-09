@@ -9,3 +9,4 @@ Assets/*.iconset/
 __pycache__/
 *.pyc
 /target/
+.claude/

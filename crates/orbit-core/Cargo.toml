@@ -9,6 +9,21 @@ publish.workspace = true
 
 [dependencies]
 orbit-platform.workspace = true
+parking_lot.workspace = true
+crossbeam-deque.workspace = true
+crossbeam-channel.workspace = true
+memchr.workspace = true
+smallvec.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
+caseless.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+orbit-native.workspace = true
 
 [lints]
 workspace = true
