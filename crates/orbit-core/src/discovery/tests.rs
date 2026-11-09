@@ -337,26 +337,35 @@ fn cancellation_fences_live_and_durable_publication() {
     for i in 0..60 {
         write(&root.join(format!("d{i}/f")), 1);
     }
+    // Every worker that reaches ticket 10 or later parks until the test has cancelled, so the
+    // number of listed folders is bounded no matter how the scheduler interleaves workers.
     struct Gate {
         reached: Barrier,
-        release: Barrier,
+        released: Mutex<bool>,
+        wake: Condvar,
     }
     impl DiscoveryHooks for Gate {
         fn before_directory(&self, _path: &[u8], ticket: u64) {
             if ticket == 10 {
                 self.reached.wait();
-                self.release.wait();
+            }
+            if ticket >= 10 {
+                let mut released = self.released.lock();
+                while !*released {
+                    self.wake.wait(&mut released);
+                }
             }
         }
     }
-    let gate = Arc::new(Gate { reached: Barrier::new(2), release: Barrier::new(2) });
+    let gate = Arc::new(Gate { reached: Barrier::new(2), released: Mutex::new(false), wake: Condvar::new() });
     let (platform, live, mailbox, cancel) = setup(&root);
     let options = DiscoveryOptions { workers: 4, hooks: Some(gate.clone()), ..DiscoveryOptions::default() };
     let handle = start(platform, mailbox.clone(), live.clone(), options, cancel).unwrap();
     gate.reached.wait();
     handle.cancel();
     let revision = live.revision();
-    gate.release.wait();
+    *gate.released.lock() = true;
+    gate.wake.notify_all();
     let report = handle.join();
     assert!(report.cancelled);
     assert_eq!(live.revision(), revision, "nothing reached the live inventory after cancel");

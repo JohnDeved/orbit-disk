@@ -465,11 +465,18 @@ impl<P: Platform> Shared<P> {
         while let Some(task) = self.next_task(index, local) {
             let claimed = match task {
                 Task::Queued(job) => {
-                    let node = if job.parent == NONE {
-                        self.live.claim_root().then_some(crate::live::arena::ROOT)
-                    } else {
-                        let name = &job.components.last().expect("child jobs have components").name;
-                        self.live.claim_child(job.parent, name, job.identity)
+                    // Claims mutate the live inventory, so they sit behind the same fence as
+                    // publication: nothing changes after `cancel` returns.
+                    let node = {
+                        let _fence = self.publication.read();
+                        if self.cancel.is_cancelled() {
+                            None
+                        } else if job.parent == NONE {
+                            self.live.claim_root().then_some(crate::live::arena::ROOT)
+                        } else {
+                            let name = &job.components.last().expect("child jobs have components").name;
+                            self.live.claim_child(job.parent, name, job.identity)
+                        }
                     };
                     let bytes = job.byte_count();
                     self.frontier_bytes.fetch_sub(bytes, Ordering::Relaxed);
@@ -587,7 +594,14 @@ impl<P: Platform> Shared<P> {
             if self.preference_active.load(Ordering::Acquire) {
                 let preferred = self.preferred.lock().clone();
                 if let Some(path) = preferred {
-                    match self.live.claim_toward(&path) {
+                    let claimed = {
+                        let _fence = self.publication.read();
+                        if self.cancel.is_cancelled() {
+                            return None;
+                        }
+                        self.live.claim_toward(&path)
+                    };
+                    match claimed {
                         Preferred::Claimed(dir) => {
                             self.outstanding.fetch_add(1, Ordering::AcqRel);
                             return Some(Task::Preferred(dir));
