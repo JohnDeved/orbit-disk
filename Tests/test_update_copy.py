@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import plistlib
 from pathlib import Path
 import tempfile
@@ -12,6 +13,17 @@ copy = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(copy)
 
 
+def vendor_framework():
+    """The pinned, unmodified Sparkle framework: `ORBIT_SPARKLE_DIR` (made by
+    `cargo xtask sparkle DIR`), or SwiftPM's resolved artifact while the Swift app still exists."""
+    if os.environ.get("ORBIT_SPARKLE_DIR"):
+        return Path(os.environ["ORBIT_SPARKLE_DIR"]) / "Sparkle.framework"
+    swiftpm = ROOT / ".build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+    if swiftpm.is_dir():
+        return swiftpm
+    raise SystemExit("Set ORBIT_SPARKLE_DIR to a directory created by `cargo xtask sparkle DIR`")
+
+
 class UpdateCopyTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -19,7 +31,7 @@ class UpdateCopyTests(unittest.TestCase):
         self.framework = Path(self.directory.name) / "Sparkle.framework"
         self.strings = self.framework / "Versions/Current/Resources/Base.lproj/Sparkle.strings"
         self.strings.parent.mkdir(parents=True)
-        vendor = ROOT / ".build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework/Versions/Current/Resources/Base.lproj/Sparkle.strings"
+        vendor = vendor_framework() / "Versions/Current/Resources/Base.lproj/Sparkle.strings"
         self.original = plistlib.loads(vendor.read_bytes())
         self.strings.write_bytes(plistlib.dumps(self.original, fmt=plistlib.FMT_BINARY))
 

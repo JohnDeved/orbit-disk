@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for Contents/MacOS/OrbitDisk and OrbitControl (Developer ID
+  signing in scripts/sign-release.sh). Deliberately empty; see RELEASING.md, "Entitlements":
+  - GPUI loads a precompiled metallib (new_library_with_data): no JIT or unsigned executable memory.
+  - Sparkle.framework is loaded at runtime from Contents/Frameworks and signed with the same
+    Developer ID, so library validation stays enabled.
+  - No Apple Events, no App Sandbox; disk access is governed by TCC (Full Disk Access), not entitlements.
+  Add a key here only with a reason recorded in RELEASING.md.
+-->
+<plist version="1.0">
+<dict/>
+</plist>
