@@ -9,6 +9,14 @@ publish.workspace = true
 
 [dependencies]
 orbit-core.workspace = true
+orbit-platform.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "algorithms"
+harness = false
 
 [lints]
 workspace = true
