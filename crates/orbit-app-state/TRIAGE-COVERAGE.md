@@ -73,7 +73,7 @@ relative to the crate (`tests::…` under `src/tests/`; unit tests sit in their 
 | OrbitAppChecks.swift:1097 | scan root change invalidates drag payloads | test | `collection::drag_payloads_are_single_use_and_invalidated_by_new_drags_and_root_changes` |
 | OrbitAppChecks.swift:1136 | mapped roots and protected folders never removable | test | `collection::drops_collapse_descendants_report_included_and_reject_ineligible_items` |
 | OrbitAppChecks.swift:1155 | confirmed permanent removal runs in background | test | `removal::removal_locks_the_collection_and_merges_into_its_owner_after_a_switch` |
-| OrbitAppChecks.swift:1161 | nested symlink target untouched by directory removal | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
+| OrbitAppChecks.swift:1161 | nested symlink target untouched by directory removal | backend | orbit-core `journal::tests::directory_deletion_unlinks_nested_symlinks_without_following_them` |
 | OrbitAppChecks.swift:1164 | changed identities refused and kept reviewable | test | `removal::partial_failures_keep_survivors_reviewable_and_refresh_their_parents` |
 | OrbitAppChecks.swift:1171 | removal outcome survives ensuing map update | test | `removal::partial_failures_keep_survivors_reviewable_and_refresh_their_parents` |
 | OrbitAppChecks.swift:1181 | index refreshes removed and rejected replacement paths | test | `removal::partial_failures_keep_survivors_reviewable_and_refresh_their_parents` |
@@ -121,21 +121,21 @@ relative to the crate (`tests::…` under `src/tests/`; unit tests sit in their 
 | OrbitCollectionSessionChecks/main.swift:226 | row action from dismissed review leaves reopened review alone | test | `collection::review_tokens_reject_stale_actions_and_confirmation_holds_publication` |
 | OrbitCollectionSessionChecks/main.swift:248 | rejected-outer-open-no-claim | design | design: events are applied one at a time and no observer runs inside a transition, so reentrant notifications cannot occur |
 | OrbitCollectionSessionChecks/main.swift:257 | rejected outer open does not claim reentrant review | design | design: events are applied one at a time and no observer runs inside a transition, so reentrant notifications cannot occur |
-| OrbitDurableRemovalChecks/main.swift:129 | replaced journal forces reconciliation before retiring state | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitDurableRemovalChecks/main.swift:131 | published cursor cannot retire newer deletion | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
+| OrbitDurableRemovalChecks/main.swift:129 | replaced journal forces reconciliation before retiring state | backend | orbit-core `recovery::tests::replaced_journal_forces_full_reconciliation`; orbit-core `recovery::tests::replaced_journal_blocks_the_stage_and_requests_full_reconciliation` |
+| OrbitDurableRemovalChecks/main.swift:131 | published cursor cannot retire newer deletion | backend | orbit-core `recovery::tests::high_water_fence_refuses_a_stale_publication`; orbit-core `recovery::tests::replay_never_consumes_beyond_its_captured_high_water` |
 | OrbitDurableRemovalChecks/main.swift:175 | overflowing parent recovery falls back to full refresh | test | `removal::too_many_changed_parents_fall_back_to_a_full_refresh` |
-| OrbitDurableRemovalChecks/main.swift:260 | cancelled refresh keeps published snapshot | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitDurableRemovalChecks/main.swift:263 | cancel during recovery publication keeps snapshot | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitDurableRemovalChecks/main.swift:326 | cumulative overflow across refreshes reconciled | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitDurableRemovalChecks/main.swift:352 | SIGKILL bulk removal reconciles without full stage scan | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitDurableRemovalChecks/main.swift:386 | unchanged live polls keep map epoch | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core); RemovalReplay is only sent on change |
-| OrbitDurableRemovalChecks/main.swift:390 | overlapping live operation barrier | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitDurableRemovalChecks/main.swift:400 | refresh retry publishes both removals | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitDurableRemovalChecks/main.swift:409 | failed removal restored after pending intent | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitDurableRemovalChecks/main.swift:453 | stage removal reconciled on reopen after SIGKILL | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitDurableRemovalChecks/main.swift:460 | stage-recreated identity shown, stale row not | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitDurableRemovalChecks/main.swift:461 | saved map reconciled after SIGKILL without event history | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitDurableRemovalChecks/main.swift:461 | overlapping nested saved maps reconcile after kill | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
+| OrbitDurableRemovalChecks/main.swift:260 | cancelled refresh keeps published snapshot | backend | orbit-core `recovery::tests::cancelled_reconciliation_keeps_the_published_map` |
+| OrbitDurableRemovalChecks/main.swift:263 | cancel during recovery publication keeps snapshot | backend | partly: orbit-core `stage::tests::recovery_copy_replaces_the_map_only_through_the_fence` (a cancel inside `publish_recovery_copy` is not asserted) |
+| OrbitDurableRemovalChecks/main.swift:326 | cumulative overflow across refreshes reconciled | backend | not yet asserted in orbit-core (an overflow built up from several operations) |
+| OrbitDurableRemovalChecks/main.swift:352 | SIGKILL bulk removal reconciles without full stage scan | backend | partly: orbit-core `journal::tests::killed_removal_run_is_reconciled_at_each_step_boundary` (one item, not a bulk run) |
+| OrbitDurableRemovalChecks/main.swift:386 | unchanged live polls keep map epoch | backend | by design in orbit-backend: `RemovalReplay` is sent only when journal recovery at mapping start reports a live operation; nothing polls |
+| OrbitDurableRemovalChecks/main.swift:390 | overlapping live operation barrier | backend | orbit-core `recovery::tests::live_operation_is_never_retired_by_a_saved_map`; orbit-core `recovery::tests::fresh_stage_anchors_before_the_first_live_operation` |
+| OrbitDurableRemovalChecks/main.swift:400 | refresh retry publishes both removals | backend | orbit-core `recovery::tests::high_water_fence_refuses_a_stale_publication` |
+| OrbitDurableRemovalChecks/main.swift:409 | failed removal restored after pending intent | backend | partly: orbit-core `journal::tests::killed_removal_run_is_reconciled_at_each_step_boundary` (an abandoned intent keeps the item) |
+| OrbitDurableRemovalChecks/main.swift:453 | stage removal reconciled on reopen after SIGKILL | backend | partly: orbit-core `recovery::tests::anchor_capture_race_and_unanchored_stage_replay_everything` (reopened stage replays; no kill) |
+| OrbitDurableRemovalChecks/main.swift:460 | stage-recreated identity shown, stale row not | backend | not yet asserted for a stage; saved-map analogue orbit-core `recovery::tests::replaced_item_and_parent_keep_the_new_versions` |
+| OrbitDurableRemovalChecks/main.swift:461 | saved map reconciled after SIGKILL without event history | backend | orbit-core `journal::tests::killed_removal_run_is_reconciled_at_each_step_boundary` |
+| OrbitDurableRemovalChecks/main.swift:461 | overlapping nested saved maps reconcile after kill | backend | orbit-backend `tests/engine.rs::nested_saved_maps_both_reconcile_a_removal_after_reopening` |
 | OrbitFailureRecoveryChecks/main.swift:38 | saved-refresh-failure-resumes-stage | test | `misc::monitor_changes_debounce_into_one_refresh_and_a_failed_update_pauses`; journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
 | OrbitFailureRecoveryChecks/main.swift:45 | offscreen-failure-resumes-stage | test | `mapping::mapping_failure_keeps_the_partial_map_and_offscreen_failures_stay_offscreen` |
 | OrbitFailureRecoveryChecks/main.swift:49 | onscreen-failure-resumes-stage | test | `mapping::mapping_failure_keeps_the_partial_map_and_offscreen_failures_stay_offscreen` |
@@ -251,11 +251,11 @@ relative to the crate (`tests::…` under `src/tests/`; unit tests sit in their 
 | OrbitRemovalStartChecks/main.swift:40 | activity-switch-keeps-owner | test | `removal::removal_locks_the_collection_and_merges_into_its_owner_after_a_switch`; design: events are applied one at a time and no observer runs inside a transition, so reentrant notifications cannot occur |
 | OrbitRemovalStartChecks/main.swift:42 | published-switch-keeps-owner | design | design: events are applied one at a time and no observer runs inside a transition, so reentrant notifications cannot occur |
 | OrbitRemovalStartChecks/main.swift:44 | same-root-feedback-no-duplicate-removal | test | `misc::automation_collects_and_removes_on_a_partial_map_with_its_own_receipt` |
-| OrbitResumableChecks/main.swift:66 | saved-map-first SIGKILL resume keeps collection and selection | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitResumableChecks/main.swift:70 | partial-map-first SIGKILL resume keeps collection | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitResumableChecks/main.swift:92 | reopen after stage publication reflects updated snapshot | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitResumableChecks/main.swift:112 | staged partial map survives cache purge | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitResumableChecks/main.swift:282 | own-index-and-stage-excluded | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
+| OrbitResumableChecks/main.swift:66 | saved-map-first SIGKILL resume keeps collection and selection | backend | partly: orbit-core `stage::tests::crash_after_clone_keeps_the_old_map_and_the_orphan`; orbit-core `tests/session.rs::a_killed_session_resumes_committed_work` |
+| OrbitResumableChecks/main.swift:70 | partial-map-first SIGKILL resume keeps collection | backend | orbit-backend `tests/engine.rs::a_stopped_mapping_resumes_its_stage_with_the_collection` (a stop instead of SIGKILL); orbit-core `tests/session.rs::a_killed_session_resumes_committed_work` |
+| OrbitResumableChecks/main.swift:92 | reopen after stage publication reflects updated snapshot | backend | orbit-backend `tests/engine.rs::refresh_converges_and_reopening_reuses_the_saved_map_without_rescanning` |
+| OrbitResumableChecks/main.swift:112 | staged partial map survives cache purge | backend | by layout: stages live under the support folder (`IndexPaths::staging`), which a cache purge does not reach |
+| OrbitResumableChecks/main.swift:282 | own-index-and-stage-excluded | backend | orbit-backend `tests/engine.rs::refresh_converges_and_reopening_reuses_the_saved_map_without_rescanning` (index and stage inside the mapped root) |
 | OrbitSavedSearchChecks/model.swift:33 | saved-search-hides-deletions-while-refresh-gated | gap | saved search with a removal overlay while refresh is gated |
 | OrbitSavedSearchChecks/model.swift:49 | switch-from-removal-notification-restores-session | design | design: events are applied one at a time and no observer runs inside a transition, so reentrant notifications cannot occur |
 | OrbitSearchInterruptionChecks.swift:21 | stopped-preview-search-resumes | test | `search::pausing_completes_a_preview_search_without_restarting_mapping` |
@@ -266,7 +266,7 @@ relative to the crate (`tests::…` under `src/tests/`; unit tests sit in their 
 | OrbitSessionChecks/main.swift:66 | known-file-share-progress | test | `footer::tests::indexed_share_never_implies_discovery_finished_or_exceeds_found` |
 | OrbitSessionChecks/main.swift:145 | offscreen-progress-reads-finished-memory | test | `mapping::unfinished_session_continues_offscreen_and_its_completion_applies_on_return` |
 | OrbitSessionChecks/main.swift:188 | discovery-completion-during-cache-backlog | test | `footer::tests::indexed_share_never_implies_discovery_finished_or_exceeds_found` |
-| OrbitSessionChecks/main.swift:244 | progress-lease-teardown | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
+| OrbitSessionChecks/main.swift:244 | progress-lease-teardown | backend | orbit-backend `tests/engine.rs::a_stopped_mapping_resumes_its_stage_with_the_collection`; orbit-core `lease::tests::stage_lease_is_exclusive_and_released_on_drop` |
 | OrbitSessionChecks/main.swift:293 | late-progress-cannot-replace-newer-revision | test | `mapping::older_progress_and_superseded_preview_reads_never_replace_newer_state` |
 | OrbitSessionChecks/main.swift:300 | resumed-stage-revision-sequence | design | design: the layout and child list are keyed on the map revision bumped by every install; carried progress restarts at revision 0 |
 | OrbitSessionChecks/main.swift:321 | navigating partial map retains root-wide discovery | test | `mapping::partial_map_is_browsable_and_publication_keeps_route_selection_and_collection` |
@@ -283,7 +283,7 @@ relative to the crate (`tests::…` under `src/tests/`; unit tests sit in their 
 | OrbitSessionChecks/main.swift:409 | replacement-at-same-path-scans-fresh | test | `mapping::replaced_item_at_a_mapped_path_is_mapped_fresh` |
 | OrbitSessionChecks/main.swift:422 | stopped-mapping-resume | test | `mapping::pause_keeps_the_partial_map_and_resume_continues_in_a_new_session` |
 | OrbitSessionChecks/main.swift:429 | stopped mapping retains counts; resume continues stage | test | `mapping::pause_keeps_the_partial_map_and_resume_continues_in_a_new_session` |
-| OrbitSessionChecks/main.swift:462 | symlinked directory not reachable from its host | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
+| OrbitSessionChecks/main.swift:462 | symlinked directory not reachable from its host | backend | partly: orbit-core `discovery::tests::discovered_tree_matches_reference_walk` (nothing below the link is discovered) |
 | OrbitSessionChecks/main.swift:471 | stale-resolution-cannot-switch-root | test | `mapping::stale_resolution_and_preview_work_cannot_replace_a_newer_root` |
 | OrbitSessionChecks/main.swift:477 | removal-during-held-deletion | test | `removal::publication_during_a_held_removal_keeps_the_removal_status`; `footer::tests::pending_updates_withhold_counts_and_paused_updates_offer_refresh` |
 | OrbitSessionChecks/main.swift:492 | held deletion not displayed as fully saved | test | `footer::tests::pending_updates_withhold_counts_and_paused_updates_offer_refresh` |
@@ -294,14 +294,14 @@ relative to the crate (`tests::…` under `src/tests/`; unit tests sit in their 
 | OrbitSessionChecks/main.swift:522 | removals in two locations complete independently | test | `removal::removals_in_two_sessions_complete_independently` |
 | OrbitSessionChecks/main.swift:543 | scan-save-status-during-held-removal | test | `removal::publication_during_a_held_removal_keeps_the_removal_status` |
 | OrbitSessionChecks/main.swift:555 | partial-deletion-held-map | test | `collection::drag_payloads_are_single_use_and_invalidated_by_new_drags_and_root_changes` |
-| OrbitSessionChecks/main.swift:568 | async discovery completes folder while writer held | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
+| OrbitSessionChecks/main.swift:568 | async discovery completes folder while writer held | backend | orbit-core `discovery::tests::discovered_tree_matches_reference_walk` (discovery finishes with no consumer) |
 | OrbitSessionChecks/main.swift:576 | file drop accepted while mapping held | test | `mapping::partial_map_is_browsable_and_publication_keeps_route_selection_and_collection` |
 | OrbitSessionChecks/main.swift:582 | drag does not cross mapped roots | test | `collection::drag_payloads_are_single_use_and_invalidated_by_new_drags_and_root_changes` |
 | OrbitSessionChecks/main.swift:589 | discovered folder drop accepted after switching back | gap | discovered folder drop after switching back |
 | OrbitSessionChecks/main.swift:603 | retained-saved-item-collectable | gap | saved item collectable while its session reopens |
 | OrbitSessionChecks/main.swift:612 | saved-map item collectable while session opens | gap | saved item collectable while its session reopens |
-| OrbitSessionChecks/main.swift:671 | stopped removal row not visible before durable replay | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
-| OrbitSessionChecks/main.swift:681 | stage replay publishes deletion or recreated identity | backend | journal / stage / scanner behavior of the `Backend` implementation (orbit-core) |
+| OrbitSessionChecks/main.swift:671 | stopped removal row not visible before durable replay | backend | partly: orbit-core `recovery::tests::fresh_stage_anchors_before_the_first_live_operation`; orbit-core `recovery::tests::replay_cancellation_and_root_replacement_keep_the_cursor` |
+| OrbitSessionChecks/main.swift:681 | stage replay publishes deletion or recreated identity | backend | deletion: orbit-core `tests/session.rs::a_removal_during_mapping_is_replayed_before_publication`; recreated identity not yet asserted |
 | OrbitSessionChecks/main.swift:692 | pending-file-deletion-during-interaction | test | `mapping::gesture_holds_updates_and_applies_them_in_order_on_release` |
 | OrbitSessionChecks/main.swift:708 | pending deletion keeps map revision during interaction | test | `mapping::gesture_holds_updates_and_applies_them_in_order_on_release` |
 | OrbitSessionChecks/main.swift:739 | delete-open-scanning-folder-redirects | test | `mapping::deleting_the_open_folder_during_mapping_returns_to_its_parent` |

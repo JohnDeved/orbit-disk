@@ -23,7 +23,8 @@ Seam and wiring changes that agents requested. The integrator applies them once 
   - `search::PreparedKey` (database path + file stamps)
   - `discovery::ListingCache`
 - [x] The mapping session replaces `ResumableStage`: discovery + `Mailbox` + `Stage::step` loop + publish + live inventory.
-- [ ] A real `orbit_app_state::Backend` over orbit-core.
+- [x] A real `orbit_app_state::Backend` over orbit-core (`orbit-backend::EngineBackend`;
+  the app builds it with `EngineBackend::new(Arc::new(Native::default()))`).
 - [ ] `xtask bundle` stamps the workspace version into Info.plist; the release build disables `runtime-shaders`.
 - [ ] Re-enable GPUI `wayland`/`x11` features for a future Linux shell (orbit-ui currently uses `default-features = false`).
 
@@ -58,3 +59,20 @@ Seam and wiring changes that agents requested. The integrator applies them once 
   huge unchanged subtrees (not measured).
 - [ ] Workspace clippy/nextest for this wave excluded `orbit-ui` (GPUI does not fit the free disk
   space in this worktree); no API it uses changed.
+
+## From the engine backend (`orbit-backend`)
+- [ ] Wire `EngineBackend` into the app: the host runs `orbit_app_state::perform` on the background
+  executor and forwards `Notifier` events to the UI thread.
+- [ ] `ProgressSnapshot::current_path` is the mapped root: `MappingSession` does not expose the
+  folder being listed. Swift showed the current path in the footer.
+- [ ] `SearchSource::Saved { stable_order }` is ignored. The saved-map order (size, then path) is
+  already deterministic; confirm this matches the Swift tie order across the preview hand-off.
+- [ ] Journal recovery (`SavedMaps::recover`) runs every time a non-forced mapping starts for a
+  root that has a saved map, not just the first time. It is cheap when the map is up to date.
+  A recovery that cannot repair the map (`FullRefresh`) re-maps the root instead.
+- [ ] `MappingSession::start` retries a busy stage for up to 2 s and cannot be cancelled during
+  that time, so a stop issued then waits for the retry.
+- [ ] Not yet asserted in orbit-core (see `orbit-app-state/TRIAGE-COVERAGE.md`, backend rows):
+  - cumulative overflow across refreshes
+  - stage-level recreated identity after a kill
+  - a cancel inside `publish_recovery_copy`
