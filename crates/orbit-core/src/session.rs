@@ -394,15 +394,19 @@ impl<P: Platform> Shared<P> {
 
     /// Stops discovery for good (cancellation or a full reconciliation) and joins its workers.
     fn stop_discovery(&self) {
-        self.discovery_cancel.cancel();
-        self.gate.wake_all();
+        // Readers stop overlaying the mailbox before it is released.
+        self.async_active.store(false, Ordering::Release);
         let handle = self.discovery.lock().take();
         if let Some(handle) = handle {
             if !handle.is_finished() {
+                self.discovery_cancel.cancel();
+                self.gate.wake_all();
                 handle.cancel();
             }
             *self.report.lock() = Some(handle.join());
         }
+        self.discovery_cancel.cancel();
+        self.gate.wake_all();
         self.mailbox.cancel(true);
     }
 
@@ -924,10 +928,20 @@ impl<P: Platform> MappingSession<P> {
         if let Some(live) = self.shared.live() {
             tree = live.view(path, &all);
         }
-        if tree.is_none() {
+        // A finished discovery leaves the live inventory complete; the stage database is only
+        // read when the live inventory cannot answer, and never while it is being published
+        // (an open reader would block the switch out of WAL mode).
+        let live_complete = self.shared.live.read().is_some() && self.shared.mailbox.is_finished();
+        if tree.is_none() && !live_complete && self.phase() != Phase::Publishing {
             let pending = self.shared.async_active.load(Ordering::Acquire).then(|| self.shared.mailbox.capture());
             let revision = self.shared.notifier.revision();
-            tree = missing_as_none(self.shared.stage_reader.view(path, &all, pending.as_ref(), revision, None))?;
+            tree = match self.shared.stage_reader.view(path, &all, pending.as_ref(), revision, None) {
+                // The mailbox was released meanwhile (discovery ended): its batches are durable.
+                Err(CoreError::Cancelled) if pending.is_some() && !self.shared.cancel.is_cancelled() => {
+                    missing_as_none(self.shared.stage_reader.view(path, &all, None, revision, None))?
+                }
+                result => missing_as_none(result)?,
+            };
         }
         if !self.replay_unchanged(generation) {
             return Ok(None);
@@ -1142,7 +1156,7 @@ fn write_and_publish<P: Platform>(
         shared.set_phase(Phase::Publishing);
         let elapsed = shared.clock.elapsed().as_secs_f64();
         let mut journal_changed = false;
-        let published = match replay.as_deref_mut() {
+        let published = publish_with_retry(shared, || match replay.as_deref_mut() {
             Some(replay) => {
                 let replay: &StageReplay = replay;
                 let mut fence = |rename: &mut dyn FnMut() -> Result<()>| -> Result<()> {
@@ -1156,7 +1170,7 @@ fn write_and_publish<P: Platform>(
                 stage.publish(elapsed, crate::publish::PublishOptions { fence: Some(&mut fence), ..Default::default() })
             }
             None => stage.publish(elapsed, crate::publish::PublishOptions::default()),
-        };
+        });
         match published {
             Ok(snapshot) => return Ok(snapshot),
             Err(_) if journal_changed && !shared.cancel.is_cancelled() => {
@@ -1175,4 +1189,26 @@ fn write_and_publish<P: Platform>(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Retries publication while a reader briefly keeps the stage database busy (a view or search
+/// that started before publication began).
+fn publish_with_retry<P: Platform>(
+    shared: &Shared<P>,
+    mut publish: impl FnMut() -> Result<SnapshotInfo>,
+) -> Result<SnapshotInfo> {
+    const ATTEMPTS: usize = 20;
+    for attempt in 1.. {
+        match publish() {
+            Err(CoreError::Sqlite(rusqlite::Error::SqliteFailure(failure, _)))
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy
+                    && attempt < ATTEMPTS
+                    && !shared.cancel.is_cancelled() =>
+            {
+                shared.gate.sleep(SETTLE_WAIT);
+            }
+            other => return other,
+        }
+    }
+    unreachable!()
 }

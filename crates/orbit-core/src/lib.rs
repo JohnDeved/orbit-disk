@@ -12,6 +12,9 @@
 //! - durable index: `schema`, `stage`, `pending`, `publish`, `lease`, `store`
 //! - algorithms: `search`, `collate`, `projection`, `progress`, `refresh`, `policy`
 //! - removal: `journal`, `recovery`
+//! - integration (what the app drives): `session` (one mapping, start to saved map), `saved`
+//!   (coverage, views, search, refresh and recovery of saved maps), `removal` (Trash/delete),
+//!   `query` (SQL search), `reuse` (saved maps of subfolders)
 
 pub mod fold;
 pub mod mailbox;
