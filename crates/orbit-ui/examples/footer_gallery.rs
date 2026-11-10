@@ -91,19 +91,6 @@ fn cases() -> Vec<Case> {
             skipped: 780,
         },
         Case {
-            caption: "Background update of changed folders",
-            footer: FooterState {
-                discovered_files: 4_946_253,
-                discovery_complete: true,
-                phase: Phase::Updating,
-                action: FooterAction::Pause,
-                ..base("Home")
-            },
-            age: Some("38 min"),
-            status: None,
-            skipped: 437,
-        },
-        Case {
             caption: "Mapping stopped by the user",
             footer: FooterState {
                 discovered_files: 2_741_998,
@@ -157,6 +144,19 @@ fn cases() -> Vec<Case> {
                 discovery_complete: true,
                 phase: Phase::Saved,
                 action: FooterAction::None,
+                ..mac()
+            },
+            age: Some("5 min"),
+            status: None,
+            skipped: 780,
+        },
+        Case {
+            caption: "Background update of changed folders (the resting line, in place)",
+            footer: FooterState {
+                discovered_files: 4_946_253,
+                discovery_complete: true,
+                phase: Phase::Updating,
+                action: FooterAction::Pause,
                 ..mac()
             },
             age: Some("5 min"),

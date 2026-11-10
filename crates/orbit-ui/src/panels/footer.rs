@@ -12,7 +12,10 @@
 //! The glyph hangs in the margin so headline, track and detail share one left edge; the action
 //! sits beside the task it controls. Coral is the indexed share, a quiet ivory the files found;
 //! without an estimate of the total there is no track and no percentage (nothing is invented).
-//! At rest the block collapses to one calm line: `✓ Up to date · Indexed 5 min ago`.
+//! At rest the block collapses to one calm line: `✓ Up to date · Indexed 5 min ago`. A background
+//! update of the saved map keeps that line and only swaps the glyph and label in place
+//! (`◌ Updating   · Indexed 5 min ago`): on a whole disk, updates come every few seconds, and
+//! growing into the progress block each time would make the footer jump.
 //!
 //! The shares ease over [`theme::TRACK_TRANSITION`]; completion cross-fades to the resting line
 //! over [`theme::FOOTER_FADE`]. Reduce Motion disables both and shows static symbols.
@@ -41,6 +44,10 @@ pub const REGIONS: Regions = Regions::FOOTER;
 const HANG: f32 = 20.;
 const TRACK_HEIGHT: f32 = 4.;
 
+/// Labels of the resting line. Its label slot is as wide as the widest, so the detail after it
+/// does not move when an update starts or ends.
+const RESTING_LABELS: [&str; 2] = ["Up to date", "Updating"];
+
 /// The symbol hanging before the headline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FooterGlyph {
@@ -67,7 +74,8 @@ pub struct FooterView {
     pub status: Option<String>,
     pub skipped: u64,
     pub action: FooterAction,
-    /// The map is saved and up to date: one resting line instead of the progress block.
+    /// The map is saved (up to date, or updating in the background): one resting line instead of
+    /// the progress block.
     pub resting: bool,
     /// Help of the track and percentage.
     pub help: Option<String>,
@@ -86,7 +94,7 @@ impl FooterView {
         let (glyph, headline, detail) = match footer.phase {
             Phase::Saved => (
                 FooterGlyph::Done,
-                "Up to date".to_owned(),
+                RESTING_LABELS[0].to_owned(),
                 age.map(|age| format!("Indexed {age} ago")).unwrap_or_default(),
             ),
             Phase::Finding => {
@@ -99,9 +107,11 @@ impl FooterView {
             }
             Phase::Saving => (FooterGlyph::Activity, format!("Indexing {root}"), format!("All {counts}")),
             Phase::Finishing => (FooterGlyph::Activity, format!("Finishing the index of {root}"), counts),
-            Phase::Updating => {
-                (FooterGlyph::Activity, format!("Updating {root}"), "Checking changed folders".to_owned())
-            }
+            Phase::Updating => (
+                FooterGlyph::Activity,
+                RESTING_LABELS[1].to_owned(),
+                age.map(|age| format!("Indexed {age} ago")).unwrap_or_else(|| "Checking changed folders".to_owned()),
+            ),
             Phase::Paused if footer.is_paused => {
                 (FooterGlyph::Paused, "Mapping paused".to_owned(), format!("{counts} · Progress is kept"))
             }
@@ -147,7 +157,7 @@ impl FooterView {
             status: status.filter(|s| !s.is_empty()).map(str::to_owned),
             skipped,
             action: footer.action,
-            resting: footer.phase == Phase::Saved,
+            resting: matches!(footer.phase, Phase::Saved | Phase::Updating),
             help,
         }
     }
@@ -375,8 +385,9 @@ pub fn footer_content(view: &FooterView, shown: Shown, reduce_motion: bool, host
         )));
     }
     if shown.progress_opacity < 1.0 {
-        layers =
-            layers.child(div().absolute().inset_0().opacity(1.0 - shown.progress_opacity).child(resting_line(view)));
+        layers = layers.child(
+            div().absolute().inset_0().opacity(1.0 - shown.progress_opacity).child(resting_line(view, reduce_motion)),
+        );
     }
     div().size_full().flex().flex_row().items_center().gap(px(18.)).child(layers).child(trailing)
 }
@@ -388,7 +399,7 @@ fn progress_block(view: &FooterView, shown: Shown, reduce_motion: bool) -> gpui:
         .flex()
         .flex_row()
         .items_center()
-        .child(glyph_slot(view.glyph, reduce_motion))
+        .child(glyph_slot("footer-activity", view.glyph, reduce_motion))
         .child(
             div()
                 .flex_1()
@@ -446,21 +457,29 @@ fn progress_block(view: &FooterView, shown: Shown, reduce_motion: bool) -> gpui:
     div().size_full().flex().flex_col().justify_center().gap(px(6.)).child(headline).children(track).child(detail)
 }
 
-/// `✓ Up to date · Indexed 5 min ago` … status.
-fn resting_line(view: &FooterView) -> gpui::Div {
+/// `✓ Up to date · Indexed 5 min ago` … status (`◌ Updating` while the saved map is updated).
+fn resting_line(view: &FooterView, reduce_motion: bool) -> gpui::Div {
+    // The other labels are laid out at zero height: they only widen the slot to the widest one.
+    let sizers = RESTING_LABELS
+        .iter()
+        .filter(|label| **label != view.headline)
+        .map(|label| div().h(px(0.)).overflow_hidden().opacity(0.).child(*label));
     div()
         .size_full()
         .flex()
         .flex_row()
         .items_center()
-        .child(glyph_slot(view.glyph, true))
+        .child(glyph_slot("footer-resting-activity", view.glyph, reduce_motion))
         .child(
             div()
                 .flex_none()
+                .flex()
+                .flex_col()
                 .text_size(theme::TEXT_BODY)
                 .font_weight(theme::WEIGHT_MEDIUM)
                 .text_color(theme::color(theme::TEXT))
-                .child(view.headline.clone()),
+                .child(view.headline.clone())
+                .children(sizers),
         )
         .when(!view.detail.is_empty(), |el| {
             el.child(div().flex_none().px(px(6.)).child("·")).child(div().flex_none().child(view.detail.clone()))
@@ -470,10 +489,10 @@ fn resting_line(view: &FooterView) -> gpui::Div {
 }
 
 /// The hanging glyph in a fixed slot.
-fn glyph_slot(glyph: FooterGlyph, reduce_motion: bool) -> gpui::Div {
+fn glyph_slot(id: &'static str, glyph: FooterGlyph, reduce_motion: bool) -> gpui::Div {
     let symbol = |shape: Icon, color: u32| icon(shape).size(px(11.)).text_color(theme::color(color)).into_any_element();
     let element = match glyph {
-        FooterGlyph::Activity => activity_indicator("footer-activity", px(11.), reduce_motion, Icon::Ellipsis),
+        FooterGlyph::Activity => activity_indicator(id, px(11.), reduce_motion, Icon::Ellipsis),
         FooterGlyph::Done => symbol(Icon::CircleCheck, theme::SLATE),
         FooterGlyph::Paused => symbol(Icon::CirclePause, theme::SLATE),
         FooterGlyph::Warning => symbol(Icon::Warning, theme::CORAL),
@@ -699,6 +718,20 @@ mod tests {
             (saved.headline.as_str(), saved.detail.as_str(), saved.resting),
             ("Up to date", "Indexed 5 min ago", true)
         );
+
+        // A background update keeps the resting line: only the glyph and label change.
+        let updating = orbit_app_state::FooterState {
+            cached_files: None,
+            discovery_complete: true,
+            action: orbit_app_state::FooterAction::Pause,
+            ..state(Phase::Updating)
+        };
+        let updating = FooterView::new(&updating, "Macintosh HD", Some("5 min"), None, 780);
+        assert_eq!(
+            (updating.headline.as_str(), updating.detail.as_str(), updating.resting, updating.progress),
+            ("Updating", "Indexed 5 min ago", true, None)
+        );
+        assert_eq!(updating.glyph, FooterGlyph::Activity);
 
         let paused = orbit_app_state::FooterState {
             phase: Phase::Paused,
