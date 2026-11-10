@@ -26,6 +26,7 @@ const LEDGER_LIMIT: usize = 1024;
 /// One forwarded batch.
 struct Delivered {
     directories: Vec<Vec<u8>>,
+    subtrees: Vec<Vec<u8>>,
     full_refresh: bool,
     checkpoint: ChangeCheckpoint,
 }
@@ -43,6 +44,7 @@ impl Ledger {
             && let (Some(oldest), Some(next)) = (self.batches.pop_front(), self.batches.front_mut())
         {
             next.directories.extend(oldest.directories);
+            next.subtrees.extend(oldest.subtrees);
             next.full_refresh |= oldest.full_refresh;
         }
     }
@@ -51,14 +53,17 @@ impl Ledger {
         self.batches.clear();
     }
 
-    /// The checkpoint a refresh of `refreshed` folders (recursively) may persist: that of the
-    /// newest batch such that it and every older batch are covered. Covered batches are dropped.
-    pub fn settle(&mut self, refreshed: &[Vec<u8>]) -> Option<ChangeCheckpoint> {
-        let refreshed: HashSet<&[u8]> = refreshed.iter().map(Vec::as_slice).collect();
-        let covered = |dir: &[u8]| {
+    /// The checkpoint a refresh may persist that re-lists `listings` and reconciles `subtrees`
+    /// recursively: that of the newest batch such that it and every older batch are covered.
+    /// A batch's listing is covered by the same listing or by a subtree containing it; its
+    /// subtree only by a subtree containing it. Covered batches are dropped.
+    pub fn settle(&mut self, listings: &[Vec<u8>], subtrees: &[Vec<u8>]) -> Option<ChangeCheckpoint> {
+        let listings: HashSet<&[u8]> = listings.iter().map(Vec::as_slice).collect();
+        let subtrees: HashSet<&[u8]> = subtrees.iter().map(Vec::as_slice).collect();
+        let in_subtree = |dir: &[u8]| {
             let mut path = Some(dir);
             while let Some(current) = path {
-                if refreshed.contains(current) {
+                if subtrees.contains(current) {
                     return true;
                 }
                 path = orbit_core::paths::parent(current);
@@ -67,7 +72,10 @@ impl Ledger {
         };
         let mut checkpoint = None;
         while let Some(batch) = self.batches.front() {
-            if batch.full_refresh || !batch.directories.iter().all(|d| covered(d)) {
+            let covered = !batch.full_refresh
+                && batch.directories.iter().all(|d| listings.contains(d.as_slice()) || in_subtree(d))
+                && batch.subtrees.iter().all(|d| in_subtree(d));
+            if !covered {
                 break;
             }
             checkpoint = self.batches.pop_front().map(|b| b.checkpoint);
@@ -79,6 +87,7 @@ impl Ledger {
 #[derive(Default)]
 struct Pending {
     directories: BTreeSet<Vec<u8>>,
+    subtrees: BTreeSet<Vec<u8>>,
     full_refresh: bool,
     checkpoint: Option<ChangeCheckpoint>,
     dirty: bool,
@@ -94,7 +103,9 @@ struct Shared {
 impl Shared {
     fn add(&self, batch: ChangeBatch) {
         let mut pending = self.pending.lock();
-        pending.directories.extend(batch.directories.iter().map(|p| p.as_os_str().as_encoded_bytes().to_vec()));
+        let bytes = |p: &PathBuf| p.as_os_str().as_encoded_bytes().to_vec();
+        pending.directories.extend(batch.directories.iter().map(bytes));
+        pending.subtrees.extend(batch.subtrees.iter().map(bytes));
         pending.full_refresh |= batch.full_refresh;
         pending.checkpoint = Some(batch.checkpoint);
         pending.dirty = true;
@@ -166,16 +177,22 @@ fn forward_changes(shared: &Shared, session: SessionId, notify: &Notifier, ledge
             return;
         }
         let directories: Vec<Vec<u8>> = std::mem::take(&mut pending.directories).into_iter().collect();
+        let subtrees: Vec<Vec<u8>> = std::mem::take(&mut pending.subtrees).into_iter().collect();
         let full_refresh = std::mem::take(&mut pending.full_refresh);
         let batch_checkpoint = pending.checkpoint.take();
         pending.dirty = false;
         drop(pending);
         if let Some(checkpoint) = batch_checkpoint {
             // Recorded before the app can see the batch, so no refresh can skip past it.
-            ledger.lock().push(Delivered { directories: directories.clone(), full_refresh, checkpoint });
+            ledger.lock().push(Delivered {
+                directories: directories.clone(),
+                subtrees: subtrees.clone(),
+                full_refresh,
+                checkpoint,
+            });
         }
-        if full_refresh || !directories.is_empty() {
-            notify(Event::Mapping { session, event: MappingEvent::Changes { directories, full_refresh } });
+        if full_refresh || !directories.is_empty() || !subtrees.is_empty() {
+            notify(Event::Mapping { session, event: MappingEvent::Changes { directories, subtrees, full_refresh } });
         }
     }
 }
@@ -186,7 +203,8 @@ mod tests {
 
     fn batch(directories: &[&str], full_refresh: bool, event_id: u64) -> Delivered {
         Delivered {
-            directories: directories.iter().map(|d| d.as_bytes().to_vec()).collect(),
+            directories: paths(directories),
+            subtrees: Vec::new(),
             full_refresh,
             checkpoint: ChangeCheckpoint { root: "/r".into(), identity: "h".into(), event_id },
         }
@@ -205,12 +223,12 @@ mod tests {
         ledger.push(batch(&[], false, 2));
         ledger.push(batch(&["/r/b/c"], false, 3));
         ledger.push(batch(&["/r/d"], false, 4));
-        let settled = ledger.settle(&paths(&["/r/a", "/r/b"]));
+        let settled = ledger.settle(&[], &paths(&["/r/a", "/r/b"]));
         assert_eq!(settled.map(|c| c.event_id), Some(3), "subfolders of refreshed folders are covered");
-        assert_eq!(ledger.settle(&paths(&["/r/a"])), None, "the /r/d batch was not refreshed");
-        assert_eq!(ledger.settle(&paths(&["/r/d"])).map(|c| c.event_id), Some(4));
+        assert_eq!(ledger.settle(&[], &paths(&["/r/a"])), None, "the /r/d batch was not refreshed");
+        assert_eq!(ledger.settle(&[], &paths(&["/r/d"])).map(|c| c.event_id), Some(4));
         ledger.push(batch(&["/r/e"], true, 5));
-        assert_eq!(ledger.settle(&paths(&["/r"])), None, "a full refresh re-maps instead");
+        assert_eq!(ledger.settle(&[], &paths(&["/r"])), None, "a full refresh re-maps instead");
     }
 
     /// Deferred (off-screen) changes hold the position back while visible ones are refreshed;
@@ -220,11 +238,26 @@ mod tests {
         let mut ledger = Ledger::default();
         ledger.push(batch(&["/r/elsewhere"], false, 1));
         ledger.push(batch(&["/r/shown/a"], false, 2));
-        assert_eq!(ledger.settle(&paths(&["/r/shown"])), None, "the deferred batch is older");
+        assert_eq!(ledger.settle(&[], &paths(&["/r/shown"])), None, "the deferred batch is older");
         ledger.push(batch(&["/r/shown/b"], false, 3));
         ledger.push(batch(&["/r/elsewhere/deep"], false, 4));
-        let settled = ledger.settle(&paths(&["/r/elsewhere", "/r/shown"]));
+        let settled = ledger.settle(&[], &paths(&["/r/elsewhere", "/r/shown"]));
         assert_eq!(settled.map(|c| c.event_id), Some(4));
-        assert_eq!(ledger.settle(&paths(&["/r"])), None, "nothing is left to persist");
+        assert_eq!(ledger.settle(&[], &paths(&["/r"])), None, "nothing is left to persist");
+    }
+
+    /// A refreshed listing covers only that listing: a change below it, or one whose history was
+    /// coalesced (a subtree), still needs its own refresh before the position may pass it.
+    #[test]
+    fn a_listing_covers_only_itself() {
+        let mut ledger = Ledger::default();
+        ledger.push(batch(&["/r"], false, 1));
+        ledger.push(batch(&["/r/a"], false, 2));
+        assert_eq!(ledger.settle(&paths(&["/r"]), &[]).map(|c| c.event_id), Some(1));
+        assert_eq!(ledger.settle(&paths(&["/r"]), &[]), None, "/r/a was not re-listed");
+        assert_eq!(ledger.settle(&paths(&["/r/a"]), &[]).map(|c| c.event_id), Some(2));
+        ledger.push(Delivered { subtrees: paths(&["/r/b"]), ..batch(&[], false, 3) });
+        assert_eq!(ledger.settle(&paths(&["/r/b"]), &[]), None, "a listing does not reconcile a subtree");
+        assert_eq!(ledger.settle(&[], &paths(&["/r"])).map(|c| c.event_id), Some(3));
     }
 }

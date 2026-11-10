@@ -111,8 +111,11 @@ pub enum Event {
     Pause,
     /// Continue a stopped mapping (`resumeMapping`).
     Resume,
-    /// Re-map the current root from scratch (`rescan`).
+    /// Bring the map up to date as cheaply as its change history allows: replay what changed,
+    /// re-check folders that could not be read, rescan only without usable history.
     Refresh,
+    /// Read the whole current root again ("Rescan Everything"); only changes are written.
+    RescanEverything,
     DismissError,
 
     // Platform.
@@ -172,7 +175,10 @@ pub enum MappingEvent {
     Failed(String),
     /// Monitor batch: folders whose contents changed since the saved map.
     Changes {
+        /// Folders whose own entries changed: their listings are repeated.
         directories: Vec<Vec<u8>>,
+        /// Folders to reconcile recursively.
+        subtrees: Vec<Vec<u8>>,
         full_refresh: bool,
     },
     MonitorUnavailable,

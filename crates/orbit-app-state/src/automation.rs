@@ -172,8 +172,8 @@ impl AutomationModel for AppState {
         self.apply(Event::PreviewSelection);
     }
 
-    fn refresh(&mut self) {
-        self.apply(Event::Refresh);
+    fn refresh(&mut self, everything: bool) {
+        self.apply(if everything { Event::RescanEverything } else { Event::Refresh });
     }
 
     fn stop_scan(&mut self) {

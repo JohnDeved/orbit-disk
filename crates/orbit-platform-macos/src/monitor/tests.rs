@@ -178,3 +178,110 @@ fn exclusions_match_whole_components_in_every_spelling() {
         vec![root_path]
     );
 }
+
+#[test]
+fn file_events_list_their_folder_and_coalesced_history_reconciles_a_subtree() {
+    use crate::ffi::{
+        kFSEventStreamEventFlagItemCreated, kFSEventStreamEventFlagItemIsDir, kFSEventStreamEventFlagItemRemoved,
+        kFSEventStreamEventFlagMustScanSubDirs,
+    };
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    std::fs::create_dir_all(root.join("a/b")).unwrap();
+    std::fs::create_dir_all(root.join("a/new")).unwrap();
+    std::fs::write(root.join("a/b/file.txt"), b"x").unwrap();
+    let plan = EventPlan::inspect(&root).unwrap();
+    let real = realpath(&bytes(&root)).unwrap();
+    let raw = |tail: &str| raw_spelling(&plan, &join(&real, tail));
+    let at = |tail: &str| {
+        let root = paths::standardize(&bytes(&root));
+        if tail.is_empty() { root } else { join(&root, tail) }
+    };
+    let set = |list: &[&str]| list.iter().map(|t| at(t)).collect::<std::collections::BTreeSet<_>>();
+
+    let (file, top, created, removed) = (raw("a/b/file.txt"), raw("top.txt"), raw("a/new"), raw("a/gone"));
+    let result = batch(
+        &plan,
+        &[],
+        &[],
+        &[
+            (&file, 0),
+            (&top, kFSEventStreamEventFlagItemCreated),
+            (&created, kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsDir),
+            (&removed, kFSEventStreamEventFlagItemRemoved | kFSEventStreamEventFlagItemIsDir),
+        ],
+    );
+    assert!(!result.full_refresh, "{result:?}");
+    // The changed file's folder, the root for a root-level file, a created folder and its parent,
+    // and a removed folder's parent: listings only.
+    assert_eq!(result.directories, set(&["a/b", "", "a/new", "a"]));
+    assert!(result.subtrees.is_empty(), "{result:?}");
+
+    let coalesced = raw("a/b");
+    let result = batch(&plan, &[], &[], &[(&coalesced, kFSEventStreamEventFlagMustScanSubDirs)]);
+    assert_eq!((result.directories.len(), result.subtrees), (0, set(&["a/b"])));
+}
+
+/// The whole-Mac history identity covers only the mapped volume group: other local volumes
+/// (boot helpers here; external disks, disk images, simulator volumes in practice) can come and
+/// go without invalidating it. Checkpoints saved by earlier builds, which listed every volume,
+/// still replay while the same volumes are mounted.
+#[test]
+fn whole_mac_identity_ignores_untracked_volumes_and_accepts_the_earlier_form() {
+    let plan = EventPlan::inspect(Path::new("/")).unwrap();
+    assert!(!plan.untracked_mounts.is_empty(), "every Mac mounts boot helper volumes");
+    for mount in &plan.untracked_mounts {
+        let mut needle = String::from("\"mountPath\":");
+        needle.push_str(&format!("{:?}", String::from_utf8_lossy(mount)));
+        assert!(!plan.checkpoint.identity.contains(&needle), "{needle} in {}", plan.checkpoint.identity);
+    }
+    let legacy = plan.legacy_identity.clone().expect("earlier builds listed the untracked volumes");
+    assert!(plan.same_history(&plan.checkpoint.identity));
+    assert!(plan.same_history(&legacy));
+    assert!(!plan.same_history(&format!("{legacy}-other")));
+}
+
+#[test]
+fn mounts_inside_the_map_list_their_folder_and_mounts_of_the_map_rescan() {
+    use crate::ffi::{kFSEventStreamEventFlagMount, kFSEventStreamEventFlagUnmount};
+    let whole = EventPlan::inspect(Path::new("/")).unwrap();
+    let mounted = b"/Volumes/Orbit Test Disk".to_vec();
+    let result = batch(&whole, &[], &[], &[(&mounted, kFSEventStreamEventFlagMount)]);
+    assert!(!result.full_refresh && !result.identity_invalidated, "{result:?}");
+    assert_eq!(result.directories.into_iter().collect::<Vec<_>>(), [b"/Volumes".to_vec()]);
+    let result = batch(&whole, &[], &[], &[(&mounted, kFSEventStreamEventFlagUnmount)]);
+    assert!(!result.full_refresh, "{result:?}");
+    assert!(whole.mount_changes_history(b"/"));
+
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    let plan = EventPlan::inspect(&root).unwrap();
+    let real = realpath(&bytes(&root)).unwrap();
+    let inside = raw_spelling(&plan, &join(&real, "sub/mnt"));
+    let result = batch(&plan, &[], &[], &[(&inside, kFSEventStreamEventFlagMount)]);
+    assert!(!result.full_refresh, "{result:?}");
+    assert_eq!(result.directories.into_iter().collect::<Vec<_>>(), [join(&paths::standardize(&bytes(&root)), "sub")]);
+    let at_root = raw_spelling(&plan, &real);
+    let result = batch(&plan, &[], &[], &[(&at_root, kFSEventStreamEventFlagMount)]);
+    assert!(result.full_refresh && result.identity_invalidated, "a volume mounted over the root: {result:?}");
+}
+
+/// Dropped events that name their folder (MustScanSubDirs) reconcile that subtree; without a
+/// folder the whole map is refreshed.
+#[test]
+fn dropped_events_rescan_their_subtree_when_they_name_one() {
+    use crate::ffi::{kFSEventStreamEventFlagMustScanSubDirs, kFSEventStreamEventFlagUserDropped};
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    std::fs::create_dir_all(root.join("a/b")).unwrap();
+    let plan = EventPlan::inspect(&root).unwrap();
+    let real = realpath(&bytes(&root)).unwrap();
+    let path = raw_spelling(&plan, &join(&real, "a/b"));
+    let named =
+        batch(&plan, &[], &[], &[(&path, kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagMustScanSubDirs)]);
+    assert!(!named.full_refresh, "{named:?}");
+    assert_eq!(named.subtrees.into_iter().collect::<Vec<_>>(), [join(&paths::standardize(&bytes(&root)), "a/b")]);
+    let unnamed = batch(&plan, &[], &[], &[(&path, kFSEventStreamEventFlagUserDropped)]);
+    assert!(unnamed.full_refresh);
+}

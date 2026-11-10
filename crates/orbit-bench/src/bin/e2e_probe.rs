@@ -4,7 +4,13 @@
 //!
 //! ```text
 //! e2e_probe fixture --dir DIR [--files 180000]   (creates DIR/root; sparse/empty files only)
-//! e2e_probe run     --dir DIR                    (one measured session; prints JSON)
+//! e2e_probe rescan  --dir DIR [--workers N] [--fresh]
+//!                                                (maps DIR/root once, then times a forced rescan
+//!                                                seeded from that saved map, or with --fresh an
+//!                                                unseeded one as before; prints JSON)
+//! e2e_probe run     --dir DIR [--workers N] [--keep]
+//!                                                (one measured session; prints JSON; --keep
+//!                                                leaves its cache for inspection)
 //! ```
 //!
 //! Files are empty or sparse, so the fixture costs almost no disk blocks; logical sizes vary.
@@ -34,9 +40,14 @@ fn main() {
             let files: usize = arg(&args, "--files").map_or(180_000, |n| n.parse().unwrap());
             fixture(&dir.join("root"), files);
         }
-        Some("run") => run(&dir),
+        Some("run") => run(&dir, arg(&args, "--workers").map(|n| n.parse().expect("--workers N"))),
+        Some("rescan") => rescan(
+            &dir,
+            arg(&args, "--workers").map(|n| n.parse().expect("--workers N")),
+            args.iter().any(|a| a == "--fresh"),
+        ),
         _ => {
-            eprintln!("usage: e2e_probe fixture|run --dir DIR");
+            eprintln!("usage: e2e_probe fixture|run|rescan --dir DIR");
             std::process::exit(2);
         }
     }
@@ -118,7 +129,7 @@ fn percentile(values: &mut [f64], p: f64) -> f64 {
     values[((values.len() - 1) as f64 * p).round() as usize]
 }
 
-fn run(dir: &Path) {
+fn run(dir: &Path, workers: Option<usize>) {
     let root = std::fs::canonicalize(dir.join("root")).expect("run `fixture` first");
     let cache = dir.join(format!("cache-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&cache);
@@ -127,15 +138,25 @@ fn run(dir: &Path) {
     let root_bytes = root.as_os_str().as_bytes().to_vec();
     // A folder two levels down that the UI could be looking at.
     let first_dir = |dir: &Path| {
-        let mut dirs: Vec<PathBuf> =
-            std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+        // Readable folders only (a real home has some that are not, such as `.Trash`).
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir() && std::fs::read_dir(p).is_ok())
+            .collect();
         dirs.sort();
         dirs.into_iter().next().unwrap_or_else(|| dir.to_path_buf())
     };
     let deep = first_dir(&first_dir(&root)).as_os_str().as_bytes().to_vec();
+    // Like the app: cloud storage under the user's home is excluded (it matters when the
+    // measured root is a real home folder).
     let options = SessionOptions {
         checkpoint: Some(ChangeCheckpoint { root: root.clone(), identity: "e2e-benchmark".into(), event_id: 0 }),
         prepare_search: false,
+        home: std::env::var_os("HOME").map(std::path::PathBuf::from),
+        workers: workers.unwrap_or(orbit_core::discovery::DEFAULT_WORKERS),
         ..SessionOptions::default()
     };
     let started = Instant::now();
@@ -196,5 +217,74 @@ fn run(dir: &Path) {
     });
     println!("{result}");
     drop(session);
+    if std::env::args().all(|a| a != "--keep") {
+        let _ = std::fs::remove_dir_all(&cache);
+    } else {
+        eprintln!("kept cache {}", cache.display());
+    }
+}
+
+/// Maps `DIR/root`, then times a forced rescan of it (seeded from the saved map unless `fresh`).
+fn rescan(dir: &Path, workers: Option<usize>, fresh: bool) {
+    let root = std::fs::canonicalize(dir.join("root")).expect("DIR/root");
+    let cache = dir.join(format!("cache-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&cache);
+    std::fs::create_dir_all(&cache).unwrap();
+    let paths = IndexPaths::under(&std::fs::canonicalize(&cache).unwrap());
+    let root_bytes = root.as_os_str().as_bytes().to_vec();
+    let options = |event_id: u64| SessionOptions {
+        checkpoint: Some(ChangeCheckpoint { root: root.clone(), identity: "e2e-benchmark".into(), event_id }),
+        prepare_search: false,
+        reuse_saved_maps: false,
+        home: std::env::var_os("HOME").map(std::path::PathBuf::from),
+        workers: workers.unwrap_or(orbit_core::discovery::DEFAULT_WORKERS),
+        ..SessionOptions::default()
+    };
+    let platform = Arc::new(Native::default());
+    let publish = |options: SessionOptions| {
+        let started = Instant::now();
+        let session = MappingSession::start(Arc::clone(&platform), paths.clone(), &root_bytes, options).expect("start");
+        let mut discovery = None;
+        loop {
+            match session.outcome() {
+                SessionOutcome::Running => {
+                    if discovery.is_none() && session.progress().discovery_complete {
+                        discovery = Some(started.elapsed());
+                    }
+                    session.changes().wait(session.revision(), Duration::from_millis(20));
+                }
+                SessionOutcome::Published(snapshot) => {
+                    return (snapshot, discovery.unwrap_or_else(|| started.elapsed()), started.elapsed());
+                }
+                other => panic!("mapping failed: {other:?}"),
+            }
+        }
+    };
+    let (saved, _, first) = publish(options(1));
+    let seed = (!fresh).then(|| saved.clone());
+    let (cpu_user, cpu_system) = cpu_times();
+    let (rescanned, discovery, total) = publish(SessionOptions { seed, ..options(2) });
+    let (user, system) = cpu_times();
+    let result = serde_json::json!({
+        "seeded": !fresh,
+        "first_map_ms": first.as_secs_f64() * 1e3,
+        "rescan_discovery_ms": discovery.as_secs_f64() * 1e3,
+        "rescan_total_ms": total.as_secs_f64() * 1e3,
+        "rescan_user_cpu_s": user - cpu_user,
+        "rescan_system_cpu_s": system - cpu_system,
+        "map_bytes": std::fs::metadata(&rescanned.database).map_or(0, |m| m.len()),
+        "usage": orbit_bench::rss_and_cpu(),
+    });
+    println!("{result}");
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// User and system CPU seconds of this process.
+fn cpu_times() -> (f64, f64) {
+    // SAFETY: zeroed rusage is valid POD; getrusage writes it.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out-pointer.
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    (seconds(usage.ru_utime), seconds(usage.ru_stime))
 }

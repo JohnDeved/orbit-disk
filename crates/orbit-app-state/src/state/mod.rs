@@ -21,7 +21,7 @@ mod removal;
 mod search;
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -40,7 +40,7 @@ use crate::ids::{DragId, GestureId, IdGen, LeaseId, RemovalId, RequestId, Sessio
 use crate::model::{Item, SnapshotInfo, SortOrder, Volume};
 use crate::places::{Places, selected_place};
 use crate::review::ReviewToken;
-use crate::session::Session;
+use crate::session::{ChangedFolders, Session};
 
 pub use collect::BACKGROUND_EDIT_ITEMS;
 pub(crate) use collect::CollectionEdit;
@@ -163,7 +163,7 @@ pub(crate) enum Pending {
         generation: u64,
         session: Option<SessionId>,
         epoch: u64,
-        paths: Vec<Vec<u8>>,
+        paths: ChangedFolders,
         versions: Vec<(Vec<u8>, u64)>,
         /// A background refresh of changes outside what is shown (no status, no reload).
         quiet: bool,
@@ -232,13 +232,15 @@ pub struct AppState {
     folder_load: Option<RequestId>,
     folder_cache: VecDeque<Arc<FolderTree>>,
     resolution_request: Option<RequestId>,
-    pending_dirs: BTreeSet<Vec<u8>>,
+    pending_dirs: ChangedFolders,
     pending_full_refresh: bool,
     refresh_timer: Option<u64>,
     /// When the pending refresh timer fires and how urgent its changes are.
     refresh_due: Option<(Instant, mapping::RefreshUrgency)>,
     /// Pending changes became visible (navigation, search, review): refresh without delay.
     refresh_flush: bool,
+    /// The next refresh also re-checks folders the map could not read (a quick Refresh).
+    retry_unreadable: bool,
     /// The running refresh only covers changes outside what is shown: no status, no spinner.
     quiet_refresh: bool,
     /// Index into [`BACKGROUND_REFRESH_DELAYS`].
@@ -349,11 +351,12 @@ impl AppState {
             folder_load: None,
             folder_cache: VecDeque::new(),
             resolution_request: None,
-            pending_dirs: BTreeSet::new(),
+            pending_dirs: ChangedFolders::default(),
             pending_full_refresh: false,
             refresh_timer: None,
             refresh_due: None,
             refresh_flush: false,
+            retry_unreadable: false,
             quiet_refresh: false,
             background_step: 0,
             last_change: None,
@@ -456,7 +459,8 @@ impl AppState {
             Event::ConfirmPermanentDelete { review } => self.confirm_removal(&review, true),
             Event::Pause => self.pause(),
             Event::Resume => self.resume(),
-            Event::Refresh => self.rescan(),
+            Event::Refresh => self.quick_refresh(),
+            Event::RescanEverything => self.rescan(),
             Event::DismissError => self.set_error(None),
             Event::RevealSelection => {
                 if let Some(item) = &self.selected {

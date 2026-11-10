@@ -170,7 +170,8 @@ pub trait AutomationModel {
     fn select(&mut self, node: &Self::Node) -> bool;
     fn reveal_selection(&mut self);
     fn preview_selection(&mut self);
-    fn refresh(&mut self);
+    /// `everything`: read the whole location again rather than only what changed.
+    fn refresh(&mut self, everything: bool);
     fn stop_scan(&mut self);
     /// Queues `nodes` for collection; `false` if the model refused them.
     fn collect(&mut self, nodes: &[Self::Node]) -> bool;

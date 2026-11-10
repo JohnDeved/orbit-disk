@@ -10,25 +10,28 @@
 //!   .snapshot(root) / .view(..)     -> SnapshotInfo / FolderTree
 //!   .search(snapshot, query, ..)    -> SearchResults      (prepared NameIndex + SQL tail)
 //!   .prepare_search                 -> build the accelerator (callers choose when)
-//!   .refresh(snapshot, dirs, ckpt)  -> SnapshotInfo       re-lists changed subtrees in a private
-//!                                                        working copy, folds in removal-journal
+//!   .refresh(snapshot, listings,    -> SnapshotInfo       re-lists changed folders (and subtrees)
+//!            subtrees, ckpt)                             in a private working copy, folds in
+//!                                                        removal-journal
 //!                                                        history, publishes under the fence
 //!   .recover(snapshot)              -> SavedRecovery      journal-only repair (RecoveryTarget)
 //! ```
 //!
-//! Refresh follows Swift v0.9.15: changed directories (plus the journal's affected parents)
-//! are planned with [`crate::refresh::plan_refresh`], each planned folder is re-read
-//! recursively, the working copy gets a new snapshot id with the batch's change-history
-//! position and the journal cursor, and replaces the saved map inside the journal fence only
-//! while no newer removal was recorded (otherwise it starts over). Instead of Swift's
-//! delete-and-reinsert of each subtree, the working copy is driven by the stage writer: planned
-//! subtrees are marked dirty and re-listed, so unchanged listings keep their rows.
+//! Refresh follows Swift v0.9.15 with one difference: a folder whose own entries changed is
+//! re-listed alone, not with every folder below it. Changed folders, subtrees and the journal's
+//! affected parents (subtrees) are planned with [`crate::refresh::plan_changes`]; planned
+//! listings are marked dirty, planned subtrees with everything registered below them. The
+//! working copy gets a new snapshot id with the batch's change-history position and the
+//! journal cursor, and replaces the saved map inside the journal fence only while no newer
+//! removal was recorded (otherwise it starts over). Instead of Swift's delete-and-reinsert of
+//! each subtree, the working copy is driven by the stage writer, so unchanged listings keep
+//! their rows.
 
 use crate::journal::{Fence, Journal, JournalError, JournalOptions, RemovalCursor};
 use crate::lease::RootMutationLease;
 use crate::query::SearchResults;
 use crate::recovery::{RecoveryTarget, SavedRecovery, SystemClock, reconcile_saved_map};
-use crate::refresh::{FileKind, IndexedNode, PathStat, RefreshFacts, plan_refresh};
+use crate::refresh::{FileKind, IndexedNode, PathStat, RefreshFacts, plan_changes};
 use crate::schema::{self, SnapshotInfo};
 use crate::search::{BUILDER_BYTE_LIMIT, PreparedIndex, PreparedIndexes, PreparedKey};
 use crate::session::{mapping_exclusions, mapping_scope, stage_config};
@@ -111,6 +114,8 @@ pub struct SavedMaps<P: Platform> {
     platform: Arc<P>,
     paths: IndexPaths,
     store: Store,
+    /// The user's home: its cloud-storage roots are excluded from refreshes, as from mapping.
+    home: Option<std::path::PathBuf>,
 }
 
 impl<P: Platform> std::fmt::Debug for SavedMaps<P> {
@@ -122,7 +127,15 @@ impl<P: Platform> std::fmt::Debug for SavedMaps<P> {
 impl<P: Platform> SavedMaps<P> {
     pub fn new(platform: Arc<P>, paths: IndexPaths) -> Self {
         let store = Store::new(paths.clone());
-        Self { platform, paths, store }
+        Self { platform, paths, store, home: None }
+    }
+
+    /// Refreshes and repairs exclude the cloud-storage roots of `home`, like a mapping session
+    /// started with [`crate::session::SessionOptions::home`]. Without it they would list (and
+    /// fail on) cloud placeholders the saved map never contained.
+    pub fn with_home(mut self, home: impl Into<std::path::PathBuf>) -> Self {
+        self.home = Some(home.into());
+        self
     }
 
     pub fn store(&self) -> &Store {
@@ -343,6 +356,57 @@ impl<P: Platform> SavedMaps<P> {
 
     // --- Refresh and recovery ------------------------------------------------------------------
 
+    /// Folders worth re-listing because something below them could not be read and now can
+    /// (Full Disk Access or permissions granted since; the platform reports no change for that):
+    /// the parent of each readable-again folder the map recorded as unreadable, and each folder
+    /// whose listing failed but that opens now. At most `limit`. Mount points and other volumes
+    /// (also recorded as not readable) are left out.
+    pub fn retry_candidates(&self, snapshot: &SnapshotInfo, limit: usize) -> Result<Vec<Vec<u8>>> {
+        let conn = self.store.open(snapshot, None)?;
+        let root_dev: i64 =
+            conn.query_row("SELECT dev FROM dirs WHERE path=?1", [&snapshot.root_path], |row| row.get(0))?;
+        // Readable now means listable: privacy-protected folders open but refuse their entries.
+        let opens_as = |path: &[u8], identity: Option<FileIdentity>| {
+            let native = crate::discovery::native_path(path);
+            self.platform
+                .without_materialization(|| {
+                    self.platform
+                        .open_root(&native)
+                        .is_ok_and(|(_, current)| identity.is_none_or(|expected| expected == current))
+                        && std::fs::read_dir(&native).and_then(|mut entries| entries.next().transpose()).is_ok()
+                })
+                .unwrap_or(false)
+        };
+        let mut candidates = Vec::new();
+        let mut blocked = conn.prepare(
+            "SELECT p.path,n.name,n.dev,n.inode FROM nodes n JOIN dirs p ON p.id=n.parent
+             WHERE n.kind=1 AND n.accessible=0 AND n.is_mount=0 AND n.dev=?1",
+        )?;
+        let mut rows = blocked.query([root_dev])?;
+        while let Some(row) = rows.next()? {
+            let (parent, name): (Vec<u8>, Vec<u8>) = (row.get(0)?, row.get(1)?);
+            let identity = crate::schema::identity_from_sql(row.get(2)?, row.get(3)?);
+            if opens_as(&crate::paths::join(&parent, &name), Some(identity)) && !candidates.contains(&parent) {
+                candidates.push(parent);
+                if candidates.len() >= limit {
+                    return Ok(candidates);
+                }
+            }
+        }
+        let mut failed = conn.prepare("SELECT parent FROM listing_issues")?;
+        let mut rows = failed.query([])?;
+        while let Some(row) = rows.next()? {
+            let parent: Vec<u8> = row.get(0)?;
+            if opens_as(&parent, None) && !candidates.contains(&parent) {
+                candidates.push(parent);
+                if candidates.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(candidates)
+    }
+
     fn root_identity(&self, snapshot: &SnapshotInfo) -> Result<FileIdentity> {
         let node = self.store.node(snapshot, &snapshot.root_path, None)?.ok_or(CoreError::SnapshotChanged)?;
         let identity = node.meta.identity.ok_or(CoreError::SnapshotChanged)?;
@@ -364,19 +428,22 @@ impl<P: Platform> SavedMaps<P> {
     ) -> Result<Stage<P>> {
         let root = &copy.root_path;
         let scope = mapping_scope(&*self.platform, root, root_identity);
-        let exclusions = mapping_exclusions(&*self.platform, &self.paths, &scope, &[]);
+        let cloud = self.home.as_deref().map(|home| self.platform.cloud_roots(home)).unwrap_or_default();
+        let exclusions = mapping_exclusions(&*self.platform, &self.paths, &scope, &cloud);
         let config = stage_config(&scope, &exclusions);
         Stage::open_repair(self.platform.clone(), self.paths.clone(), copy, root_identity, cancel.clone(), config)
     }
 
-    /// Re-lists `directories` (paths reported by a change monitor; reconciled recursively) and
-    /// everything the removal journal recorded since the map's cursor, then replaces the saved
-    /// map. `checkpoint` is the change-history position the batch brings the map to. Fails with
+    /// Re-lists `listings` (folders a change monitor reported changed entries in, not their
+    /// subfolders), reconciles `subtrees` recursively, and applies everything the removal
+    /// journal recorded since the map's cursor (recursively), then replaces the saved map.
+    /// `checkpoint` is the change-history position the batch brings the map to. Fails with
     /// [`CoreError::InUse`] while a removal touching the map is still running (retry later).
     pub fn refresh(
         &self,
         snapshot: &SnapshotInfo,
-        directories: &[Vec<u8>],
+        listings: &[Vec<u8>],
+        subtrees: &[Vec<u8>],
         checkpoint: Option<&ChangeCheckpoint>,
         cancel: &Cancellation,
     ) -> Result<SnapshotInfo> {
@@ -397,9 +464,11 @@ impl<P: Platform> SavedMaps<P> {
             if plan.has_live_operation {
                 return Err(CoreError::InUse("a removal in this folder is still running".into()));
             }
-            let mut changed: Vec<Vec<u8>> = directories.to_vec();
+            let mut listed: &[Vec<u8>] = listings;
+            let mut changed: Vec<Vec<u8>> = subtrees.to_vec();
             changed.extend(plan.affected_parents.iter().cloned());
             if plan.requires_full_refresh || plan.overlay_overflow {
+                listed = &[];
                 changed = vec![root.clone()];
             }
             let copy = self.store.recovery_working_copy(&*self.platform, snapshot, cancel)?;
@@ -410,13 +479,22 @@ impl<P: Platform> SavedMaps<P> {
                         reader: Reader::new(&conn, None, false, Some(cancel)),
                         platform: &*self.platform,
                     };
-                    plan_refresh(changed.iter().map(Vec::as_slice), &root, &mut facts, cancel)?
+                    plan_changes(
+                        listed.iter().map(Vec::as_slice),
+                        changed.iter().map(Vec::as_slice),
+                        &root,
+                        &mut facts,
+                        cancel,
+                    )?
                 };
                 let mut stage = self.repair_stage(&copy, root_identity, cancel)?;
                 let issues = stage.writer_ref().issue_fingerprint()?;
                 stage.writer().track_inventory_changes()?;
-                for path in &minimal {
+                for path in &minimal.subtrees {
                     stage.writer().mark_subtree_changed(path)?;
+                }
+                for path in &minimal.listings {
+                    stage.writer().mark_listing_changed(path)?;
                 }
                 drain(&mut stage)?;
                 // Re-listing found nothing new (e.g. a file rewritten with the same size): keep the
@@ -473,6 +551,19 @@ impl<P: Platform> SavedMaps<P> {
     ) -> Result<(SavedRecovery, Option<SnapshotInfo>)> {
         let journal = self.journal()?;
         let root_identity = self.root_identity(snapshot)?;
+        // Usually the journal has nothing for this map: answer that from the published map
+        // without cloning it or opening it for writing (the first step of the reconciliation
+        // below, which reads the same cursor and journal).
+        if let Some(stored) = self
+            .store
+            .removal_cursor(snapshot, Some(cancel))?
+            .map(|(identity, sequence)| RemovalCursor { identity, sequence })
+        {
+            let plan = journal.recover_or_reset(&snapshot.root_path, Some(&stored), cancel, &SystemClock::default())?;
+            if plan.cursor == stored && plan.is_empty() {
+                return Ok((SavedRecovery::UpToDate(plan.cursor), None));
+            }
+        }
         let copy = self.store.recovery_working_copy(&*self.platform, snapshot, cancel)?;
         // Lease before fence, like every saved-map writer.
         let lease = match RootMutationLease::acquire(&self.paths.locks, &snapshot.root_path, cancel) {
@@ -523,10 +614,11 @@ struct InventoryFacts<'a, P> {
 
 impl<P: Platform> RefreshFacts for InventoryFacts<'_, P> {
     fn indexed(&mut self, path: &[u8]) -> Result<Option<IndexedNode>> {
-        Ok(self
-            .reader
-            .node_by_path(path)?
-            .map(|row| IndexedNode { is_dir: row.meta.flags.is_dir, accessible: row.meta.flags.accessible }))
+        Ok(self.reader.node_by_path(path)?.map(|row| IndexedNode {
+            is_dir: row.meta.flags.is_dir,
+            accessible: row.meta.flags.accessible,
+            mount_point: row.meta.flags.is_mount_point,
+        }))
     }
 
     fn lstat(&mut self, path: &[u8]) -> Option<PathStat> {

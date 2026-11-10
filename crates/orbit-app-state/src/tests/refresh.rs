@@ -12,14 +12,22 @@ const MS: Duration = Duration::from_millis(1);
 
 fn changes(h: &mut Harness, directories: &[&str]) {
     let directories = directories.iter().map(|d| d.as_bytes().to_vec()).collect();
-    h.mapping(b"/r", MappingEvent::Changes { directories, full_refresh: false });
+    h.mapping(b"/r", MappingEvent::Changes { directories, subtrees: Vec::new(), full_refresh: false });
 }
 
-/// The paths of the pending refresh request, if one was issued.
+/// The folders of the pending refresh request (listings and subtrees, sorted), if one was issued.
 fn refresh_paths(h: &Harness) -> Option<Vec<String>> {
     h.requests.iter().find_map(|(_, request)| match request {
         Request::Refresh(refresh) => {
-            Some(refresh.paths.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect())
+            let mut paths: Vec<String> = refresh
+                .paths
+                .iter()
+                .chain(&refresh.subtrees)
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect();
+            paths.sort();
+            paths.dedup();
+            Some(paths)
         }
         _ => None,
     })
@@ -212,4 +220,116 @@ fn an_unchanged_map_is_not_reloaded() {
     assert!(!h.has_request(is_saved_view));
     assert_eq!(h.state.map_revision(), revision);
     assert_eq!(status(&h).as_deref(), Some("Updated changed folders."));
+}
+
+#[test]
+fn listings_and_subtrees_reach_the_refresh_separately() {
+    let mut h = harness();
+    h.open_mapped(b"/r");
+    h.backend.add_file(b"/r/docs/new.txt", 3);
+    let listing = |d: &str| MappingEvent::Changes {
+        directories: vec![d.as_bytes().to_vec()],
+        subtrees: Vec::new(),
+        full_refresh: false,
+    };
+    h.mapping(b"/r", listing("/r/docs"));
+    h.mapping(b"/r", listing("/r"));
+    h.mapping(
+        b"/r",
+        MappingEvent::Changes { directories: Vec::new(), subtrees: vec![b"/r/big".to_vec()], full_refresh: false },
+    );
+    h.advance(REFRESH_DELAY);
+    let refresh = h.take(|r| matches!(r, Request::Refresh(_))).expect("a refresh request");
+    let Request::Refresh(request) = &refresh.1 else { unreachable!() };
+    // A listing of `/r` is not a recursive reconciliation of `/r`: neither absorbs the other.
+    assert_eq!(request.paths, [b"/r".to_vec(), b"/r/docs".to_vec()]);
+    assert_eq!(request.subtrees, [b"/r/big".to_vec()]);
+}
+
+/// Re-listing a folder above the shown one (a write to `~/.zsh_history` lists the home folder)
+/// does not change what is shown: it waits like an off-screen change, then refreshes quietly.
+#[test]
+fn a_listing_above_the_shown_folder_is_a_background_change() {
+    let mut h = showing_docs();
+    changes(&mut h, &["/r"]);
+    h.advance(REFRESH_DELAY);
+    assert_eq!(refresh_paths(&h), None, "a listing of /r is not visible from /r/docs");
+    // A subtree at the shown folder is visible (a root subtree would start a rescan instead).
+    h.mapping(
+        b"/r",
+        MappingEvent::Changes { directories: Vec::new(), subtrees: vec![b"/r/docs".to_vec()], full_refresh: false },
+    );
+    h.advance(REFRESH_DELAY);
+    assert_eq!(
+        refresh_paths(&h),
+        Some(vec!["/r".to_owned(), "/r/docs".to_owned()]),
+        "a subtree of /r/docs includes what is shown"
+    );
+}
+
+/// Refresh on a live map flushes the pending changes and retries unreadable folders: no
+/// mapping starts.
+#[test]
+fn refresh_of_a_live_map_updates_changes_without_rescanning() {
+    let mut h = harness();
+    h.open_mapped(b"/r");
+    let mappings = h.mappings.len();
+    h.send(Event::Refresh);
+    h.advance(Duration::ZERO);
+    let request = h.requests.iter().find_map(|(_, r)| match r {
+        Request::Refresh(refresh) => Some(refresh.clone()),
+        _ => None,
+    });
+    assert!(request.expect("a refresh request").retry_unreadable);
+    assert_eq!(h.mappings.len(), mappings, "no mapping started");
+}
+
+/// After a pause, Refresh reopens the saved map (no forced rescan); its monitoring replays the
+/// history it missed.
+#[test]
+fn refresh_after_a_pause_reopens_the_saved_map() {
+    let mut h = harness();
+    h.open_mapped(b"/r");
+    h.send(Event::Pause);
+    h.run();
+    h.send(Event::Refresh);
+    h.run();
+    let last = h.mappings.last().expect("a mapping");
+    assert!(!last.force, "a paused map is reopened, not rescanned");
+    assert!(!h.state.updates_paused());
+}
+
+/// Without change history Refresh has nothing to replay: it rescans. Rescan Everything always
+/// does.
+#[test]
+fn refresh_without_history_and_rescan_everything_read_everything() {
+    let mut h = harness();
+    h.open_mapped(b"/r");
+    h.mapping(b"/r", MappingEvent::MonitorUnavailable);
+    h.send(Event::Refresh);
+    h.run();
+    let last = h.mappings.last().expect("a mapping");
+    assert!(last.force && last.keep_map, "no history: the map is read again, kept on screen");
+
+    let mut h = harness();
+    h.open_mapped(b"/r");
+    h.send(Event::RescanEverything);
+    h.run();
+    let last = h.mappings.last().expect("a mapping");
+    assert!(last.force && last.keep_map);
+}
+
+/// A change history that asks to reconcile the whole root starts the (fast, parallel) rescan.
+#[test]
+fn a_root_subtree_change_rescans_the_map() {
+    let mut h = harness();
+    h.open_mapped(b"/r");
+    h.mapping(
+        b"/r",
+        MappingEvent::Changes { directories: Vec::new(), subtrees: vec![b"/r".to_vec()], full_refresh: false },
+    );
+    h.advance(REFRESH_DELAY);
+    h.run();
+    let last = h.mappings.last().expect("a mapping");
+    assert!(last.force && last.keep_map, "the root is rescanned, keeping the map on screen");
 }

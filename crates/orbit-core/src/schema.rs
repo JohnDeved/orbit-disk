@@ -91,9 +91,14 @@ pub const QUEUE_INDEX_DDL: [&str; 2] = [
 /// Tables that must exist in a format-6 stage (used to validate files found on disk).
 pub const REQUIRED_STAGE_TABLES: [&str; 5] = ["scan", "nodes", "dirs", "metadata", "full_refresh"];
 
-/// Writer pragmas: WAL, FULL synchronization, 64 MiB autocheckpoint and a 16 MiB page cache.
+/// Writer pragmas: WAL, FULL synchronization, 512 MiB autocheckpoint and a 256 MiB page cache.
+/// A large map's indexes outgrow a small cache (every insert then rereads a page), and frequent
+/// checkpoints rewrite the same index pages into the database again and again; both dominated
+/// writing a 5-million-file home folder. The cache only grows as pages are used. Statement
+/// journals stay in memory: each folder of a transaction group is a savepoint, and a
+/// file-backed sub-journal would write every modified page twice.
 pub const WRITER_PRAGMAS: &str = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
-    PRAGMA cache_size=-16384; PRAGMA wal_autocheckpoint=16384;";
+    PRAGMA cache_size=-262144; PRAGMA wal_autocheckpoint=131072; PRAGMA temp_store=MEMORY;";
 
 /// Busy timeout of the stage writer.
 pub const WRITER_BUSY_MS: u64 = 5_000;

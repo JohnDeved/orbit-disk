@@ -8,6 +8,30 @@ use std::time::Instant;
 
 use orbit_platform::FileIdentity;
 
+/// Folders waiting for a refresh: listings to repeat (a change monitor named the folder whose
+/// entries changed) and subtrees to reconcile recursively (coalesced history, removal parents).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChangedFolders {
+    pub listings: BTreeSet<Vec<u8>>,
+    pub subtrees: BTreeSet<Vec<u8>>,
+}
+
+impl ChangedFolders {
+    pub fn is_empty(&self) -> bool {
+        self.listings.is_empty() && self.subtrees.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.listings.clear();
+        self.subtrees.clear();
+    }
+
+    pub fn append(&mut self, other: ChangedFolders) {
+        self.listings.extend(other.listings);
+        self.subtrees.extend(other.subtrees);
+    }
+}
+
 use crate::collection::{CollectJob, CollectionSnapshot};
 use crate::folder::PreparedFolder;
 use crate::hash::FxHashSet;
@@ -63,8 +87,10 @@ pub(crate) struct Session {
     pub removal_versions: HashMap<Vec<u8>, u64>,
     pub recovery_pending: bool,
     pub preview_blocked: bool,
-    pub pending_dirs: BTreeSet<Vec<u8>>,
+    pub pending_dirs: ChangedFolders,
     pub pending_full_refresh: bool,
+    /// The platform cannot report changes to this map (monitoring unavailable).
+    pub history_unavailable: bool,
     pub count_read: Option<RequestId>,
     pub last_count_read: Option<Instant>,
 }
@@ -104,8 +130,9 @@ impl Session {
             removal_versions: HashMap::new(),
             recovery_pending: false,
             preview_blocked: false,
-            pending_dirs: BTreeSet::new(),
+            pending_dirs: ChangedFolders::default(),
             pending_full_refresh: false,
+            history_unavailable: false,
             count_read: None,
             last_count_read: None,
         }

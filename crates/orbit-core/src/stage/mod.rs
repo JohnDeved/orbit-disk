@@ -66,6 +66,9 @@ pub struct StageConfig {
     pub excluded_identities: HashSet<FileIdentity>,
     /// Records per later transaction of a wide listing (at least 128).
     pub write_chunk: usize,
+    /// A new stage starts as a copy of this saved map of the root (a forced rescan): listings
+    /// then write only what changed instead of every row (see [`Stage::open`]).
+    pub seed: Option<crate::schema::SnapshotInfo>,
 }
 
 impl Default for StageConfig {
@@ -74,6 +77,7 @@ impl Default for StageConfig {
             traversal: Traversal::SameDevice,
             excluded_paths: HashSet::new(),
             excluded_identities: HashSet::new(),
+            seed: None,
             write_chunk: writer::WRITE_CHUNK,
         }
     }
@@ -116,6 +120,22 @@ impl StepOutcome {
     }
 }
 
+/// One step of the asynchronous writer keeps consuming mailbox work in a single transaction
+/// group until this much time passed (or [`GROUP_RECORDS`] were written), then commits it once.
+/// A crash loses at most one group; its batches are still pending and are written again.
+pub const GROUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+/// Records per transaction group.
+pub const GROUP_RECORDS: usize = 131_072;
+
+/// How long a validated folder stays trusted by the fast validation path.
+const VALIDATION_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Validated folders remembered at most (the memo is cleared when it reaches this size).
+const VALIDATED_LIMIT: usize = 262_144;
+
+/// Parent folders the fast validation path keeps open.
+const PARENT_CACHE: usize = 16;
+
 /// Descriptors the writer's validation cursor keeps open (Swift: 32).
 const CURSOR_DEPTH: usize = 32;
 
@@ -156,7 +176,19 @@ pub struct Stage<P: Platform> {
     lister: Option<P::Lister>,
     /// Open ancestors reused by [`Stage::validate_components`] (root first).
     ancestors: Vec<CursorLevel<P::Dir>>,
+    /// Whether written listings revalidate their folder's path against the filesystem (off when
+    /// replayable change history covers the scan, see [`Stage::set_recheck_identities`]).
+    recheck_identities: bool,
+    /// Folders (path → identity) validated during the current transaction group; cleared with
+    /// each group so a check is never older than one group.
+    validated: std::collections::HashMap<Vec<u8>, (FileIdentity, std::time::Instant)>,
+    /// Parents reopened by the fast validation path, most recent first (at most
+    /// [`PARENT_CACHE`]): discovery interleaves folders from a few subtrees at a time.
+    parents: Vec<(Vec<u8>, FileIdentity, P::Dir)>,
     before_acknowledge: Option<BeforeAcknowledge>,
+    /// The highest mailbox sequence written into the open transaction group, acknowledged once
+    /// the group commits.
+    group_ack: Option<u64>,
     observer: Option<Box<dyn LocalObserver>>,
 }
 
@@ -207,8 +239,17 @@ impl<P: Platform> Stage<P> {
             let lease = RootMutationLease::acquire(&paths.locks, root, &cancel)?;
             (SnapshotExpectation::capture(&paths.cache, root)?, lease.invalidation_generation()?)
         };
-        let lease = StageLease::acquire(&paths.staging, root, root_identity)?;
+        let mut lease = StageLease::acquire(&paths.staging, root, root_identity)?;
         lease.validate_paths()?;
+        if let Some(seed) = config.seed.as_ref()
+            && lease.is_empty()
+            && expected == SnapshotExpectation::Matching(seed.id.clone())
+            && Self::seed_stage(&platform, &paths, root, root_identity, seed, &expected, &cancel, &config, &mut lease)
+                .is_err()
+        {
+            // Unseeded: the stage is still the empty file; the rescan writes every row.
+            lease.remove_seed()?;
+        }
         let mut writer = Writer::open(lease.database_path(), root, root_identity, config.traversal.clone())?;
         let previous = writer.scan_start()?;
         let prior_expected = writer.scan_expectation()?;
@@ -280,9 +321,48 @@ impl<P: Platform> Stage<P> {
             async_finished: None,
             lister: None,
             ancestors: Vec::new(),
+            recheck_identities: true,
+            validated: std::collections::HashMap::new(),
+            parents: Vec::new(),
             before_acknowledge: None,
+            group_ack: None,
             observer: None,
         })))
+    }
+
+    /// Makes the empty stage of a forced rescan a copy of the saved map `seed`: cloned (copy on
+    /// write) beside the stage while the saved map is held, verified, reset to an unsealed stage
+    /// whose every directory must be listed again (a new full-refresh generation), and renamed
+    /// over the stage file. Unchanged folders then cost reads only (`Writer::upsert`); before,
+    /// a rescan rebuilt all rows and indexes. The listing after the new checkpoint confirms or
+    /// replaces every row, and folders no longer found are pruned.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_stage(
+        platform: &Arc<P>,
+        paths: &IndexPaths,
+        root: &[u8],
+        root_identity: FileIdentity,
+        seed: &crate::schema::SnapshotInfo,
+        expected: &SnapshotExpectation,
+        cancel: &Cancellation,
+        config: &StageConfig,
+        lease: &mut StageLease,
+    ) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        lease.remove_seed()?;
+        let copy = lease.seed_path();
+        {
+            let _held = RootMutationLease::acquire(&paths.locks, root, cancel)?;
+            expected.verify(&paths.cache, root)?;
+            platform.clone_file(&seed.database, &copy)?;
+        }
+        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600))?;
+        {
+            let mut writer = Writer::open(&copy, root, root_identity, config.traversal.clone())?;
+            writer.prepare_seed(&seed.id)?;
+            writer.checkpoint_for_clone(std::time::Duration::from_secs(5), cancel)?;
+        }
+        lease.install_seed()
     }
 
     /// A writer over a private working copy of a saved map (see `crate::saved`), used to re-list
@@ -324,7 +404,11 @@ impl<P: Platform> Stage<P> {
             async_finished: None,
             lister: None,
             ancestors: Vec::new(),
+            recheck_identities: true,
+            validated: std::collections::HashMap::new(),
+            parents: Vec::new(),
             before_acknowledge: None,
+            group_ack: None,
             observer: None,
         })
     }
@@ -461,6 +545,13 @@ impl<P: Platform> Stage<P> {
         &self.writer
     }
 
+    /// Whether asynchronous listings revalidate their folder's path before they are written
+    /// (default on). Turn it off only when replayable change history captured before the scan
+    /// reports any folder replaced meanwhile.
+    pub fn set_recheck_identities(&mut self, recheck: bool) {
+        self.recheck_identities = recheck;
+    }
+
     pub fn set_before_acknowledge(&mut self, hook: Option<BeforeAcknowledge>) {
         self.before_acknowledge = hook;
     }
@@ -514,7 +605,7 @@ impl<P: Platform> Stage<P> {
         if let Some(mailbox) = mailbox
             && self.async_finished != Some(mailbox.generation())
         {
-            match self.step_async(mailbox) {
+            match self.step_async_group(mailbox) {
                 Ok(Some(outcome)) => return Ok(outcome),
                 Ok(None) => {
                     self.async_finished = Some(mailbox.generation());
@@ -536,11 +627,84 @@ impl<P: Platform> Stage<P> {
     /// and identity with [`Platform::child_identity`], new ones are opened with
     /// [`Platform::open_child`], and the listed directory itself is only `fstatat`ed.
     fn validate_components(&mut self, components: &[DirComponent]) -> Result<()> {
+        if !self.recheck_identities {
+            return Ok(());
+        }
+        if self.validated_through_parent(components) {
+            return Ok(());
+        }
         let result = self.validate_with_cursor(components);
-        if result.is_err() {
-            self.ancestors.clear();
+        match &result {
+            Ok(()) => self.remember_validated(components),
+            Err(_) => {
+                self.ancestors.clear();
+                self.validated.clear();
+                self.parents.clear();
+            }
         }
         result
+    }
+
+    /// The cheap path of [`Stage::validate_components`]: the folder itself, or its parent, was
+    /// validated earlier in this transaction group. Then the parent is reopened by path (or
+    /// reused for a sibling) and must have exactly the validated identity, so a replaced or
+    /// symlinked ancestor cannot pass; only the folder's own entry is checked inside it. Anything
+    /// unexpected returns `false` and the full walk decides. Discovery interleaves folders from
+    /// many subtrees, and the single-chain cursor reopened every ancestor for each of them.
+    fn validated_through_parent(&mut self, components: &[DirComponent]) -> bool {
+        let Some((last, ancestors)) = components.split_last() else { return false };
+        let path = self.component_path(components);
+        let ttl = VALIDATION_TTL;
+        let fresh = |entry: Option<&(FileIdentity, std::time::Instant)>, identity: FileIdentity| {
+            entry.is_some_and(|(id, at)| *id == identity && at.elapsed() < ttl)
+        };
+        if fresh(self.validated.get(&path), last.identity) {
+            return true;
+        }
+        let parent_path = self.component_path(ancestors);
+        let parent_identity = ancestors.last().map_or(self.root_identity, |c| c.identity);
+        if !fresh(self.validated.get(&parent_path), parent_identity) {
+            return false;
+        }
+        match self.parents.iter().position(|(p, id, _)| *p == parent_path && *id == parent_identity) {
+            Some(0) => {}
+            Some(index) => {
+                let entry = self.parents.remove(index);
+                self.parents.insert(0, entry);
+            }
+            None => {
+                let Ok((dir, identity)) = self.platform.open_root(path_of(&parent_path)) else { return false };
+                if identity != parent_identity {
+                    return false;
+                }
+                self.parents.truncate(PARENT_CACHE - 1);
+                self.parents.insert(0, (parent_path, identity, dir));
+            }
+        }
+        let Some((_, _, dir)) = self.parents.first() else { return false };
+        if !self.platform.child_identity(dir, &last.name).is_ok_and(|identity| identity == last.identity) {
+            return false;
+        }
+        self.validated.insert(path, (last.identity, std::time::Instant::now()));
+        true
+    }
+
+    /// Records the root and every component of a fully validated path.
+    fn remember_validated(&mut self, components: &[DirComponent]) {
+        if self.validated.len() >= VALIDATED_LIMIT {
+            self.validated.clear();
+        }
+        let now = std::time::Instant::now();
+        let mut path = self.root.clone();
+        self.validated.insert(path.clone(), (self.root_identity, now));
+        for component in components {
+            path = crate::paths::join(&path, &component.name);
+            self.validated.insert(path.clone(), (component.identity, now));
+        }
+    }
+
+    fn component_path(&self, components: &[DirComponent]) -> Vec<u8> {
+        components.iter().fold(self.root.clone(), |path, c| crate::paths::join(&path, &c.name))
     }
 
     fn validate_with_cursor(&mut self, components: &[DirComponent]) -> Result<()> {
@@ -586,8 +750,69 @@ impl<P: Platform> Stage<P> {
             hook(&mut self.writer)?;
         }
         while self.writer.reconcile_links_chunk(Some(&self.cancel))? {}
-        mailbox.acknowledge(sequence);
+        if self.writer.in_group() {
+            // Written, not yet durable: acknowledged after the group commits.
+            mailbox.consume(sequence);
+            self.group_ack = Some(self.group_ack.map_or(sequence, |s| s.max(sequence)));
+        } else {
+            mailbox.acknowledge(sequence);
+        }
         Ok(())
+    }
+
+    /// Asynchronous writing in one transaction group: [`Stage::step_async`] repeatedly until the
+    /// group's budget is spent or there is nothing ready, then one durable commit and one
+    /// acknowledgement. Before, every folder (or small-folder group) was its own `FULL` commit
+    /// that rewrote the same ancestor and index pages. The group never outlives this call, so
+    /// work between steps (journal replay, publication) never runs inside it. On any error the
+    /// whole group is discarded and its batches are offered again.
+    fn step_async_group(&mut self, mailbox: &Mailbox) -> Result<Option<StepOutcome>> {
+        let started = std::time::Instant::now();
+        self.writer.begin_group()?;
+        self.group_ack = None;
+        self.parents.clear();
+        let (mut records, mut completed, mut progressed) = (0usize, None, false);
+        let outcome = loop {
+            match self.step_async(mailbox) {
+                Ok(Some(StepOutcome::Progressed { records: written, completed: folder })) => {
+                    progressed = true;
+                    records += written;
+                    completed = folder.or(completed);
+                    if started.elapsed() >= GROUP_BUDGET || records >= GROUP_RECORDS || self.cancel.is_cancelled() {
+                        break Ok(Some(StepOutcome::Progressed { records, completed }));
+                    }
+                }
+                Ok(other) if progressed => {
+                    // Nothing more ready (or async work ended): commit what the group has; the
+                    // next step sees the rest (`Idle`, or `None` once the mailbox drained).
+                    let _ = other;
+                    break Ok(Some(StepOutcome::Progressed { records, completed }));
+                }
+                Ok(other) => break Ok(other),
+                Err(error) => break Err(error),
+            }
+        };
+        let committed = outcome.and_then(|outcome| {
+            self.writer.commit_group()?;
+            Ok(outcome)
+        });
+        match committed {
+            Ok(outcome) => {
+                if let Some(sequence) = self.group_ack.take() {
+                    mailbox.acknowledge(sequence);
+                }
+                Ok(outcome)
+            }
+            Err(error) => {
+                if self.writer.in_group() {
+                    self.writer.rollback_group();
+                }
+                self.group_ack = None;
+                mailbox.rewind();
+                self.async_listing = None;
+                Err(error)
+            }
+        }
     }
 
     fn step_async(&mut self, mailbox: &Mailbox) -> Result<Option<StepOutcome>> {

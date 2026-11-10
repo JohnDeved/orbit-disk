@@ -375,7 +375,10 @@ fn refresh_converges_and_reopening_reuses_the_saved_map_without_rescanning() {
     let session = app.state.active_session_id().unwrap();
     let before = app.state.snapshot().unwrap().id;
     let directories = vec![bytes(&root.join("docs")), bytes(&root.join("big"))];
-    app.send(Event::Mapping { session, event: MappingEvent::Changes { directories, full_refresh: false } });
+    app.send(Event::Mapping {
+        session,
+        event: MappingEvent::Changes { directories, subtrees: Vec::new(), full_refresh: false },
+    });
     app.until("the refreshed map", |a| a.state.snapshot().is_some_and(|s| s.id != before) && !a.state.is_refreshing());
     let refreshed =
         [("big".into(), 1, 5000), ("docs".into(), 4, 1250), ("engine".into(), 0, 0), ("slow".into(), 2, 200)];
@@ -390,7 +393,7 @@ fn refresh_converges_and_reopening_reuses_the_saved_map_without_rescanning() {
     assert_eq!(saved_rows(&app, &root), refreshed);
     assert_eq!(app.rows(), ["big", "docs", "slow", "engine"]);
 
-    app.send(Event::Refresh);
+    app.send(Event::RescanEverything);
     app.until("the rescanned map", |a| a.published(&root) && !a.state.is_refreshing());
     assert!(gate.listed_within(&root) > 0, "an explicit rescan lists the folders again");
     assert_eq!(saved_rows(&app, &root), refreshed);
@@ -554,4 +557,101 @@ fn progress_names_the_folder_being_read_and_skipped_paths_reach_the_snapshot() {
         assert!(snapshot.skipped_count >= 1);
         assert!(snapshot.issues.iter().any(|issue| issue.starts_with(&locked)), "{:?}", snapshot.issues);
     }
+}
+
+/// A read of a saved map that a refresh replaced in the meantime (its reply not yet handled by
+/// the app) answers from the replacement instead of failing with "the saved map changed".
+#[test]
+fn reads_of_a_replaced_saved_map_answer_from_its_replacement() {
+    use orbit_app_state::Backend as _;
+    use orbit_app_state::backend::{SearchRequest, SearchSource, ViewRequest, ViewSource};
+    let fx = Fixture::new();
+    let root = fx.tree("root");
+    let mut app = App::new(&fx, None);
+    app.open(&root);
+    app.until("the saved map", |a| a.published(&root));
+    let stale = app.state.snapshot().unwrap().clone();
+    let session = app.state.active_session_id().unwrap();
+    // A refresh publishes a new saved map behind the app's back.
+    write(&root.join("docs/fresh.txt"), 900);
+    let core = app.backend.core_snapshot(stale.id).unwrap();
+    let maps = app.fixture_maps();
+    let listings = [bytes(&root.join("docs"))];
+    let replaced = maps.refresh(&core, &listings, &[], None, &Cancellation::new()).unwrap();
+    assert_ne!(replaced.id, core.id);
+
+    let view = app
+        .backend
+        .view(
+            &ViewRequest {
+                session,
+                root: Arc::from(bytes(&root)),
+                source: ViewSource::Saved(stale.id),
+                path: bytes(&root.join("docs")),
+                removals: Arc::from([]),
+                fallback: true,
+            },
+            &Cancellation::new(),
+        )
+        .expect("the stale read answers")
+        .expect("a folder");
+    let names: Vec<String> = view
+        .children(FolderTree::FOLDER)
+        .iter()
+        .map(|&child| String::from_utf8_lossy(view.name(child)).into_owned())
+        .collect();
+    assert!(names.contains(&"fresh.txt".to_owned()), "{names:?}");
+    let search = app.backend.search(
+        &SearchRequest {
+            session,
+            root: Arc::from(bytes(&root)),
+            source: SearchSource::Saved { snapshot: stale.id, stable_order: false },
+            query: "fresh".into(),
+            removals: Arc::from([]),
+            limit: 10,
+        },
+        &Cancellation::new(),
+    );
+    assert!(search.is_ok(), "{search:?}");
+}
+
+/// A quick Refresh retries folders the map could not read: once readable (access granted, which
+/// no change history reports), their contents appear without any reported change.
+#[test]
+fn a_quick_refresh_maps_folders_that_became_readable() {
+    use orbit_app_state::Backend as _;
+    use orbit_app_state::backend::RefreshRequest;
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    let root = fx.tree("root");
+    let locked = root.join("locked");
+    write(&locked.join("secret.bin"), 4_321);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return; // Privileges that ignore permissions.
+    }
+    let mut app = App::new(&fx, None);
+    app.open(&root);
+    app.until("the saved map", |a| a.published(&root));
+    let before = app.state.snapshot().unwrap().clone();
+    let session = app.state.active_session_id().unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let request = |retry_unreadable| RefreshRequest {
+        session,
+        root: Arc::from(bytes(&root)),
+        snapshot: before.id,
+        paths: Vec::new(),
+        subtrees: Vec::new(),
+        retry_unreadable,
+    };
+    let unchanged = app.backend.refresh(&request(false), &Cancellation::new()).unwrap();
+    assert_eq!(unchanged.id, before.id, "nothing reported, nothing retried");
+    let retried = app.backend.refresh(&request(true), &Cancellation::new()).unwrap();
+    assert_ne!(retried.id, before.id, "the readable folder was mapped");
+    let maps = app.fixture_maps();
+    let saved = maps.snapshot(&bytes(&root)).unwrap();
+    let tree = maps.view(&saved, &bytes(&locked), &[], None).unwrap();
+    let meta = tree.node(FolderTree::FOLDER).meta;
+    assert_eq!((meta.file_count, meta.size), (1, 4_321));
 }

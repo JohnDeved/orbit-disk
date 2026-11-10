@@ -6,7 +6,9 @@
 //! refresh_probe run     --dir DIR [--iterations 20]   maps DIR/root into a fresh cache, then
 //!                                                     times SavedMaps::refresh of the deep folder
 //!                                                     after a real change (a file grows) and
-//!                                                     after no change (same listing); prints JSON
+//!                                                     after no change (same listing), then a
+//!                                                     file in `Area 00` and one in the root, then
+//!                                                     reopening (journal recovery); prints JSON
 //! refresh_probe writer  --dir DIR [--interval-ms 200] [--seconds 0]
 //!                                                     appends to a file in the deep folder every
 //!                                                     interval (forever with --seconds 0)
@@ -120,6 +122,11 @@ fn writer(dir: &Path, interval: Duration, seconds: u64) {
     }
 }
 
+fn append(target: &Path) {
+    let mut file = std::fs::OpenOptions::new().append(true).create(true).open(target).unwrap();
+    file.write_all(b"orbit refresh probe line\n").unwrap();
+}
+
 /// User + system CPU seconds of this process.
 fn cpu_seconds() -> f64 {
     // SAFETY: zeroed rusage is valid POD; getrusage writes it.
@@ -185,25 +192,49 @@ fn run(dir: &Path, iterations: usize) {
     let (mut unchanged, mut unchanged_cpu) = (Vec::new(), Vec::new());
     let (mut search, mut search_cpu) = (Vec::new(), Vec::new());
     let mut kept = 0usize;
-    for iteration in 0..iterations {
-        let mut file = std::fs::OpenOptions::new().append(true).open(&target).unwrap();
-        file.write_all(b"orbit refresh probe line\n").unwrap();
-        drop(file);
-        let checkpoint = ChangeCheckpoint {
-            root: root.clone(),
-            identity: "refresh-probe".into(),
-            event_id: 1 + 2 * iteration as u64,
-        };
+    let mut event_id = 0u64;
+    let mut checkpoint = || {
+        event_id += 1;
+        ChangeCheckpoint { root: root.clone(), identity: "refresh-probe".into(), event_id }
+    };
+    for _ in 0..iterations {
+        append(&target);
+        let next = checkpoint();
         snapshot = timed(&mut changed, &mut changed_cpu, || {
-            maps.refresh(&snapshot, std::slice::from_ref(&deep_bytes), Some(&checkpoint), &cancel).unwrap()
+            maps.refresh(&snapshot, std::slice::from_ref(&deep_bytes), &[], Some(&next), &cancel).unwrap()
         });
-        let checkpoint = ChangeCheckpoint { event_id: 2 + 2 * iteration as u64, ..checkpoint };
+        let next = checkpoint();
         let before = snapshot.id.clone();
         snapshot = timed(&mut unchanged, &mut unchanged_cpu, || {
-            maps.refresh(&snapshot, std::slice::from_ref(&deep_bytes), Some(&checkpoint), &cancel).unwrap()
+            maps.refresh(&snapshot, std::slice::from_ref(&deep_bytes), &[], Some(&next), &cancel).unwrap()
         });
         kept += usize::from(snapshot.id == before);
         timed(&mut search, &mut search_cpu, || maps.prepare_search(&snapshot, &cancel).unwrap());
+    }
+    // A file changed in a shallow folder with a large subtree (like a home folder), and one changed
+    // directly in the mapped root. The monitor reports the changed file's parent folder.
+    let mut shallow = |folder: &Path, wall: &mut Vec<f64>, cpu: &mut Vec<f64>| {
+        let target = folder.join("probe change.log");
+        let folder = folder.as_os_str().as_bytes().to_vec();
+        for _ in 0..iterations {
+            append(&target);
+            let next = checkpoint();
+            snapshot = timed(wall, cpu, || {
+                maps.refresh(&snapshot, std::slice::from_ref(&folder), &[], Some(&next), &cancel).unwrap()
+            });
+        }
+    };
+    let (mut area, mut area_cpu) = (Vec::new(), Vec::new());
+    shallow(&root.join("Area 00"), &mut area, &mut area_cpu);
+    let (mut top, mut top_cpu) = (Vec::new(), Vec::new());
+    shallow(&root, &mut top, &mut top_cpu);
+    let _ = std::fs::remove_file(root.join("Area 00/probe change.log"));
+    let _ = std::fs::remove_file(root.join("probe change.log"));
+    // Reopening a saved map whose removal journal is already current.
+    let (mut reopen, mut reopen_cpu) = (Vec::new(), Vec::new());
+    for _ in 0..iterations {
+        let (_, published) = timed(&mut reopen, &mut reopen_cpu, || maps.recover(&snapshot, &cancel).unwrap());
+        assert!(published.is_none(), "a current journal must not republish the map");
     }
     let size = std::fs::metadata(&snapshot.database).map_or(0, |m| m.len());
     let result = serde_json::json!({
@@ -218,6 +249,12 @@ fn run(dir: &Path, iterations: usize) {
         "unchanged_refreshes_kept_the_map": kept,
         "prepare_search_after_refresh": summary(&search),
         "prepare_search_after_refresh_cpu": summary(&search_cpu),
+        "refresh_area_file": summary(&area),
+        "refresh_area_file_cpu": summary(&area_cpu),
+        "refresh_root_file": summary(&top),
+        "refresh_root_file_cpu": summary(&top_cpu),
+        "reopen_current_journal": summary(&reopen),
+        "reopen_current_journal_cpu": summary(&reopen_cpu),
         "usage": orbit_bench::rss_and_cpu(),
     });
     println!("{result}");

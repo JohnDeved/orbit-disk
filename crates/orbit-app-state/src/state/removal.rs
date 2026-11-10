@@ -211,7 +211,7 @@ impl AppState {
         if root_changed {
             self.set_updates_paused(true);
         } else {
-            self.pending_dirs.extend(parents);
+            self.pending_dirs.subtrees.extend(parents);
             self.removal_result_status = status;
             if self.snapshot.is_some() {
                 self.set_updates_paused(false);

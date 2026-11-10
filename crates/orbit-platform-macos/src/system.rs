@@ -133,7 +133,7 @@ pub fn cloud_status(path: &Path) -> Result<CloudStatus> {
         // SAFETY: zeroed stat is valid POD.
         let mut info: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: NUL-terminated path, writable out-param.
-        if unsafe { libc::lstat(c.as_ptr(), &mut info) } != 0 {
+        if orbit_platform::posix::retry_interrupted(|| unsafe { libc::lstat(c.as_ptr(), &mut info) }) != 0 {
             let error = PlatformError::last_os(path);
             return if error.code() == Some(libc::EDEADLK) { Ok(CloudStatus::Dataless) } else { Err(error) };
         }

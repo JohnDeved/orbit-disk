@@ -80,7 +80,12 @@ pub(crate) fn run<P: Platform>(
         }
     }
     let preferred = Some(request.route.clone()).filter(|route| orbit_core::paths::is_within(route, &root));
+    // A forced rescan starts from the saved map (unless it must be rebuilt for a new traversal),
+    // so it writes only what changed.
+    let seed =
+        request.force.then(|| inner.maps.snapshot(&root)).flatten().filter(|saved| !convert::needs_boot_upgrade(saved));
     let options = SessionOptions {
+        seed,
         workers: inner.options.workers,
         preferred,
         home: Some(inner.options.home.clone()),

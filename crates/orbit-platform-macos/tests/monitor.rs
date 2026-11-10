@@ -114,7 +114,7 @@ fn foreign_checkpoint_requests_a_full_refresh_first() {
         .unwrap();
     assert_eq!(start, MonitorStart::FullRefresh);
     let first = rx.recv_timeout(TIMEOUT).unwrap();
-    assert!(first.full_refresh && first.directories == vec![root.clone()], "{first:?}");
+    assert!(first.full_refresh && first.directories.is_empty() && first.subtrees == vec![root.clone()], "{first:?}");
     assert_eq!(first.checkpoint.identity, current_identity);
     wait_for(&rx, "history", |b| b.history_finished);
 

@@ -237,7 +237,7 @@ impl MacLister {
             let storage = self.buffer.as_mut_ptr().cast::<c_void>();
             // SAFETY: `attributes` and the 256 KiB buffer are valid for the call; the kernel
             // writes at most `BUFFER_BYTES` bytes.
-            let count = unsafe {
+            let count = orbit_platform::posix::retry_interrupted(|| unsafe {
                 libc::getattrlistbulk(
                     fd,
                     (&raw mut attributes).cast(),
@@ -245,7 +245,7 @@ impl MacLister {
                     BUFFER_BYTES,
                     u64::from(libc::FSOPT_PACK_INVAL_ATTRS),
                 )
-            };
+            });
             if count < 0 {
                 let code = errno();
                 if first_fill && matches!(code, libc::ENOTSUP | libc::EINVAL | libc::ENOSYS) {
@@ -392,7 +392,9 @@ impl MacLister {
         let error_path = || paths::to_path(path);
         // A separate descriptor keeps readdir's offset independent of the caller's.
         // SAFETY: live descriptor; "." is a static C string.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), c".".as_ptr(), DIR_OPEN_FLAGS) };
+        let fd = orbit_platform::posix::retry_interrupted(|| unsafe {
+            libc::openat(dir.as_raw_fd(), c".".as_ptr(), DIR_OPEN_FLAGS)
+        });
         if fd < 0 {
             return Err(PlatformError::os(error_path(), errno()));
         }
@@ -523,7 +525,10 @@ fn stat_at(fd: libc::c_int, name: &CStr) -> std::result::Result<libc::stat, i32>
     // SAFETY: zeroed stat is valid POD.
     let mut info: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: live descriptor, NUL-terminated name, writable out-param.
-    if unsafe { libc::fstatat(fd, name.as_ptr(), &mut info, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+    if orbit_platform::posix::retry_interrupted(|| unsafe {
+        libc::fstatat(fd, name.as_ptr(), &mut info, libc::AT_SYMLINK_NOFOLLOW)
+    }) != 0
+    {
         return Err(errno());
     }
     Ok(info)
@@ -539,7 +544,8 @@ fn read_at(fd: libc::c_int, name: &CStr) -> std::result::Result<Metadata, i32> {
     let mut is_mount_point = false;
     if is_dir {
         // SAFETY: live descriptor, NUL-terminated name.
-        let child = unsafe { libc::openat(fd, name.as_ptr(), DIR_OPEN_FLAGS) };
+        let child =
+            orbit_platform::posix::retry_interrupted(|| unsafe { libc::openat(fd, name.as_ptr(), DIR_OPEN_FLAGS) });
         if child >= 0 {
             struct Close(libc::c_int);
             impl Drop for Close {
@@ -552,7 +558,7 @@ fn read_at(fd: libc::c_int, name: &CStr) -> std::result::Result<Metadata, i32> {
             // SAFETY: zeroed stat is valid POD.
             let mut child_info: libc::stat = unsafe { std::mem::zeroed() };
             // SAFETY: live descriptor, writable out-param.
-            if unsafe { libc::fstat(child, &mut child_info) } != 0
+            if orbit_platform::posix::retry_interrupted(|| unsafe { libc::fstat(child, &mut child_info) }) != 0
                 || orbit_platform::posix::stat_identity(&child_info) != id
             {
                 return Err(libc::EAGAIN);
@@ -568,7 +574,7 @@ fn read_at(fd: libc::c_int, name: &CStr) -> std::result::Result<Metadata, i32> {
             };
             let mut value = [0u32; 2];
             // SAFETY: `attributes` and the 8-byte out buffer are valid for the call.
-            let status = unsafe {
+            let status = orbit_platform::posix::retry_interrupted(|| unsafe {
                 libc::fgetattrlist(
                     child,
                     (&raw mut attributes).cast(),
@@ -576,7 +582,7 @@ fn read_at(fd: libc::c_int, name: &CStr) -> std::result::Result<Metadata, i32> {
                     std::mem::size_of_val(&value),
                     0,
                 )
-            };
+            });
             if status == 0 && value[0] >= 8 {
                 is_mount_point = value[1] & libc::DIR_MNTSTATUS_MNTPOINT != 0;
             } else {
@@ -584,8 +590,9 @@ fn read_at(fd: libc::c_int, name: &CStr) -> std::result::Result<Metadata, i32> {
                 let (mut parent_fs, mut child_fs): (libc::statfs, libc::statfs) =
                     unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
                 // SAFETY: live descriptors, writable out-params.
-                let failed =
-                    unsafe { libc::fstatfs(fd, &mut parent_fs) != 0 || libc::fstatfs(child, &mut child_fs) != 0 };
+                let failed = orbit_platform::posix::retry_interrupted(|| unsafe { libc::fstatfs(fd, &mut parent_fs) })
+                    != 0
+                    || orbit_platform::posix::retry_interrupted(|| unsafe { libc::fstatfs(child, &mut child_fs) }) != 0;
                 if failed {
                     return Err(errno());
                 }

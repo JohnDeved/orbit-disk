@@ -80,7 +80,7 @@ fn partial_failures_keep_survivors_reviewable_and_refresh_their_parents() {
     h.run();
     assert_eq!(h.rows(), ["y.txt", "deep"]);
     h.advance(Duration::from_millis(1_500));
-    assert!(h.has_request(|r| matches!(r, Request::Refresh(req) if req.paths.contains(&b"/r/docs".to_vec()))));
+    assert!(h.has_request(|r| matches!(r, Request::Refresh(req) if req.subtrees.contains(&b"/r/docs".to_vec()))));
     h.settle();
     assert_eq!(status(&h).as_deref(), Some("Moved 1 item to Trash."), "the outcome survives the map update");
     assert!(error(&h).is_some());

@@ -126,7 +126,7 @@ impl AutomationModel for Mock {
     }
     fn reveal_selection(&mut self) {}
     fn preview_selection(&mut self) {}
-    fn refresh(&mut self) {}
+    fn refresh(&mut self, _everything: bool) {}
     fn stop_scan(&mut self) {}
     fn collect(&mut self, nodes: &[ItemInfo]) -> bool {
         self.collection.extend_from_slice(nodes);
@@ -351,4 +351,15 @@ fn prepare_removal_refuses_more_than_200_items() {
     harness.model.collection = (0..201).map(|index| file(&format!("f{index}"), &format!("1:{index}"), 1)).collect();
     let context = harness.model.context();
     assert_eq!(harness.error("prepare_removal", json!({"context": context, "mode": "trash"})), "too_many_items");
+}
+
+/// `refresh` takes an optional `everything`; leaving it out must work (an absent optional key
+/// once crashed the app).
+#[test]
+fn refresh_accepts_its_optional_everything_flag() {
+    let mut harness = Harness::new();
+    let context = harness.model.context();
+    harness.ok("refresh", json!({"context": context}));
+    harness.ok("refresh", json!({"context": context, "everything": true}));
+    assert_eq!(harness.error("refresh", json!({"context": context, "everything": "yes"})), "invalid_arguments");
 }

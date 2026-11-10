@@ -1,4 +1,4 @@
-//! Full-refresh marking probe, ported from `Benchmarks/DurableIndexing/MarkingProbe.swift`.
+//! Full-refresh marking probe, ported from the Swift `MarkingProbe` (tag `v0.9.15`).
 //!
 //! `marking_probe output-dir directory-count rounds`
 //!

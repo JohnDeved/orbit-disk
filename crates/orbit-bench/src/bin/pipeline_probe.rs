@@ -1,12 +1,12 @@
-//! Port of `Benchmarks/DurableIndexing/PipelineProbe.swift`: one full mapping session on real
+//! Port of the Swift `PipelineProbe` (tag `v0.9.15`): one full mapping session on real
 //! files (discovery and the stage writer overlapping), then publication and verification.
 //!
 //! ```text
 //! pipeline_probe ROOT CACHE FILES DIRECTORIES      (prints one JSON object)
 //! ```
 //!
-//! Output keys match the Swift probe so `scripts/benchmarks/run-indexing-pipeline.py` can run
-//! both interleaved. `CACHE` must not exist; the runner deletes it afterwards.
+//! Output keys are what `scripts/benchmarks/run-indexing-pipeline.py` reads (it can interleave
+//! several builds). `CACHE` must not exist; the runner deletes it afterwards.
 
 #![allow(clippy::default_constructed_unit_structs)] // `Native` is a unit struct only on some OSes.
 

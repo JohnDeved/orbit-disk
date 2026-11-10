@@ -109,7 +109,7 @@ pub fn lstat(path: &[u8]) -> Option<libc::stat> {
     // SAFETY: zeroed stat is valid POD.
     let mut info: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: NUL-terminated path, writable out-param.
-    (unsafe { libc::lstat(c.as_ptr(), &mut info) } == 0).then_some(info)
+    (orbit_platform::posix::retry_interrupted(|| unsafe { libc::lstat(c.as_ptr(), &mut info) }) == 0).then_some(info)
 }
 
 pub fn stat(path: &[u8]) -> Option<libc::stat> {
@@ -117,7 +117,7 @@ pub fn stat(path: &[u8]) -> Option<libc::stat> {
     // SAFETY: zeroed stat is valid POD.
     let mut info: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: NUL-terminated path, writable out-param.
-    (unsafe { libc::stat(c.as_ptr(), &mut info) } == 0).then_some(info)
+    (orbit_platform::posix::retry_interrupted(|| unsafe { libc::stat(c.as_ptr(), &mut info) }) == 0).then_some(info)
 }
 
 pub fn is_dir(info: &libc::stat) -> bool {
@@ -157,7 +157,7 @@ pub fn statfs_path(path: &[u8]) -> Option<libc::statfs> {
     // SAFETY: zeroed statfs is valid POD.
     let mut info: libc::statfs = unsafe { std::mem::zeroed() };
     // SAFETY: NUL-terminated path, writable out-param.
-    (unsafe { libc::statfs(c.as_ptr(), &mut info) } == 0).then_some(info)
+    (orbit_platform::posix::retry_interrupted(|| unsafe { libc::statfs(c.as_ptr(), &mut info) }) == 0).then_some(info)
 }
 
 /// `f_fsid` of a statfs record.

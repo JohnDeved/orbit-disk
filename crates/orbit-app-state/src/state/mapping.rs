@@ -22,7 +22,7 @@ use crate::hash::name_hash;
 use crate::ids::{RequestId, SessionId};
 use crate::model::{Item, ScanRemoval, SnapshotInfo};
 use crate::paths::{normalized, parent_or_root};
-use crate::session::{Remembered, Session};
+use crate::session::{ChangedFolders, Remembered, Session};
 
 pub(crate) const TITLE_MAPPING: &str = "Mapping your files…";
 pub(crate) const TITLE_OPENING: &str = "Opening saved map…";
@@ -241,7 +241,7 @@ impl AppState {
             if let Some(remembered) = &mut session.remembered {
                 remembered.selection = selection;
             }
-            session.pending_dirs.extend(dirs);
+            session.pending_dirs.append(dirs);
             session.pending_full_refresh |= full;
         }
     }
@@ -300,8 +300,8 @@ impl AppState {
         let status = session.removal_status().cloned();
         let error = session.removal_error().cloned();
         let removing = session.removing;
-        let mut dirs: Vec<Vec<u8>> = session.removal_parents.iter().cloned().collect();
-        dirs.extend(std::mem::take(&mut session.pending_dirs));
+        let mut dirs = std::mem::take(&mut session.pending_dirs);
+        dirs.subtrees.extend(session.removal_parents.iter().cloned());
         let full = std::mem::take(&mut session.pending_full_refresh);
         let route = if requested != root { requested.to_vec() } else { session.last_route.clone().unwrap_or(desired) };
         let finished = session.finished;
@@ -312,7 +312,7 @@ impl AppState {
         self.set_status(status.clone());
         self.set_error(error);
         self.removal_result_status = if removing { None } else { status };
-        self.pending_dirs.extend(dirs);
+        self.pending_dirs.append(dirs);
         self.pending_full_refresh = full;
         self.show_review = false;
         self.confirmation = None;
@@ -404,7 +404,8 @@ impl AppState {
         self.item_count = 0;
         self.progress_bytes = 0;
         self.set_error(None);
-        self.set_status(keep_map.then(|| "Refreshing the full map…".to_owned()));
+        // The footer names a rescan that keeps the saved map ("Rescanning …").
+        self.set_status(None);
         if !keep_map && self.search.query == query {
             self.set_query(String::new());
         }
@@ -463,8 +464,8 @@ impl AppState {
             None => {}
         }
         session.collection = session.collection.renewed(self.token());
-        self.pending_dirs.extend(session.removal_parents.iter().cloned());
-        self.pending_dirs.extend(std::mem::take(&mut session.pending_dirs));
+        self.pending_dirs.subtrees.extend(session.removal_parents.iter().cloned());
+        self.pending_dirs.append(std::mem::take(&mut session.pending_dirs));
         self.pending_full_refresh = std::mem::take(&mut session.pending_full_refresh);
         self.show_review = false;
         self.confirmation = None;
@@ -1062,7 +1063,7 @@ impl AppState {
             self.snapshot = Some(snapshot);
             self.scanning = false;
             self.refreshing = false;
-            self.pending_dirs.extend(parents);
+            self.pending_dirs.subtrees.extend(parents);
             self.schedule_refresh();
             return;
         }
@@ -1084,7 +1085,7 @@ impl AppState {
             self.snapshot = Some(saved.clone());
             self.scanning = false;
             self.refreshing = false;
-            self.pending_dirs.extend(parents);
+            self.pending_dirs.subtrees.extend(parents);
             self.set_status(status);
             if self.preview_session.is_none() {
                 self.partial = false;
@@ -1247,7 +1248,7 @@ impl AppState {
                     self.snapshot = Some(snapshot);
                     self.scanning = false;
                     self.refreshing = false;
-                    self.pending_dirs.extend(parents);
+                    self.pending_dirs.subtrees.extend(parents);
                     self.schedule_refresh();
                     return;
                 }
@@ -1277,7 +1278,7 @@ impl AppState {
                     self.display_mapping_failure(id, message);
                 }
             }
-            MappingEvent::Changes { directories, full_refresh } => {
+            MappingEvent::Changes { directories, subtrees, full_refresh } => {
                 if !active || self.monitored != Some(id) || self.updates_paused {
                     return;
                 }
@@ -1286,8 +1287,14 @@ impl AppState {
                     self.background_step = 0;
                 }
                 self.last_change = Some(now);
-                self.pending_dirs.extend(directories);
-                self.pending_full_refresh |= full_refresh;
+                // Reconciling the whole root is a rescan: the parallel one (seeded from the saved
+                // map) is much faster than relisting every folder in a serial repair.
+                let root_subtree = self
+                    .active_session()
+                    .is_some_and(|session| subtrees.iter().any(|subtree| subtree[..] == session.root[..]));
+                self.pending_dirs.listings.extend(directories);
+                self.pending_dirs.subtrees.extend(subtrees);
+                self.pending_full_refresh |= full_refresh || root_subtree;
                 self.schedule_refresh();
             }
             MappingEvent::MonitorUnavailable => {
@@ -1295,6 +1302,9 @@ impl AppState {
                     return;
                 }
                 self.monitored = None;
+                if let Some(session) = self.session_mut(id) {
+                    session.history_unavailable = true;
+                }
                 self.set_updates_paused(true);
                 self.set_status(Some("Saved map available. Automatic updates unavailable; use Refresh.".into()));
             }
@@ -1333,7 +1343,7 @@ impl AppState {
         if exceeded || full {
             self.pending_full_refresh = true;
         } else {
-            self.pending_dirs.extend(parents);
+            self.pending_dirs.subtrees.extend(parents);
         }
         self.deferred.preview = None;
         if blocked {
@@ -1445,6 +1455,35 @@ impl AppState {
         }
     }
 
+    /// Refresh / ⌘R: brings the map up to date as cheaply as its change history allows. An
+    /// unfinished map continues; a map without change history is read again; otherwise
+    /// monitoring (re)starts from the saved position, whose replay brings every change made
+    /// meanwhile (and asks for a full rescan itself when that history is gone), and folders the
+    /// map could not read are tried again. Only "Rescan Everything" always reads everything.
+    pub(crate) fn quick_refresh(&mut self) {
+        let Some(session) = self.active_session() else { return self.rescan() };
+        if self.snapshot.is_none() || self.partial {
+            return self.resume();
+        }
+        if session.history_unavailable {
+            return self.rescan();
+        }
+        let (id, stopped, root) = (session.id, session.stopped || session.failed, session.root.to_vec());
+        self.retry_unreadable = true;
+        if stopped {
+            // Republishes the saved map without reading folders, then monitors it.
+            self.set_updates_paused(false);
+            return self.open_location(root, false);
+        }
+        if self.monitored != Some(id) {
+            let Some(saved) = self.snapshot.clone() else { return };
+            self.set_updates_paused(false);
+            self.begin_monitoring(id, saved);
+        }
+        self.refresh_flush = true;
+        self.schedule_refresh();
+    }
+
     pub(crate) fn rescan(&mut self) {
         let root = self.root_path().map(<[u8]>::to_vec).or_else(|| self.active_session().map(|s| s.root.to_vec()));
         if let Some(root) = root {
@@ -1465,6 +1504,15 @@ impl AppState {
         is_within(directory, focus) || is_within(focus, directory)
     }
 
+    /// Whether refreshing `changes` can alter what is shown. A subtree at, above or below the
+    /// shown folder can; a listing only at or below it (re-listing an ancestor such as the home
+    /// folder for `~/.zsh_history` leaves the shown folder's contents alone).
+    pub(crate) fn changes_are_visible(&self, changes: &ChangedFolders) -> bool {
+        let Some(focus) = self.focus_folder() else { return !changes.is_empty() };
+        changes.listings.iter().any(|dir| is_within(dir, focus))
+            || changes.subtrees.iter().any(|dir| self.change_is_visible(dir))
+    }
+
     /// How soon the pending changes should be refreshed, ignoring a requested flush.
     fn pending_urgency(&self) -> RefreshUrgency {
         let recovery = self.active_session().is_some_and(|s| s.recovery_pending || s.pending_full_refresh);
@@ -1473,7 +1521,7 @@ impl AppState {
             || self.removal_result_status.is_some()
             || self.filtering()
             || self.show_review
-            || self.pending_dirs.iter().any(|dir| self.change_is_visible(dir))
+            || self.changes_are_visible(&self.pending_dirs)
         {
             RefreshUrgency::Visible
         } else {
@@ -1520,7 +1568,7 @@ impl AppState {
             || self.is_removing()
             || (self.updates_paused && !recovery)
             || self.refresh_request.is_some()
-            || (!self.pending_full_refresh && self.pending_dirs.is_empty())
+            || (!self.pending_full_refresh && self.pending_dirs.is_empty() && !self.retry_unreadable)
         {
             return;
         }
@@ -1559,7 +1607,7 @@ impl AppState {
             self.open_location(saved.root.to_vec(), true);
             return;
         }
-        if self.pending_dirs.is_empty() {
+        if self.pending_dirs.is_empty() && !self.retry_unreadable {
             return;
         }
         // Re-evaluated now: what is shown may have changed since the timer was set.
@@ -1570,7 +1618,7 @@ impl AppState {
             self.background_step = (self.background_step + 1).min(BACKGROUND_REFRESH_DELAYS.len() - 1);
         }
         self.refresh_flush = false;
-        let paths: Vec<Vec<u8>> = std::mem::take(&mut self.pending_dirs).into_iter().collect();
+        let paths = std::mem::take(&mut self.pending_dirs);
         let Some(session) = self.active_session() else { return };
         let versions: Vec<(Vec<u8>, u64)> = session.removal_versions.iter().map(|(p, v)| (p.clone(), *v)).collect();
         let (id, epoch, root) = (session.id, session.epoch, Arc::clone(&session.root));
@@ -1591,7 +1639,14 @@ impl AppState {
             versions,
             quiet,
         };
-        let request = crate::backend::RefreshRequest { session: id, root, snapshot: saved.id, paths };
+        let request = crate::backend::RefreshRequest {
+            session: id,
+            root,
+            snapshot: saved.id,
+            paths: paths.listings.into_iter().collect(),
+            subtrees: paths.subtrees.into_iter().collect(),
+            retry_unreadable: std::mem::take(&mut self.retry_unreadable),
+        };
         self.refresh_request = Some(self.request(pending, Request::Refresh(request)));
     }
 
@@ -1647,8 +1702,7 @@ impl AppState {
                 // Reload what is shown unless nothing it depends on changed: an unchanged map, or
                 // a background refresh of folders outside the displayed one.
                 let affected = removal_versions
-                    || (!unchanged
-                        && (!quiet || self.filtering() || paths.iter().any(|path| self.change_is_visible(path))));
+                    || (!unchanged && (!quiet || self.filtering() || self.changes_are_visible(&paths)));
                 if !self.partial && (affected || was_partial) {
                     let route = self
                         .requested_path
@@ -1662,20 +1716,21 @@ impl AppState {
             }
             Err(error) => {
                 self.refreshing = false;
-                self.pending_dirs.extend(paths);
+                self.pending_dirs.append(paths);
                 self.set_updates_paused(true);
                 if let Some(session) = self.monitored.take() {
                     self.send(Request::StopMonitor { session });
                 }
                 let prefix = self.removal_result_status.as_ref().map(|s| format!("{s} ")).unwrap_or_default();
                 let prior = self.removal_result_status.is_some().then(|| self.error.clone()).flatten();
-                self.set_status(Some(format!("{prefix}Map kept. Update failed; use Refresh to retry.")));
+                // A background update is not something the user asked for: its failure belongs in
+                // the footer (with the Refresh action), not in an alert. An error the user's own
+                // removal produced keeps its alert, with the update failure appended.
+                self.set_status(Some(format!("{prefix}Map kept. Update failed: {error}")));
                 self.removal_result_status = None;
-                let message = match prior {
-                    Some(prior) => format!("{prior}\nMap update failed: {error}"),
-                    None => error,
-                };
-                self.set_error(Some(message));
+                if let Some(prior) = prior {
+                    self.set_error(Some(format!("{prior}\nMap update failed: {error}")));
+                }
             }
         }
         if !quiet {

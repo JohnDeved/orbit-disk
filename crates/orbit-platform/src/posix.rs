@@ -9,6 +9,19 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
+/// Calls `call` again while it fails with `EINTR`: a signal arrived before the call did anything,
+/// so repeating it is exact. macOS returns `EINTR` from opens and stats in some folders (app
+/// containers, file providers), which otherwise failed whole listings and mappings. Never use
+/// it for `close`.
+pub fn retry_interrupted<T: Copy + PartialEq + From<i8>>(mut call: impl FnMut() -> T) -> T {
+    loop {
+        let result = call();
+        if result != T::from(-1) || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return result;
+        }
+    }
+}
+
 const DIR_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
 fn c_name(bytes: &[u8], path: &Path) -> Result<CString> {
@@ -20,7 +33,7 @@ pub fn identity(fd: BorrowedFd<'_>, path: &Path) -> Result<FileIdentity> {
     // SAFETY: `stat` is plain old data; zeroed is a valid value that fstat overwrites.
     let mut info: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `fd` is a live descriptor for the duration of the borrow; `info` is writable.
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut info) } != 0 {
+    if retry_interrupted(|| unsafe { libc::fstat(fd.as_raw_fd(), &mut info) }) != 0 {
         return Err(PlatformError::last_os(path));
     }
     Ok(stat_identity(&info))
@@ -45,7 +58,7 @@ const fn dev_mask() -> u64 {
 pub fn open_root(path: &Path) -> Result<(OwnedFd, FileIdentity)> {
     let c = c_name(path.as_os_str().as_bytes(), path)?;
     // SAFETY: `c` is a valid NUL-terminated string.
-    let fd = unsafe { libc::open(c.as_ptr(), DIR_FLAGS) };
+    let fd = retry_interrupted(|| unsafe { libc::open(c.as_ptr(), DIR_FLAGS) });
     if fd < 0 {
         return Err(PlatformError::last_os(path));
     }
@@ -64,7 +77,7 @@ pub fn open_child(
 ) -> Result<OwnedFd> {
     let c = c_name(name, path_for_errors)?;
     // SAFETY: `parent` is a live directory descriptor; `c` is NUL-terminated.
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), c.as_ptr(), DIR_FLAGS) };
+    let fd = retry_interrupted(|| unsafe { libc::openat(parent.as_raw_fd(), c.as_ptr(), DIR_FLAGS) });
     if fd < 0 {
         let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         // ELOOP/ENOTDIR: a symlink or file was swapped in where the directory was.
@@ -88,7 +101,10 @@ pub fn stat_at(parent: BorrowedFd<'_>, name: &[u8], path_for_errors: &Path) -> R
     // SAFETY: zeroed `stat` is valid POD.
     let mut info: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: live descriptor, NUL-terminated name, writable out-param.
-    if unsafe { libc::fstatat(parent.as_raw_fd(), c.as_ptr(), &mut info, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+    if retry_interrupted(|| unsafe {
+        libc::fstatat(parent.as_raw_fd(), c.as_ptr(), &mut info, libc::AT_SYMLINK_NOFOLLOW)
+    }) != 0
+    {
         return Err(PlatformError::last_os(path_for_errors));
     }
     Ok(info)
@@ -112,7 +128,7 @@ pub fn try_flock(fd: BorrowedFd<'_>, mode: LockMode, path: &Path) -> Result<bool
         LockMode::Exclusive => libc::LOCK_EX,
     } | libc::LOCK_NB;
     // SAFETY: live descriptor.
-    if unsafe { libc::flock(fd.as_raw_fd(), op) } == 0 {
+    if retry_interrupted(|| unsafe { libc::flock(fd.as_raw_fd(), op) }) == 0 {
         return Ok(true);
     }
     let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -123,7 +139,7 @@ pub fn try_flock(fd: BorrowedFd<'_>, mode: LockMode, path: &Path) -> Result<bool
 pub fn fsync_dir(dir: &Path) -> Result<()> {
     let (fd, _) = open_root(dir)?;
     // SAFETY: live descriptor.
-    if unsafe { libc::fsync(fd.as_raw_fd()) } != 0 {
+    if retry_interrupted(|| unsafe { libc::fsync(fd.as_raw_fd()) }) != 0 {
         return Err(PlatformError::last_os(dir));
     }
     Ok(())
@@ -222,7 +238,7 @@ pub fn fstat(fd: BorrowedFd<'_>) -> io::Result<Stat> {
     // SAFETY: zeroed `stat` is valid plain old data.
     let mut info: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `fd` is live for the borrow; `info` is writable.
-    if unsafe { libc::fstat(fd.as_raw_fd(), &mut info) } != 0 {
+    if retry_interrupted(|| unsafe { libc::fstat(fd.as_raw_fd(), &mut info) }) != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(Stat::from_raw(&info))
@@ -234,7 +250,9 @@ pub fn fstat_at(dir: BorrowedFd<'_>, name: &[u8]) -> io::Result<Stat> {
     // SAFETY: zeroed `stat` is valid plain old data.
     let mut info: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: live descriptor, NUL-terminated name, writable out-param.
-    if unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut info, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+    if retry_interrupted(|| unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut info, libc::AT_SYMLINK_NOFOLLOW) })
+        != 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(Stat::from_raw(&info))
@@ -246,7 +264,7 @@ pub fn lstat(path: &Path) -> io::Result<Stat> {
     // SAFETY: zeroed `stat` is valid plain old data.
     let mut info: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: NUL-terminated path, writable out-param.
-    if unsafe { libc::lstat(c.as_ptr(), &mut info) } != 0 {
+    if retry_interrupted(|| unsafe { libc::lstat(c.as_ptr(), &mut info) }) != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(Stat::from_raw(&info))
@@ -258,7 +276,7 @@ pub fn stat(path: &Path) -> io::Result<Stat> {
     // SAFETY: zeroed `stat` is valid plain old data.
     let mut info: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: NUL-terminated path, writable out-param.
-    if unsafe { libc::stat(c.as_ptr(), &mut info) } != 0 {
+    if retry_interrupted(|| unsafe { libc::stat(c.as_ptr(), &mut info) }) != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(Stat::from_raw(&info))
@@ -269,9 +287,9 @@ pub fn open_at(dir: BorrowedFd<'_>, name: &[u8], flags: libc::c_int, mode: u32) 
     let c = c_bytes(name)?;
     // SAFETY: live descriptor and NUL-terminated name; `mode` is the variadic argument `openat`
     // reads only with O_CREAT.
-    let fd = unsafe {
+    let fd = retry_interrupted(|| unsafe {
         libc::openat(dir.as_raw_fd(), c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC, mode as libc::c_uint)
-    };
+    });
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -292,7 +310,7 @@ pub fn create_exclusive_at(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::R
 pub fn mkdir_at(dir: BorrowedFd<'_>, name: &[u8], mode: u32) -> io::Result<()> {
     let c = c_bytes(name)?;
     // SAFETY: live descriptor and NUL-terminated name.
-    if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), mode as libc::mode_t) } != 0 {
+    if retry_interrupted(|| unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), mode as libc::mode_t) }) != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -303,7 +321,7 @@ pub fn unlink_at(dir: BorrowedFd<'_>, name: &[u8], directory: bool) -> io::Resul
     let c = c_bytes(name)?;
     let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
     // SAFETY: live descriptor and NUL-terminated name.
-    if unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), flags) } != 0 {
+    if retry_interrupted(|| unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), flags) }) != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -313,7 +331,9 @@ pub fn unlink_at(dir: BorrowedFd<'_>, name: &[u8], directory: bool) -> io::Resul
 pub fn rename_at(dir: BorrowedFd<'_>, from: &[u8], to: &[u8]) -> io::Result<()> {
     let (from, to) = (c_bytes(from)?, c_bytes(to)?);
     // SAFETY: live descriptor and NUL-terminated names.
-    if unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) } != 0 {
+    if retry_interrupted(|| unsafe { libc::renameat(dir.as_raw_fd(), from.as_ptr(), dir.as_raw_fd(), to.as_ptr()) })
+        != 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -321,7 +341,7 @@ pub fn rename_at(dir: BorrowedFd<'_>, from: &[u8], to: &[u8]) -> io::Result<()> 
 
 pub fn fchmod(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
     // SAFETY: live descriptor.
-    if unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) } != 0 {
+    if retry_interrupted(|| unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) }) != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -329,7 +349,7 @@ pub fn fchmod(fd: BorrowedFd<'_>, mode: u32) -> io::Result<()> {
 
 pub fn fsync(fd: BorrowedFd<'_>) -> io::Result<()> {
     // SAFETY: live descriptor.
-    if unsafe { libc::fsync(fd.as_raw_fd()) } != 0 {
+    if retry_interrupted(|| unsafe { libc::fsync(fd.as_raw_fd()) }) != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -337,7 +357,7 @@ pub fn fsync(fd: BorrowedFd<'_>) -> io::Result<()> {
 
 pub fn read(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<usize> {
     // SAFETY: live descriptor; the buffer is writable for its full length.
-    let count = unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) };
+    let count = retry_interrupted(|| unsafe { libc::read(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len()) });
     if count < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -347,7 +367,7 @@ pub fn read(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<usize> {
 pub fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> io::Result<()> {
     while !bytes.is_empty() {
         // SAFETY: live descriptor; `bytes` is readable for its full length.
-        let count = unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+        let count = retry_interrupted(|| unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) });
         if count <= 0 {
             return Err(io::Error::last_os_error());
         }
@@ -416,5 +436,45 @@ mod tests {
         let err = open_child(root.as_fd_borrowed(), b"link", real, &dir.join("link")).unwrap_err();
         assert!(matches!(err, PlatformError::IdentityChanged { .. }), "{err:?}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod interrupted_tests {
+    fn set_errno(value: libc::c_int) {
+        // SAFETY: the thread's errno slot.
+        unsafe {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                *libc::__error() = value;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                *libc::__errno_location() = value;
+            }
+        }
+    }
+
+    /// An interrupted call is repeated until it completes; other failures return at once.
+    #[test]
+    fn interrupted_calls_are_repeated_and_other_failures_returned() {
+        let mut calls = 0;
+        let result = super::retry_interrupted(|| {
+            calls += 1;
+            if calls < 3 {
+                set_errno(libc::EINTR);
+                -1
+            } else {
+                7
+            }
+        });
+        assert_eq!((result, calls), (7, 3));
+        let mut calls = 0;
+        let result = super::retry_interrupted(|| {
+            calls += 1;
+            set_errno(libc::ENOENT);
+            -1
+        });
+        assert_eq!((result, calls), (-1, 1));
     }
 }

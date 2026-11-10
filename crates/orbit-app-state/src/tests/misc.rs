@@ -22,7 +22,7 @@ fn hidden_refresh_keeps_the_map_and_reads_counts_at_most_every_half_second() {
     let mut h = harness();
     h.open_mapped(b"/r");
     let revision = h.state.map_revision();
-    h.send(Event::Refresh);
+    h.send(Event::RescanEverything);
     h.run();
     assert!(h.mappings.last().unwrap().keep_map, "a full refresh keeps the saved map visible");
     assert!(h.state.is_refreshing() && !h.state.is_partial());
@@ -53,9 +53,15 @@ fn monitor_changes_debounce_into_one_refresh_and_a_failed_update_pauses() {
     let mut h = harness();
     h.open_mapped(b"/r");
     h.backend.add_file(b"/r/docs/new.txt", 3);
-    h.mapping(b"/r", MappingEvent::Changes { directories: vec![b"/r/docs".to_vec()], full_refresh: false });
+    h.mapping(
+        b"/r",
+        MappingEvent::Changes { directories: vec![b"/r/docs".to_vec()], subtrees: Vec::new(), full_refresh: false },
+    );
     h.advance(Duration::from_millis(1_000));
-    h.mapping(b"/r", MappingEvent::Changes { directories: vec![b"/r/big".to_vec()], full_refresh: false });
+    h.mapping(
+        b"/r",
+        MappingEvent::Changes { directories: vec![b"/r/big".to_vec()], subtrees: Vec::new(), full_refresh: false },
+    );
     assert!(!h.has_request(is_refresh));
     h.advance(Duration::from_millis(500));
     let refresh = h.take(is_refresh).unwrap();
@@ -68,14 +74,20 @@ fn monitor_changes_debounce_into_one_refresh_and_a_failed_update_pauses() {
     assert_eq!(status(&h).as_deref(), Some("Updated changed folders."));
     // A failed update keeps the map, pauses updates and offers Refresh.
     h.backend.fail_next_refresh("disk busy");
-    h.mapping(b"/r", MappingEvent::Changes { directories: vec![b"/r/docs".to_vec()], full_refresh: false });
+    h.mapping(
+        b"/r",
+        MappingEvent::Changes { directories: vec![b"/r/docs".to_vec()], subtrees: Vec::new(), full_refresh: false },
+    );
     h.settle();
-    assert_eq!(status(&h).as_deref(), Some("Map kept. Update failed; use Refresh to retry."));
-    assert_eq!(error(&h).as_deref(), Some("disk busy"));
+    assert_eq!(status(&h).as_deref(), Some("Map kept. Update failed: disk busy"));
+    assert_eq!(error(&h).as_deref(), None, "a background update failure raises no alert");
     assert!(h.state.updates_paused());
     assert_eq!(h.state.footer().map(|f| f.action), Some(crate::footer::FooterAction::Refresh));
     // Changes while paused are ignored.
-    h.mapping(b"/r", MappingEvent::Changes { directories: vec![b"/r/big".to_vec()], full_refresh: false });
+    h.mapping(
+        b"/r",
+        MappingEvent::Changes { directories: vec![b"/r/big".to_vec()], subtrees: Vec::new(), full_refresh: false },
+    );
     h.advance(Duration::from_secs(2));
     assert!(!h.has_request(is_refresh));
 }

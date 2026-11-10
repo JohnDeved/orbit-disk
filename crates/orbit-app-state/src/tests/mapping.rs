@@ -261,7 +261,10 @@ fn gesture_holds_a_refreshed_folder_and_a_background_name_sort() {
     assert!(h.state.is_sorting_rows());
     // Monitor reports a change in the open folder; the refreshed folder is held.
     h.backend.add_file(b"/r/many/zzz", 1);
-    h.mapping(b"/r", MappingEvent::Changes { directories: vec![b"/r/many".to_vec()], full_refresh: false });
+    h.mapping(
+        b"/r",
+        MappingEvent::Changes { directories: vec![b"/r/many".to_vec()], subtrees: Vec::new(), full_refresh: false },
+    );
     h.settle();
     assert_eq!(h.state.row_count(), 2_100, "refreshed rows wait for the release");
     assert!(h.state.is_sorting_rows(), "the sort result waits too");
@@ -373,7 +376,7 @@ fn stop_effects_are_emitted_for_replaced_sessions_only() {
     h.open(b"/s");
     // Switching roots keeps /r mapping in the background.
     assert!(!h.backend.log().contains(&"stop".to_owned()));
-    h.send(Event::Refresh);
+    h.send(Event::RescanEverything);
     h.run();
     assert!(h.backend.log().contains(&"stop".to_owned()), "a forced refresh replaces the session");
     let effects = h.state.handle(Event::Pause, h.now);
@@ -386,7 +389,7 @@ fn switching_away_during_a_refresh_restores_the_refreshing_map() {
     h.open_mapped(b"/r");
     h.send(Event::Open { path: p("/r/docs") });
     h.run();
-    h.send(Event::Refresh);
+    h.send(Event::RescanEverything);
     h.run();
     assert!(h.state.is_refreshing());
     h.open_mapped(b"/s");

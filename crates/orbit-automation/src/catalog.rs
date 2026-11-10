@@ -124,8 +124,8 @@ fn build_tools() -> Vec<Value> {
         tool("preview", "Open Quick Look for a file.", vec![ctx(), it()], &["context", "item"], Mutating),
         tool(
             "refresh",
-            "Refresh the active map. Normal scan already reuses cached work; use this only when a refresh is needed.",
-            vec![ctx()],
+            "Bring the active map up to date: replays the folder changes the system recorded and retries folders that could not be read (fast). everything=true reads the whole location again instead (slow; only changes are written). Use only when a refresh is needed.",
+            vec![ctx(), ("everything", json!({"type": "boolean"}))],
             &["context"],
             Mutating,
         ),

@@ -57,6 +57,8 @@ use crate::warm::{REFRESH_WARM_DELAY, SearchWarmer};
 
 /// How long removal-policy inputs (cloud roots, mounted volumes) are reused between checks.
 const POLICY_INPUTS_TTL: Duration = Duration::from_secs(2);
+/// Folders a quick Refresh re-lists at most to retry ones that could not be read.
+const RETRY_LIMIT: usize = 1024;
 
 /// Configuration of an [`EngineBackend`].
 #[derive(Clone)]
@@ -155,7 +157,8 @@ impl<P: Platform> EngineBackend<P> {
     /// A backend with explicit locations and tuning (tests, tools). Does not touch obsolete
     /// caches.
     pub fn with_options(platform: Arc<P>, options: BackendOptions) -> Self {
-        let maps = Arc::new(SavedMaps::new(Arc::clone(&platform), options.paths.clone()));
+        let maps =
+            Arc::new(SavedMaps::new(Arc::clone(&platform), options.paths.clone()).with_home(options.home.clone()));
         Self {
             inner: Arc::new(Inner {
                 platform,
@@ -269,6 +272,14 @@ impl<P: Platform> Inner<P> {
         self.snapshots.lock().get(id).ok_or_else(|| MAP_UNAVAILABLE.to_owned())
     }
 
+    /// The saved map that replaced `snapshot` (a refresh published it while this read was on its
+    /// way); `None` when there is none. Reads then answer from it: the same folder, a moment
+    /// later. The app learns about the new map from the refresh reply and reconciles then, so a
+    /// read must not fail (with an alert) in between.
+    fn replacement(&self, snapshot: &CoreSnapshot) -> Option<CoreSnapshot> {
+        self.maps.snapshot(&snapshot.root_path).filter(|current| current.id != snapshot.id)
+    }
+
     /// The saved folder at `path`, or its nearest indexed ancestor.
     fn saved_view(
         &self,
@@ -279,9 +290,16 @@ impl<P: Platform> Inner<P> {
     ) -> Result<FolderTree, String> {
         let root = snapshot.root_path.as_slice();
         let mut path = if is_within(path, root) { path } else { root };
+        let mut snapshot = std::borrow::Cow::Borrowed(snapshot);
         loop {
-            match self.maps.view(snapshot, path, removals, Some(cancel)) {
+            match self.maps.view(&snapshot, path, removals, Some(cancel)) {
                 Ok(tree) => return Ok(tree),
+                Err(CoreError::SnapshotChanged) if matches!(snapshot, std::borrow::Cow::Borrowed(_)) => {
+                    match self.replacement(&snapshot) {
+                        Some(current) => snapshot = std::borrow::Cow::Owned(current),
+                        None => return Err(message(&CoreError::SnapshotChanged)),
+                    }
+                }
                 Err(CoreError::Invalid(_)) if path != root => path = parent(path).unwrap_or(root),
                 Err(CoreError::Invalid(_)) => return Err(FOLDER_UNAVAILABLE.to_owned()),
                 Err(error) => return Err(message(&error)),
@@ -505,9 +523,17 @@ impl<P: Platform> Backend for EngineBackend<P> {
         if !inner.maps.is_search_prepared(&saved) {
             inner.warmer.schedule(saved.clone(), Duration::ZERO);
         }
-        let results =
-            result_message(inner.maps.search(&saved, &request.query, &request.removals, request.limit, Some(cancel)))?;
-        Ok(convert::search_reply(results, 0))
+        let search = |saved: &CoreSnapshot| {
+            inner.maps.search(saved, &request.query, &request.removals, request.limit, Some(cancel))
+        };
+        let results = match search(&saved) {
+            Err(CoreError::SnapshotChanged) => match inner.replacement(&saved) {
+                Some(current) => search(&current),
+                None => Err(CoreError::SnapshotChanged),
+            },
+            other => other,
+        };
+        Ok(convert::search_reply(result_message(results)?, 0))
     }
 
     fn identity(&self, path: &[u8]) -> Option<FileIdentity> {
@@ -545,8 +571,13 @@ impl<P: Platform> Backend for EngineBackend<P> {
         let entry = inner.entry(request.session);
         // Only history whose folders this refresh re-lists may be marked as applied. A failed
         // refresh forgets those batches: the retry then keeps the older position (safe).
-        let checkpoint = entry.as_ref().and_then(|e| e.ledger.lock().settle(&request.paths));
-        let updated = result_message(inner.maps.refresh(&saved, &request.paths, checkpoint.as_ref(), cancel))?;
+        let checkpoint = entry.as_ref().and_then(|e| e.ledger.lock().settle(&request.paths, &request.subtrees));
+        let mut listings = request.paths.clone();
+        if request.retry_unreadable {
+            listings.extend(result_message(inner.maps.retry_candidates(&saved, RETRY_LIMIT))?);
+        }
+        let updated =
+            result_message(inner.maps.refresh(&saved, &listings, &request.subtrees, checkpoint.as_ref(), cancel))?;
         let (info, _) = inner.describe(&updated)?;
         if let Some(entry) = entry {
             entry.set_saved(updated.clone());
@@ -577,10 +608,13 @@ impl<P: Platform> Backend for EngineBackend<P> {
             event_id: saved.event_id,
         });
         entry.ledger.lock().clear();
+        // Like the map itself, the monitor ignores the engine's own files and cloud storage.
+        let mut exclusions = inner.options.paths.exclusion_roots();
+        exclusions.extend(inner.platform.cloud_roots(&inner.options.home));
         let started = MonitorRun::start(
             inner.platform.new_monitor(),
             root,
-            &inner.options.paths.exclusion_roots(),
+            &exclusions,
             since.as_ref(),
             session,
             Arc::clone(&notify),

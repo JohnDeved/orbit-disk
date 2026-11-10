@@ -64,7 +64,7 @@ impl Platform for MacPlatform {
         // SAFETY: zeroed statfs is valid POD.
         let mut info: libc::statfs = unsafe { std::mem::zeroed() };
         // SAFETY: live descriptor, writable out-param.
-        if unsafe { libc::fstatfs(dir.as_raw_fd(), &mut info) } != 0 {
+        if orbit_platform::posix::retry_interrupted(|| unsafe { libc::fstatfs(dir.as_raw_fd(), &mut info) }) != 0 {
             return None;
         }
         Some(paths::lossy(&paths::mount_on_name(&info)))

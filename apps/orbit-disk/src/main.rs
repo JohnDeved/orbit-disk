@@ -275,16 +275,20 @@ fn register_app_actions(host: &Host, shell: &Rc<dyn Shell>, cx: &mut App) {
             }
         });
     }
+    // Menu actions arrive while GPUI is still updating the key window, where updating that
+    // window again (to queue an alert or show a native prompt) fails silently. Alerts are
+    // therefore presented once the current update has finished.
     cx.on_action(|_: &actions::AiIntegration, cx| {
         if let Some(window) = cx.active_window().or_else(main_window_handle) {
-            dialogs::ai_integration(window, cx);
+            cx.defer(move |cx| dialogs::ai_integration(window, cx));
         }
     });
     {
         let (host, shell) = (host.clone(), Rc::clone(shell));
         cx.on_action(move |_: &actions::ClearCache, cx| {
             if let Some(window) = main_window_handle() {
-                dialogs::clear_cache(window, host.clone(), Rc::clone(&shell), cx);
+                let (host, shell) = (host.clone(), Rc::clone(&shell));
+                cx.defer(move |cx| dialogs::clear_cache(window, host, shell, cx));
             }
         });
     }

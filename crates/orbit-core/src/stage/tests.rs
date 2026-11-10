@@ -217,6 +217,74 @@ fn relisting_trims_stale_files_and_prunes_stale_subtrees() {
     assert_consistent(&w);
 }
 
+/// Counts every insert, update and delete of `nodes` from now on (read with [`node_writes`]).
+fn count_node_writes(w: &Writer) {
+    w.connection()
+        .execute_batch(
+            "CREATE TEMP TABLE node_writes(n INTEGER); INSERT INTO node_writes VALUES(0);
+             CREATE TEMP TRIGGER node_insert AFTER INSERT ON main.nodes BEGIN UPDATE node_writes SET n=n+1; END;
+             CREATE TEMP TRIGGER node_update AFTER UPDATE ON main.nodes BEGIN UPDATE node_writes SET n=n+1; END;
+             CREATE TEMP TRIGGER node_delete AFTER DELETE ON main.nodes BEGIN UPDATE node_writes SET n=n+1; END;",
+        )
+        .unwrap();
+}
+
+fn node_writes(w: &Writer) -> i64 {
+    w.connection().query_row("SELECT n FROM node_writes", [], |row| row.get(0)).unwrap()
+}
+
+/// Rescanning unchanged data writes nothing: every relisted row matches and stays as it is, and
+/// a relisting that saw all its rows needs no trim.
+#[test]
+fn an_unchanged_relisting_writes_no_rows_and_needs_no_trim() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut w = open_writer(&tmp.path().join("s.sqlite"));
+    let root = vec![dir("a", 10), file("f", 11, 1000), file("g", 12, 2000)];
+    assert!(relist(&mut w, b"/r", &root));
+    assert!(relist(&mut w, b"/r/a", &[file("x", 20, 300)]));
+    drain(&mut w);
+    let before = totals(&w, b"/r");
+    w.mark_dirty(b"/r").unwrap();
+    w.mark_dirty(b"/r/a").unwrap();
+    count_node_writes(&w);
+    assert!(relist(&mut w, b"/r", &root));
+    assert!(relist(&mut w, b"/r/a", &[file("x", 20, 300)]));
+    assert_eq!(node_writes(&w), 0, "an unchanged relisting rewrote rows");
+    assert!(!w.has_trim().unwrap(), "nothing is stale");
+    assert!(!w.is_dirty(b"/r").unwrap() && !w.is_dirty(b"/r/a").unwrap());
+    assert_eq!(totals(&w, b"/r"), before);
+    assert_consistent(&w);
+}
+
+/// Only what changed is written; rows left untouched survive the trim of the stale ones.
+#[test]
+fn a_changed_relisting_writes_changes_and_keeps_untouched_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut w = open_writer(&tmp.path().join("s.sqlite"));
+    let kept: Vec<Rec> = (0..20).map(|i| file(&format!("keep{i}"), 100 + i, 10)).collect();
+    let mut root = kept.clone();
+    root.push(file("grow", 200, 1000));
+    root.push(file("gone", 201, 5000));
+    assert!(relist(&mut w, b"/r", &root));
+    drain(&mut w);
+    w.mark_dirty(b"/r").unwrap();
+    count_node_writes(&w);
+    let mut now = kept.clone();
+    now.push(file("grow", 200, 3000));
+    now.push(file("new", 202, 7));
+    assert!(relist(&mut w, b"/r", &now));
+    assert!(w.has_trim().unwrap(), "\"gone\" is stale");
+    drain(&mut w);
+    // grow (update) + new (insert) + 20 untouched rows stamped for the trim + gone (delete), and
+    // the folder's own totals once for the listing and once for the trim.
+    assert_eq!(node_writes(&w), 1 + 1 + 20 + 1 + 2);
+    assert_eq!(w.count(b"/r").unwrap(), 22);
+    let files: i64 = 20 + 2;
+    assert_eq!(totals(&w, b"/r").2, files);
+    assert_eq!(totals(&w, b"/r").0, 20 * 10 + 3000 + 7);
+    assert_consistent(&w);
+}
+
 #[test]
 fn trim_without_stale_rows_acknowledges_and_guards_hold() {
     let tmp = tempfile::tempdir().unwrap();
@@ -224,18 +292,30 @@ fn trim_without_stale_rows_acknowledges_and_guards_hold() {
     assert!(relist(&mut w, b"/r", &[dir("a", 10), file("f", 11, 1)]));
     drain(&mut w);
     w.mark_dirty(b"/r").unwrap();
+    // A relisting that saw every row has nothing to trim: it is acknowledged without a marker.
     assert!(relist(&mut w, b"/r", &[dir("a", 10), file("f", 11, 1)]));
-    // The trim marker is consumed in one empty transaction with the acknowledgement.
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let seen = events.clone();
-    w.set_commit_hook(Some(Box::new(move |event, _| seen.lock().push(event.to_string()))));
-    assert!(w.trim_one_chunk().unwrap());
-    assert!(events.lock().iter().any(|e| e == "trim-empty-committed"));
+    assert!(!w.has_trim().unwrap());
     assert!(!w.is_dirty(b"/r").unwrap());
-    // A newer revision keeps the directory pending even though its old trim ran.
+    // A trim marker without stale rows is consumed in one empty transaction.
+    assert!(relist(&mut w, b"/r/a", &[file("old", 12, 1)]));
+    drain(&mut w);
     w.mark_dirty(b"/r/a").unwrap();
     let mut cursor = ListingCursor::default();
     assert!(w.finish(b"/r/a", &mut cursor, 1, Some(0), 0, &[], None).unwrap());
+    assert!(w.has_trim().unwrap(), "the unseen row is stale");
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let seen = events.clone();
+    w.set_commit_hook(Some(Box::new(move |event, _| seen.lock().push(event.to_string()))));
+    while w.trim_one_chunk().unwrap() {}
+    assert!(events.lock().iter().any(|e| e == "trim-empty-committed"));
+    assert!(!w.is_dirty(b"/r/a").unwrap());
+    // A newer revision keeps the directory pending even though its old trim ran.
+    assert!(relist(&mut w, b"/r/a", &[file("old", 12, 1)]));
+    drain(&mut w);
+    w.mark_dirty(b"/r/a").unwrap();
+    let revision = w.dirty_revision(b"/r/a").unwrap();
+    let mut cursor = ListingCursor::default();
+    assert!(w.finish(b"/r/a", &mut cursor, revision, Some(0), 0, &[], None).unwrap());
     w.mark_dirty(b"/r/a").unwrap();
     assert!(w.trim_one_chunk().unwrap());
     assert!(w.is_dirty(b"/r/a").unwrap());
@@ -814,8 +894,11 @@ fn mailbox_batches_are_committed_with_their_watermark() {
     assert!(mailbox.is_drained());
     let watermark = stage.writer_ref().watermark().unwrap().unwrap();
     assert_eq!((watermark.generation, watermark.sequence), (mailbox.generation(), mailbox.stats().sequence));
-    // The three small leaves went through one grouped transaction.
-    assert!(outcomes.iter().any(|o| matches!(o, StepOutcome::Progressed { records: 6, .. })));
+    // Steps share transaction groups: every record was written exactly once, in few groups.
+    let written: usize =
+        outcomes.iter().map(|o| if let StepOutcome::Progressed { records, .. } = o { *records } else { 0 }).sum();
+    assert_eq!(written, 5 + 3 * 2 + 1500);
+    assert!(outcomes.len() < 6, "{} steps for one small tree", outcomes.len());
     let tree = stage.reader().view(&f.root_bytes(), &[], None, 1, None).unwrap();
     let meta = tree.node(FolderTree::FOLDER).meta;
     assert_eq!(
@@ -823,6 +906,40 @@ fn mailbox_batches_are_committed_with_their_watermark() {
         (10 + 3000 + 3 * 4096 + 1500, 4096 + 3 * 4096 + 4096 + 1500 * 4096, 1 + 6 + 1500)
     );
     assert_consistent(stage.writer_ref());
+}
+
+/// Steps share one transaction group, and only its commit makes them durable: a failure in a
+/// later folder of the group discards the earlier ones too, so nothing half-written or claimed
+/// as written survives; the next session lists those folders again.
+#[test]
+fn a_failed_transaction_group_writes_nothing() {
+    let f = Fixture::new();
+    for d in ["a", "b"] {
+        std::fs::create_dir(f.root.join(d)).unwrap();
+    }
+    let mut stage = f.open();
+    let mailbox = mailbox_for(&f);
+    mailbox.enqueue(listing(&f, "", &with_dirs(&f, &["a", "b"], &[file("top", 1, 10)]), true)).unwrap();
+    mailbox.enqueue(listing(&f, "a", &with_dirs(&f, &[], &[file("one", 2, 20)]), true)).unwrap();
+    mailbox.enqueue(listing(&f, "b", &with_dirs(&f, &[], &[file("two", 3, 30)]), true)).unwrap();
+    mailbox.finish();
+    let settled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&settled);
+    stage.set_before_acknowledge(Some(Box::new(move |_| {
+        // The second folder of the group fails after the first was written into it.
+        if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            return Err(CoreError::Invalid("injected".into()));
+        }
+        Ok(())
+    })));
+    assert!(stage.step(Some(&mailbox)).is_err());
+    assert!(settled.load(std::sync::atomic::Ordering::SeqCst) >= 2, "the group spanned several folders");
+    // As for any writer failure, the session stops; resuming lists from what is durable.
+    assert!(mailbox.is_cancelled(), "the failed session stopped consuming");
+    assert_eq!(stage.writer_ref().watermark().unwrap(), None, "nothing was made durable");
+    let rows: i64 = stage.writer_ref().connection().query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0)).unwrap();
+    assert_eq!(rows, 1, "only the root's own row remains: {rows}");
+    assert!(stage.writer_ref().connection().is_autocommit(), "the group was closed");
 }
 
 #[test]

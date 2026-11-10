@@ -64,12 +64,15 @@ impl Shared {
             delivery.identity.clear();
             delivery.latest_event_id = 0;
         }
-        let directories: Vec<PathBuf> = if prepared.full_refresh {
-            vec![paths::to_path(&self.plan.root_path)]
-        } else {
-            prepared.directories.iter().map(|d| paths::to_path(d)).collect()
+        let to_paths = |set: &std::collections::BTreeSet<Vec<u8>>| -> Vec<PathBuf> {
+            set.iter().map(|d| paths::to_path(d)).collect()
         };
-        if directories.is_empty() && !prepared.full_refresh && !prepared.history_finished {
+        let (directories, subtrees) = if prepared.full_refresh {
+            (Vec::new(), vec![paths::to_path(&self.plan.root_path)])
+        } else {
+            (to_paths(&prepared.directories), to_paths(&prepared.subtrees))
+        };
+        if directories.is_empty() && subtrees.is_empty() && !prepared.full_refresh && !prepared.history_finished {
             return;
         }
         let checkpoint = ChangeCheckpoint {
@@ -79,6 +82,7 @@ impl Shared {
         };
         (delivery.sink)(ChangeBatch {
             directories,
+            subtrees,
             full_refresh: prepared.full_refresh,
             history_finished: prepared.history_finished,
             checkpoint,
@@ -296,7 +300,7 @@ impl ChangeMonitor for FsEventsMonitor {
         // SAFETY: plain FSEvents query.
         let current = unsafe { FSEventsGetCurrentEventId() };
         let can_replay = since.is_some_and(|since| {
-            since.identity == plan.checkpoint.identity
+            plan.same_history(&since.identity)
                 && since.event_id <= current
                 && since.event_id != kFSEventStreamEventIdSinceNow
         });
@@ -349,6 +353,10 @@ impl ChangeMonitor for FsEventsMonitor {
 
     fn history_unchanged_since(&self, checkpoint: &ChangeCheckpoint, timeout: Duration) -> bool {
         probe::validate(checkpoint, timeout)
+    }
+
+    fn can_replay(&self, root: &Path) -> bool {
+        EventPlan::inspect(root).is_ok_and(|plan| plan.supports_replay)
     }
 }
 

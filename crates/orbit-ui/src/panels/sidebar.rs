@@ -1,7 +1,7 @@
 //! Places column (Swift `ContentView.sidebar`, `FolderPlaces`): 210 points wide below the title
 //! bar.
 //!
-//! - "Devices": one card per volume (name, capacity bar, available space) in a fixed 100-point
+//! - "Devices": one card per volume (name, capacity bar, "available … of total") in a fixed 100-point
 //!   area that scrolls, so volume metadata arriving never moves Places.
 //! - "Places": Home, Downloads, Documents, Applications, the user's folders ("Remove from Places"
 //!   on right click) and "Choose a folder…". The highlighted place is the deepest one containing
@@ -152,6 +152,9 @@ impl SidebarPanel {
         } else {
             0.0
         };
+        // "21.01 GB available … of 494 GB": the total right-aligned and quieter, rounded to three
+        // significant digits so both fit the card's width without truncating either.
+        let total = (volume.capacity > 0).then(|| format!("of {}", compact_size(volume.capacity)));
         let detail = if volume.capacity > 0 {
             format!("{} available", theme::format_bytes(volume.available))
         } else if discovering {
@@ -198,14 +201,35 @@ impl SidebarPanel {
                         ),
                     )
                     .child(theme::monospaced_digits(
+                        // One truncating line, as before, with the total pinned to its right edge
+                        // (a flex row here kept GPUI from laying out the capacity bar above).
                         div()
+                            .relative()
                             .text_size(theme::TEXT_SMALL)
                             .text_color(theme::color(theme::SLATE))
                             .truncate()
-                            .child(detail),
+                            .child(detail)
+                            .children(total.map(|total| {
+                                div().absolute().top_0().right_0().text_color(theme::color(theme::NEUTRAL)).child(total)
+                            })),
                     )),
             )
     }
+}
+
+/// A volume size with three significant digits ("494 GB", "1.82 TB", "64.0 GB").
+fn compact_size(bytes: u64) -> String {
+    let text = theme::format_bytes(bytes);
+    let Some((number, unit)) = text.split_once(' ') else { return text };
+    let Ok(value) = number.replace(',', "").parse::<f64>() else { return text };
+    let decimals = if value >= 100.0 {
+        0
+    } else if value >= 10.0 {
+        1
+    } else {
+        2
+    };
+    format!("{value:.decimals$} {unit}")
 }
 
 /// A place row (Swift `PlaceRowButton`): full-width hit area, inset rounded background, coral

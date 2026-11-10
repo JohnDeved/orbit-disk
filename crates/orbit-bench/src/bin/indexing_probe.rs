@@ -1,4 +1,4 @@
-//! Durable-indexing probe, ported from `Benchmarks/DurableIndexing/IndexingProbe.swift`.
+//! Durable-indexing probe, ported from the Swift `IndexingProbe` (tag `v0.9.15`).
 //!
 //! `indexing_probe output-dir shape files directories generation`
 //!

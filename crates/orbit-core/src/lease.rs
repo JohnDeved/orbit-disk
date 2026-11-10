@@ -173,6 +173,63 @@ mod unix {
             Ok(())
         }
 
+        /// A new stage file holds no data yet (seeding may replace it).
+        pub fn is_empty(&self) -> bool {
+            self.expected_db.size == 0
+        }
+
+        fn seed_name(&self) -> String {
+            format!(".{}.seed", self.name)
+        }
+
+        /// Where a seed for this stage is prepared ([`StageLease::install_seed`]).
+        pub fn seed_path(&self) -> PathBuf {
+            self.directory_path.join(self.seed_name())
+        }
+
+        /// Deletes a leftover seed and its sidecars (an interrupted seeding).
+        pub fn remove_seed(&self) -> Result<()> {
+            let name = self.seed_name();
+            for suffix in ["-wal", "-shm", "-journal", ""] {
+                let file = format!("{name}{suffix}");
+                let Some(info) = sys::fstatat(self.dir.as_fd(), &file)? else { continue };
+                if !info.is_file() || info.uid != sys::euid() {
+                    return Err(unsafe_file("stage seed"));
+                }
+                sys::unlinkat(self.dir.as_fd(), &file)?;
+            }
+            Ok(())
+        }
+
+        /// Replaces the still empty stage database with the prepared seed (a single private
+        /// file without sidecars), renamed within the stage directory; the lease then holds
+        /// and validates the new file.
+        pub fn install_seed(&mut self) -> Result<()> {
+            self.validate_paths()?;
+            if !self.is_empty() {
+                return Err(unsafe_file("stage: not empty"));
+            }
+            let name = self.seed_name();
+            let seed = sys::fstatat(self.dir.as_fd(), &name)?.ok_or_else(|| unsafe_file("stage seed missing"))?;
+            if !private_file(&seed) {
+                return Err(unsafe_file("stage seed identity"));
+            }
+            for suffix in ["-wal", "-shm", "-journal"] {
+                if sys::fstatat(self.dir.as_fd(), &format!("{name}{suffix}"))?.is_some() {
+                    return Err(unsafe_file("stage seed sidecar"));
+                }
+            }
+            sys::renameat(self.dir.as_fd(), &name, &self.name)?;
+            let db = sys::openat_file(self.dir.as_fd(), &self.name, false).map_err(|_| unsafe_file("open database"))?;
+            let installed = sys::fstat(db.as_fd())?;
+            if !private_file(&installed) || !installed.same_file(&seed) {
+                return Err(unsafe_file("stage seed replaced"));
+            }
+            self.db = db;
+            self.expected_db = installed;
+            self.validate_paths()
+        }
+
         /// Deletes the stage database and its sidecars (after validating each is private).
         pub fn remove_stage_files(&self) -> Result<()> {
             self.validate_paths()?;

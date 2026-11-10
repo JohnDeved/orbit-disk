@@ -210,7 +210,7 @@ impl<M: AutomationModel, C: Clock> Controller<M, C> {
                 if state.scanning || state.refreshing || state.removing {
                     return Err(failure("busy", "The map is already scanning or removing files."));
                 }
-                model.refresh();
+                model.refresh(args.get("everything").and_then(Value::as_bool).unwrap_or(false));
             }
             "stop" => model.stop_scan(),
             "select" | "open" | "reveal" | "preview" => {

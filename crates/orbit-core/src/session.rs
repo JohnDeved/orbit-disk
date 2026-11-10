@@ -319,6 +319,9 @@ pub struct SessionOptions {
     pub checkpoint: Option<ChangeCheckpoint>,
     /// User home, for cloud-storage exclusions.
     pub home: Option<PathBuf>,
+    /// The root's saved map, for a forced rescan: a new stage starts as its copy, so unchanged
+    /// folders are only read ([`StageConfig::seed`]).
+    pub seed: Option<crate::schema::SnapshotInfo>,
     /// More directories to skip.
     pub exclusions: Vec<PathBuf>,
     /// Reuse listings from saved maps of subfolders (off for forced re-maps).
@@ -347,6 +350,7 @@ impl Default for SessionOptions {
             preferred: None,
             checkpoint: None,
             home: None,
+            seed: None,
             exclusions: Vec::new(),
             reuse_saved_maps: true,
             removal_journal: true,
@@ -653,7 +657,8 @@ impl<P: Platform> MappingSession<P> {
             extra.extend(platform.cloud_roots(home));
         }
         let exclusions = mapping_exclusions(&*platform, &paths, &scope, &extra);
-        let config = stage_config(&scope, &exclusions);
+        let mut config = stage_config(&scope, &exclusions);
+        config.seed = options.seed.clone();
         let mut stage = open_stage(
             &platform,
             &paths,
@@ -664,7 +669,16 @@ impl<P: Platform> MappingSession<P> {
             &config,
             options.busy_retry,
         )?;
-        let maps = Arc::new(SavedMaps::new(platform.clone(), paths.clone()));
+        // With replayable change history from before the scan, a folder replaced while it was
+        // being mapped is reported and reconciled once monitoring starts, so the writer can trust
+        // discovery's secure, identity-checked listing instead of reopening every folder's path
+        // again (on a large home folder most of those reopens miss the metadata cache).
+        stage.set_recheck_identities(!platform.new_monitor().can_replay(&discovery::native_path(&root)));
+        let maps = SavedMaps::new(platform.clone(), paths.clone());
+        let maps = Arc::new(match &options.home {
+            Some(home) => maps.with_home(home.clone()),
+            None => maps,
+        });
 
         // Removal history first: nothing staged is exposed before the journal was replayed.
         let journal = if options.removal_journal { Some(Arc::new(maps.journal()?)) } else { None };

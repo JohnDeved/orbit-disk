@@ -153,7 +153,13 @@ pub struct RefreshRequest {
     pub session: SessionId,
     pub root: Arc<[u8]>,
     pub snapshot: u64,
+    /// Folders whose listings to repeat (not their subfolders).
     pub paths: Vec<Vec<u8>>,
+    /// Folders to reconcile recursively.
+    pub subtrees: Vec<Vec<u8>>,
+    /// Also re-list the folders holding ones the map could not read, where those can be read
+    /// now (access granted since: no change is reported for that).
+    pub retry_unreadable: bool,
 }
 
 /// Work the state asks the host to run off the UI thread.

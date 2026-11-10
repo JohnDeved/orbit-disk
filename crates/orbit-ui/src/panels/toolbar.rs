@@ -133,14 +133,18 @@ impl Render for ToolbarPanel {
                         .flex_none()
                         .flex()
                         .justify_end()
-                        .tooltip(tooltip("Refresh the full map (⌘R)"))
+                        .tooltip(tooltip("Update changed folders (⌘R). ⌥-click to rescan everything (⌥⌘R)"))
                         .child(button(
                             "refresh",
                             "Refresh",
                             Some(Icon::Refresh),
                             ButtonStyle::Bordered,
                             can_refresh,
-                            move |_, _, cx| refresh.send(Event::Refresh, cx),
+                            move |click, _, cx| {
+                                let event =
+                                    if click.modifiers().alt { Event::RescanEverything } else { Event::Refresh };
+                                refresh.send(event, cx)
+                            },
                         )),
                 )
         } else {

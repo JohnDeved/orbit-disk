@@ -25,8 +25,6 @@ pub const CORAL: u32 = 0xff8f66;
 pub const IVORY: u32 = 0xe9dfcf;
 /// Primary text.
 pub const TEXT: u32 = 0xffffff;
-/// Mapping track background.
-pub const TRACK: u32 = 0x353944;
 /// Selected row fill (solid warm) — paired with a thick coral inset outline.
 pub const ROW_SELECTED: u32 = 0x4a2e29;
 /// Hovered row fill (neutral) — paired with a thin slate outline.
@@ -101,7 +99,6 @@ pub const ROW_HEIGHT: Pixels = px(40.);
 /// Folder arrow target in rows.
 pub const ROW_ARROW: (f32, f32) = (32., 36.);
 pub const MAP_METRIC_WIDTH: Pixels = px(130.);
-pub const MAPPING_TRACK_HEIGHT: Pixels = px(10.);
 
 // ---------------------------------------------------------------------------------------------
 // Spacing and shape.
@@ -196,11 +193,7 @@ pub const FOOTER_FADE: std::time::Duration = std::time::Duration::from_millis(18
 pub const AGE_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
 /// One turn of the activity indicator.
 pub const SPINNER_PERIOD: std::time::Duration = std::time::Duration::from_millis(900);
-/// Footer content: the 28-point progress block, 3 points, the 20-point status row.
-pub const FOOTER_PROGRESS_HEIGHT: Pixels = px(28.);
-pub const FOOTER_ROW_HEIGHT: Pixels = px(20.);
-/// Footer count groups ("12,345 found") and the action button.
-pub const FOOTER_COUNT_WIDTH: Pixels = px(164.);
+/// The footer action button.
 pub const FOOTER_ACTION_WIDTH: Pixels = px(64.);
 pub const FOOTER_ROOT_WIDTH: f32 = 160.;
 /// Legacy footer (no progress values): title, count and button columns.

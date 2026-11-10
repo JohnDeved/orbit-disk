@@ -43,6 +43,9 @@ pub struct EventPlan {
     pub root_file_id: u64,
     pub supports_replay: bool,
     pub checkpoint: ChangeCheckpoint,
+    /// The identity earlier builds saved for this whole-Mac root, which also listed every other
+    /// mounted volume; `None` when it is the same as the current identity.
+    pub legacy_identity: Option<String>,
 }
 
 fn invalid_root(root: &Path) -> PlatformError {
@@ -88,14 +91,6 @@ impl EventPlan {
             volumes.dedup_by(|a, b| a.mount_path == b.mount_path);
             volumes
         };
-        // Boot helper volumes have no journals; the verified Data volume is part of whole-Mac mapping.
-        let supports_replay = !volumes.is_empty()
-            && volumes.iter().all(|v| v.volume_uuid.is_some())
-            && if relative_path.is_some() {
-                volumes[0].events_uuid.is_some()
-            } else {
-                host_id.is_some() && volumes.iter().any(|v| v.events_uuid.is_some())
-            };
         let mut untracked_mounts: Vec<Vec<u8>> = if relative_path.is_none() && root_path == b"/" {
             volumes.iter().map(|v| v.mount_path.clone()).filter(|m| m != b"/").collect()
         } else {
@@ -108,15 +103,30 @@ impl EventPlan {
         {
             untracked_mounts.retain(|m| m != DATA_VOLUME.as_bytes());
         }
-        let identity = identity_json(&IdentityFields {
+        // Only the volumes the map covers belong to its history: an external disk, disk image or
+        // simulator volume mounted or ejected meanwhile neither changes the map nor its events.
+        let tracked: Vec<Volume> =
+            volumes.iter().filter(|v| !untracked_mounts.contains(&v.mount_path)).cloned().collect();
+        // Boot helper volumes have no journals; the verified Data volume is part of whole-Mac mapping.
+        let supports_replay = !tracked.is_empty()
+            && tracked.iter().all(|v| v.volume_uuid.is_some())
+            && if relative_path.is_some() {
+                tracked[0].events_uuid.is_some()
+            } else {
+                host_id.is_some() && tracked.iter().any(|v| v.events_uuid.is_some())
+            };
+        let fields = IdentityFields {
             root_path: &root_path,
             canonical_root: &canonical_root,
             root_file_id: metadata.st_ino,
             device_mode: relative_path.is_some(),
             host_id: host_id.as_deref(),
-            volumes: &volumes,
+            volumes: &tracked,
             boot_traversal: root_path == b"/",
-        });
+        };
+        let identity = identity_json(&fields);
+        let legacy_identity =
+            (tracked.len() != volumes.len()).then(|| identity_json(&IdentityFields { volumes: &volumes, ..fields }));
         let event_id = if relative_path.is_some() {
             // This FSEvents API takes Unix-epoch seconds despite its CFAbsoluteTime type.
             let now =
@@ -138,7 +148,24 @@ impl EventPlan {
             device: metadata.st_dev,
             root_file_id: metadata.st_ino,
             supports_replay,
+            legacy_identity,
         })
+    }
+
+    /// Whether a saved checkpoint `identity` belongs to this root's current change history:
+    /// the current identity, or the one earlier builds saved while the same volumes were mounted.
+    pub fn same_history(&self, identity: &str) -> bool {
+        identity == self.checkpoint.identity || self.legacy_identity.as_deref() == Some(identity)
+    }
+
+    /// Whether a volume mounted or unmounted at `path` changes what this root's history covers:
+    /// a mount at or above the root, or the whole-Mac map's own Data volume.
+    pub fn mount_changes_history(&self, path: &[u8]) -> bool {
+        contains(&self.root_path, path)
+            || (self.relative_path.is_none()
+                && self.root_path == b"/"
+                && path == DATA_VOLUME.as_bytes()
+                && !self.untracked_mounts.iter().any(|m| m == path))
     }
 
     /// The root is still the directory this plan was made for.
@@ -445,7 +472,10 @@ impl EventPathCache {
 /// The outcome of one FSEvents callback after normalization.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PreparedBatch {
+    /// Listings to repeat (see [`orbit_platform::ChangeBatch::directories`]).
     pub directories: std::collections::BTreeSet<Vec<u8>>,
+    /// Directories to reconcile recursively.
+    pub subtrees: std::collections::BTreeSet<Vec<u8>>,
     pub full_refresh: bool,
     pub identity_invalidated: bool,
     pub history_finished: bool,
@@ -485,7 +515,11 @@ pub fn prepare_batch(
             result.full_refresh = true;
             result.identity_invalidated = true;
         }
-        if has(kFSEventStreamEventFlagUserDropped) || has(kFSEventStreamEventFlagKernelDropped) {
+        // Dropped events name the folder to rescan with MustScanSubDirs: that subtree (below) is
+        // enough. Only without it is the extent of the loss unknown.
+        if (has(kFSEventStreamEventFlagUserDropped) || has(kFSEventStreamEventFlagKernelDropped))
+            && !has(kFSEventStreamEventFlagMustScanSubDirs)
+        {
             result.full_refresh = true;
         }
         if has(kFSEventStreamEventFlagHistoryDone) {
@@ -505,27 +539,37 @@ pub fn prepare_batch(
         if excluded.iter().any(|root| contains(&path, root)) {
             continue;
         }
+        let within =
+            |directory: Vec<u8>| if contains(&directory, &plan.root_path) { directory } else { plan.root_path.clone() };
         if has(kFSEventStreamEventFlagMount) || has(kFSEventStreamEventFlagUnmount) {
-            result.full_refresh = true;
-            result.identity_invalidated = true;
+            if plan.mount_changes_history(&path) {
+                result.full_refresh = true;
+                result.identity_invalidated = true;
+            } else if contains(&path, &plan.root_path) {
+                // Another volume appeared or vanished inside the map: the map never descends into
+                // it, so only its mount point's folder changed (an unmount may uncover a folder).
+                result.directories.insert(within(parent(&path).to_vec()));
+            }
+            continue;
         }
         if plan.untracked_mounts.iter().any(|mount| contains(&path, mount)) {
             continue;
         }
-        let directory = if has(kFSEventStreamEventFlagMustScanSubDirs)
-            || (has(kFSEventStreamEventFlagItemIsDir)
-                && !has(kFSEventStreamEventFlagItemRemoved)
-                && !has(kFSEventStreamEventFlagItemRenamed))
+        if has(kFSEventStreamEventFlagMustScanSubDirs) {
+            // Changes below `path` were coalesced: only a recursive reconciliation finds them.
+            result.subtrees.insert(within(path));
+            continue;
+        }
+        // File-level events name the changed item, so its parent's listing reconciles it: a
+        // removed or replaced subfolder is pruned there, a new one is mapped in full. A folder
+        // that still exists (created, permissions or attributes changed) is listed itself too.
+        if has(kFSEventStreamEventFlagItemIsDir)
+            && !has(kFSEventStreamEventFlagItemRemoved)
+            && !has(kFSEventStreamEventFlagItemRenamed)
         {
-            path
-        } else {
-            parent(&path).to_vec()
-        };
-        result.directories.insert(if contains(&directory, &plan.root_path) {
-            directory
-        } else {
-            plan.root_path.clone()
-        });
+            result.directories.insert(within(path.clone()));
+        }
+        result.directories.insert(within(parent(&path).to_vec()));
     }
     if !is_current() {
         return None;
@@ -641,9 +685,9 @@ fn volume_uuid(mount: &[u8]) -> Option<String> {
     };
     let mut buffer = [0u8; 4 + 16];
     // SAFETY: valid path, attribute list and output buffer for the call.
-    let status = unsafe {
+    let status = orbit_platform::posix::retry_interrupted(|| unsafe {
         libc::getattrlist(c.as_ptr(), (&raw mut attributes).cast(), buffer.as_mut_ptr().cast(), buffer.len(), 0)
-    };
+    });
     if status != 0 || u32::from_ne_bytes(buffer[..4].try_into().ok()?) < 20 {
         return None;
     }

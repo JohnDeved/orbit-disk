@@ -196,7 +196,8 @@ impl Render for MainWindow {
                     }))
             })
             .when(window_actions && can_refresh, |el| {
-                el.on_action(cx.listener(|this, _: &RefreshFullMap, _, cx| this.send(Event::Refresh, cx)))
+                el.on_action(cx.listener(|this, _: &RefreshMap, _, cx| this.send(Event::Refresh, cx)))
+                    .on_action(cx.listener(|this, _: &RescanEverything, _, cx| this.send(Event::RescanEverything, cx)))
             })
             .when(window_actions && can_go_up, |el| {
                 el.on_action(cx.listener(|this, _: &GoUp, _, cx| this.send(Event::GoUp, cx)))

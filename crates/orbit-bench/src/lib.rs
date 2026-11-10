@@ -1,7 +1,8 @@
 //! Benchmarks: criterion micro-benches and probe binaries.
 //!
 //! Shared helpers for the durable-indexing probes (`indexing_probe`, `marking_probe`), whose
-//! JSON output matches the Swift probes read by `scripts/benchmarks/*-durable-indexing.py`.
+//! JSON output is what `scripts/benchmarks/*-durable-indexing.py` read (the format of the
+//! original Swift probes).
 
 use std::collections::BTreeMap;
 use std::path::Path;

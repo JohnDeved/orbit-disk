@@ -276,10 +276,63 @@ fn refresh_after_changes_converges_with_the_disk() {
     let changed: Vec<Vec<u8>> =
         ["d2/e1", "d3/e3/f3", "d4/e4/f4", "d5/e0"].iter().map(|p| bytes(&fx.root.join(p))).collect();
     let checkpoint = ChangeCheckpoint { root: fx.root.clone(), identity: "test-history".into(), event_id: 9 };
-    let updated = maps.refresh(&snapshot, &changed, Some(&checkpoint), &Cancellation::new()).unwrap();
+    let updated = maps.refresh(&snapshot, &[], &changed, Some(&checkpoint), &Cancellation::new()).unwrap();
     assert_ne!(updated.id, snapshot.id);
     assert_eq!(updated.event_id, 9);
     assert_matches_disk(&maps, &updated);
+}
+
+/// What a file-level change monitor reports (each changed item's folder, and a changed folder
+/// itself) is enough: re-listing only those folders converges with the disk.
+#[test]
+fn refresh_of_reported_listings_converges_with_the_disk() {
+    let fx = Fixture::new();
+    fx.populate(30, 6);
+    let snapshot = fx.map();
+    let maps = fx.maps();
+    // A new nested folder, a grown file, a deleted file, a folder replaced by a file, a folder
+    // replaced by another folder of the same name, and a file directly in the root.
+    write(&fx.root.join("d2/e1/new/inner/added.bin"), 5_000);
+    write(&fx.root.join("d3/e3/f3/file-0.dat"), 9_999);
+    std::fs::remove_file(fx.root.join("d4/e4/f4/file-1.dat")).unwrap();
+    std::fs::remove_dir_all(fx.root.join("d5/e0/f5")).unwrap();
+    write(&fx.root.join("d5/e0/f5"), 77);
+    std::fs::remove_dir_all(fx.root.join("d6/e1")).unwrap();
+    write(&fx.root.join("d6/e1/other/replacement.bin"), 4_444);
+    write(&fx.root.join("top.bin"), 1_234);
+    let listings: Vec<Vec<u8>> =
+        ["d2/e1/new/inner", "d2/e1/new", "d2/e1", "d3/e3/f3", "d4/e4/f4", "d5/e0", "d6/e1/other", "d6/e1", "d6", ""]
+            .iter()
+            .map(|p| bytes(&fx.root.join(p).components().collect::<PathBuf>()))
+            .collect();
+    let checkpoint = ChangeCheckpoint { root: fx.root.clone(), identity: "test-history".into(), event_id: 9 };
+    let updated = maps.refresh(&snapshot, &listings, &[], Some(&checkpoint), &Cancellation::new()).unwrap();
+    assert_ne!(updated.id, snapshot.id);
+    assert_eq!(updated.event_id, 9);
+    assert_matches_disk(&maps, &updated);
+}
+
+/// A listing re-reads that folder alone; a subtree re-reads everything below it.
+#[test]
+fn a_listing_refresh_does_not_reread_subfolders() {
+    let fx = Fixture::new();
+    fx.populate(30, 6);
+    let snapshot = fx.map();
+    let maps = fx.maps();
+    let d0 = fx.root.join("d0");
+    let deep = d0.join("e0/f0");
+    let before = folders(&maps, &snapshot);
+    // An unreported change deep below, and a reported one in `d0` itself.
+    write(&deep.join("file-2.dat"), 8_888);
+    write(&d0.join("top.bin"), 1_000);
+    let at = |event_id| ChangeCheckpoint { root: fx.root.clone(), identity: "test-history".into(), event_id };
+    let listed = maps.refresh(&snapshot, &[bytes(&d0)], &[], Some(&at(5)), &Cancellation::new()).unwrap();
+    let after = folders(&maps, &listed);
+    assert_eq!(after[&bytes(&deep)], before[&bytes(&deep)], "the deep folder was re-read");
+    let (files, size) = before[&bytes(&d0)];
+    assert_eq!(after[&bytes(&d0)], (files + 1, size + 1_000), "d0's own listing was not repeated");
+    let reconciled = maps.refresh(&listed, &[], &[bytes(&d0)], Some(&at(6)), &Cancellation::new()).unwrap();
+    assert_matches_disk(&maps, &reconciled);
 }
 
 #[test]
@@ -293,19 +346,19 @@ fn refresh_of_unchanged_folders_keeps_the_saved_map() {
     let at = |event_id| ChangeCheckpoint { root: fx.root.clone(), identity: "test-history".into(), event_id };
     // A real change publishes.
     write(&folder.join("file-0.dat"), 4_321);
-    let first = maps.refresh(&snapshot, &changed, Some(&at(5)), &Cancellation::new()).unwrap();
+    let first = maps.refresh(&snapshot, &changed, &[], Some(&at(5)), &Cancellation::new()).unwrap();
     assert_ne!(first.id, snapshot.id);
     let published = identity(&first.database);
     // The folder reported again without a real change (rewritten with the same size): the saved map
     // stays as it is, file and all.
     write(&folder.join("file-0.dat"), 4_321);
-    let second = maps.refresh(&first, &changed, Some(&at(6)), &Cancellation::new()).unwrap();
+    let second = maps.refresh(&first, &changed, &[], Some(&at(6)), &Cancellation::new()).unwrap();
     assert_eq!(second, first);
     assert_eq!(identity(&first.database), published, "nothing was published");
     assert_eq!(maps.snapshot(&bytes(&fx.root)).map(|s| s.event_id), Some(5), "the history position lags");
     // The next real change publishes, with the newer position.
     write(&folder.join("file-1.dat"), 1);
-    let third = maps.refresh(&second, &changed, Some(&at(7)), &Cancellation::new()).unwrap();
+    let third = maps.refresh(&second, &changed, &[], Some(&at(7)), &Cancellation::new()).unwrap();
     assert_ne!(third.id, first.id);
     assert_eq!(third.event_id, 7);
     assert_ne!(identity(&third.database), published);
@@ -442,15 +495,19 @@ fn live_and_saved_search_agree() {
     };
     let removal_path = fx.root.join("d1");
     let removals = vec![ScanRemoval { path: bytes(&removal_path), identity: identity(&removal_path) }];
-    let live: Vec<_> = queries
-        .iter()
-        .flat_map(|q| {
-            [
-                key(&session.search(q, &[], 10_000).unwrap().unwrap()),
-                key(&session.search(q, &removals, 10_000).unwrap().unwrap()),
-            ]
-        })
-        .collect();
+    // `None` means "not answerable right now" (the removal replay settles once writing ends);
+    // like the app, ask again.
+    let answered = |q: &str, removals: &[ScanRemoval]| {
+        let deadline = std::time::Instant::now() + WAIT;
+        loop {
+            if let Some(results) = session.search(q, removals, 10_000).unwrap() {
+                return results;
+            }
+            assert!(std::time::Instant::now() < deadline, "search never became answerable");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    let live: Vec<_> = queries.iter().flat_map(|q| [key(&answered(q, &[])), key(&answered(q, &removals))]).collect();
     *gate.0.lock() = true;
     gate.1.notify_all();
     let snapshot = published(&session);
@@ -557,4 +614,148 @@ fn obsolete_caches_are_removed_but_durable_folders_never() {
     );
     assert_eq!(resolved.cache, fx.base.join("Caches/Maps"));
     assert!(resolved.exclusion_roots().contains(&journal.join(".orbit-removals")));
+}
+
+/// A folder replaced by another of the same name is reconciled from its parent's listing alone:
+/// the changed identity prunes the old registration and the new folder is mapped in full.
+#[test]
+fn a_parent_listing_reconciles_a_replaced_subfolder() {
+    let fx = Fixture::new();
+    fx.populate(30, 6);
+    let snapshot = fx.map();
+    let maps = fx.maps();
+    // Built beside the original so the two can never share an inode number.
+    write(&fx.base.join("replacement/other/deeper/replacement.bin"), 4_444);
+    std::fs::remove_dir_all(fx.root.join("d6/e1")).unwrap();
+    std::fs::rename(fx.base.join("replacement"), fx.root.join("d6/e1")).unwrap();
+    let checkpoint = ChangeCheckpoint { root: fx.root.clone(), identity: "test-history".into(), event_id: 9 };
+    let listings = [bytes(&fx.root.join("d6"))];
+    let updated = maps.refresh(&snapshot, &listings, &[], Some(&checkpoint), &Cancellation::new()).unwrap();
+    assert_matches_disk(&maps, &updated);
+}
+
+/// A change reported inside a folder the map could not read re-lists only the folder holding
+/// it, and that listing succeeds although it meets the unreadable folder again.
+#[test]
+fn changes_inside_an_unreadable_folder_relist_only_its_parent() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fixture::new();
+    fx.populate(30, 6);
+    let locked = fx.root.join("d1/locked");
+    write(&locked.join("inner/secret.bin"), 10);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let restore = || std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if std::fs::read_dir(&locked).is_ok() {
+        restore();
+        return; // Running with privileges that ignore permissions.
+    }
+    let snapshot = fx.map();
+    let maps = fx.maps();
+    let before = folders(&maps, &snapshot);
+    // An unreported change elsewhere below `d1` stays unread; `d1`'s own new file is listed.
+    write(&fx.root.join("d1/e1/f1/file-0.dat"), 7_777);
+    write(&fx.root.join("d1/top.bin"), 500);
+    let checkpoint = ChangeCheckpoint { root: fx.root.clone(), identity: "test-history".into(), event_id: 9 };
+    let listings = [bytes(&locked.join("inner")), bytes(&locked)];
+    let result = maps.refresh(&snapshot, &listings, &[], Some(&checkpoint), &Cancellation::new());
+    restore();
+    let updated = result.unwrap();
+    let after = folders(&maps, &updated);
+    let d1 = bytes(&fx.root.join("d1"));
+    let (files, size) = before[&d1];
+    assert_eq!(after[&d1], (files + 1, size + 500), "the unreadable folder's parent was not re-listed");
+    let deep = bytes(&fx.root.join("d1/e1/f1"));
+    assert_eq!(after[&deep], before[&deep], "the parent's subtree was re-read");
+}
+
+/// Refreshes exclude cloud storage under the user's home exactly like the mapping did: a
+/// recursive refresh above `Library/CloudStorage` never lists the provider folders (on macOS
+/// those are placeholders that fail with EDEADLK rather than download).
+#[test]
+fn refresh_keeps_cloud_storage_excluded() {
+    let fx = Fixture::new();
+    fx.populate(10, 3);
+    write(&fx.root.join("Library/CloudStorage/Provider/.Trash/placeholder.bin"), 9_000);
+    write(&fx.root.join("Library/Preferences/settings.plist"), 100);
+    let options = SessionOptions { home: Some(fx.root.clone()), ..fx.options(1) };
+    let snapshot = published(&fx.start(options));
+    let library = bytes(&fx.root.join("Library"));
+    let maps = fx.maps().with_home(fx.root.clone());
+    let before = folders(&maps, &snapshot)[&library];
+    assert_eq!(before, (1, 100), "the mapping excluded cloud storage");
+    write(&fx.root.join("Library/Preferences/more.plist"), 50);
+    let checkpoint = ChangeCheckpoint { root: fx.root.clone(), identity: "test-history".into(), event_id: 9 };
+    let updated =
+        maps.refresh(&snapshot, &[], std::slice::from_ref(&library), Some(&checkpoint), &Cancellation::new()).unwrap();
+    assert_eq!(folders(&maps, &updated)[&library], (2, 150), "the refresh mapped cloud storage");
+}
+
+/// Rows whose epoch is older than their folder's: left untouched by the latest listing.
+fn untouched_rows(snapshot: &orbit_core::schema::SnapshotInfo) -> i64 {
+    let conn = rusqlite::Connection::open(&snapshot.database).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*) FROM nodes n JOIN dirs d ON d.id=n.parent WHERE n.epoch<d.epoch AND n.kind<>1",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn rescan(fx: &Fixture, saved: &orbit_core::schema::SnapshotInfo, event: u64) -> orbit_core::schema::SnapshotInfo {
+    let options = SessionOptions { seed: Some(saved.clone()), reuse_saved_maps: false, ..fx.options(event) };
+    published(&fx.start(options))
+}
+
+/// A forced rescan starts from the saved map: unchanged files are read but not written, and the
+/// result is a new snapshot that matches the disk.
+#[test]
+fn a_seeded_rescan_of_unchanged_data_rewrites_nothing() {
+    let fx = Fixture::new();
+    fx.populate(40, 6);
+    let saved = fx.map();
+    let files = folders(&fx.maps(), &saved)[&saved.root_path].0;
+    let rescanned = rescan(&fx, &saved, 2);
+    assert_ne!(rescanned.id, saved.id, "a rescan publishes a new snapshot");
+    assert_eq!(rescanned.event_id, 2);
+    assert_matches_disk(&fx.maps(), &rescanned);
+    assert_eq!(untouched_rows(&rescanned) as u64, files, "every unchanged file row stayed as it was");
+}
+
+/// Everything a rescan can find changed ends up exactly as on disk.
+#[test]
+fn a_seeded_rescan_applies_every_kind_of_change() {
+    let fx = Fixture::new();
+    fx.populate(30, 6);
+    let saved = fx.map();
+    write(&fx.root.join("d2/e1/new/inner/added.bin"), 5_000);
+    write(&fx.root.join("d3/e3/f3/file-0.dat"), 9_999);
+    std::fs::remove_file(fx.root.join("d4/e4/f4/file-1.dat")).unwrap();
+    std::fs::remove_dir_all(fx.root.join("d5/e0/f5")).unwrap();
+    write(&fx.root.join("d5/e0/f5"), 77);
+    std::fs::remove_dir_all(fx.root.join("d6/e1")).unwrap();
+    std::fs::hard_link(fx.root.join("d0/e0/f0/file-2.dat"), fx.root.join("d2/linked-2.dat")).unwrap();
+    let rescanned = rescan(&fx, &saved, 3);
+    assert_matches_disk(&fx.maps(), &rescanned);
+    assert!(untouched_rows(&rescanned) > 100, "unchanged rows were rewritten");
+}
+
+/// A saved map already repaired by an update (its snapshot id differs from its original seal)
+/// seeds a rescan too, instead of resuming the old stage it was made from.
+#[test]
+fn a_repaired_saved_map_seeds_a_rescan() {
+    let fx = Fixture::new();
+    fx.populate(20, 4);
+    let saved = fx.map();
+    let maps = fx.maps();
+    write(&fx.root.join("d1/e1/f1/file-0.dat"), 4_444);
+    let at = ChangeCheckpoint { root: fx.root.clone(), identity: "test-history".into(), event_id: 5 };
+    let listings = [bytes(&fx.root.join("d1/e1/f1"))];
+    let repaired = maps.refresh(&saved, &listings, &[], Some(&at), &Cancellation::new()).unwrap();
+    assert_ne!(repaired.id, saved.id);
+    write(&fx.root.join("d2/fresh.bin"), 123);
+    let rescanned = rescan(&fx, &repaired, 6);
+    assert_ne!(rescanned.id, repaired.id);
+    assert_eq!(rescanned.event_id, 6);
+    assert_matches_disk(&fx.maps(), &rescanned);
+    assert!(untouched_rows(&rescanned) > 50);
 }

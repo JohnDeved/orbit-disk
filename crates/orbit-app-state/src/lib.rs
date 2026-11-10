@@ -27,7 +27,7 @@ pub mod testing;
 pub use backend::{Backend, Notifier, Reply, Request, perform};
 pub use event::{DragSource, Effect, Event, MappingEvent, Regions, Timer, TimerKind};
 pub use folder::{PreparedFolder, prepare_folder};
-pub use footer::{FooterAction, FooterState, Phase};
+pub use footer::{FooterAction, FooterState, MapProgress, Phase};
 pub use ids::{DragId, GestureId, LeaseId, RemovalId, RequestId, SessionId};
 pub use model::{Item, SnapshotInfo, SortOrder, Volume};
 pub use review::ReviewToken;

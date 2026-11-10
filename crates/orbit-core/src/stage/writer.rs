@@ -90,12 +90,42 @@ impl FreshLeaf<'_> {
 }
 
 /// Per-listing writer state carried across batches of one directory.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ListingCursor {
     /// The listing's epoch once its first batch committed.
     pub epoch: Option<i64>,
     /// The directory had never been listed and had no rows: names are known to be new.
     pub fresh: bool,
+    /// Rows the directory had when this listing minted its epoch (relistings only).
+    pub existing: Option<i64>,
+    /// Of those rows, how many this listing has seen so far.
+    pub seen: i64,
+    /// Seen rows that matched the listing exactly and were left untouched, so they still carry
+    /// an older epoch. They are stamped only if the listing ends with stale rows to trim.
+    pub unstamped: Vec<i64>,
+}
+
+/// A child row as [`Writer::upsert`] compares it with a listed entry.
+struct ExistingRow {
+    id: i64,
+    kind: i64,
+    dev: i64,
+    inode: i64,
+    size: i64,
+    allocated: i64,
+    raw_alloc: i64,
+    accessible: bool,
+    is_mount: bool,
+    links: i64,
+}
+
+/// What [`Writer::upsert`] did with one record.
+struct Upserted {
+    id: i64,
+    /// The name had a row before this listing.
+    existed: bool,
+    /// The existing row matched exactly and was not written.
+    untouched: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +209,13 @@ pub struct Writer {
     clock: Clock,
     fold: String,
     child: Vec<u8>,
+    /// An open transaction group ([`Writer::begin_group`]): transactions become savepoints of it.
+    group: bool,
+    /// Ancestor-total deltas deferred while a group is open: `(directory id, logical, allocated,
+    /// files)`, applied once per distinct ancestor by [`Writer::flush_ancestors`].
+    deferred: std::cell::RefCell<Vec<(i64, i64, i64, i64)>>,
+    /// Length of `deferred` when the open savepoint began; a rollback truncates back to it.
+    deferred_marks: std::cell::RefCell<Vec<usize>>,
 }
 
 impl std::fmt::Debug for Writer {
@@ -256,6 +293,9 @@ impl Writer {
             clock: Arc::new(Instant::now),
             fold: String::new(),
             child: Vec::new(),
+            group: false,
+            deferred: std::cell::RefCell::new(Vec::new()),
+            deferred_marks: std::cell::RefCell::new(Vec::new()),
         };
         writer.transaction(|w| {
             w.conn.execute_batch(schema::INVENTORY_DDL)?;
@@ -310,20 +350,128 @@ impl Writer {
     }
 
     fn begin(&self) -> Result<()> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.conn.execute_batch(if self.group { "SAVEPOINT orbit_step" } else { "BEGIN IMMEDIATE" })?;
+        if self.group {
+            let mark = self.deferred.borrow().len();
+            self.deferred_marks.borrow_mut().push(mark);
+        }
         Ok(())
     }
 
     fn commit(&mut self) -> Result<()> {
+        if self.group {
+            self.conn.execute_batch("RELEASE orbit_step")?;
+            self.deferred_marks.borrow_mut().pop();
+            return Ok(());
+        }
         self.emit("commit");
         self.conn.execute_batch("COMMIT")?;
         Ok(())
     }
 
     fn rollback(&self) {
-        if !self.conn.is_autocommit() {
+        if self.group {
+            // Undoes only this step (rows and deferred totals); the group's earlier steps stay.
+            let _ = self.conn.execute_batch("ROLLBACK TO orbit_step; RELEASE orbit_step");
+            if let Some(mark) = self.deferred_marks.borrow_mut().pop() {
+                self.deferred.borrow_mut().truncate(mark);
+            }
+        } else if !self.conn.is_autocommit() {
             let _ = self.conn.execute_batch("ROLLBACK");
         }
+    }
+
+    /// Opens a transaction group: until [`Writer::commit_group`], every transaction of this
+    /// writer is a savepoint inside one `BEGIN IMMEDIATE`, so many small listings share one
+    /// durable commit (one WAL sync, ancestor and index pages written once). Nothing in the group
+    /// is durable before that commit; callers must not acknowledge its mailbox batches earlier.
+    pub fn begin_group(&mut self) -> Result<()> {
+        debug_assert!(!self.group && self.conn.is_autocommit());
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        self.group = true;
+        Ok(())
+    }
+
+    pub fn in_group(&self) -> bool {
+        self.group
+    }
+
+    /// Commits the open group durably (`synchronous=FULL`), with its deferred ancestor totals.
+    pub fn commit_group(&mut self) -> Result<()> {
+        if let Err(error) = self.flush_ancestors() {
+            self.rollback_group();
+            return Err(error);
+        }
+        self.group = false;
+        self.emit("commit");
+        if let Err(error) = self.conn.execute_batch("COMMIT") {
+            self.rollback();
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    /// Discards the open group (everything since [`Writer::begin_group`]).
+    pub fn rollback_group(&mut self) {
+        self.group = false;
+        self.deferred.borrow_mut().clear();
+        self.deferred_marks.borrow_mut().clear();
+        self.rollback();
+    }
+
+    /// Applies deferred ancestor deltas: each folder's delta is carried up its parent chain and
+    /// every distinct ancestor is updated once. In a group of thousands of folders under deep
+    /// trees (`node_modules`), the shared ancestors were otherwise rewritten, with their
+    /// size-index entries, once per folder. Deltas add up in any order.
+    fn flush_ancestors(&self) -> Result<()> {
+        if self.deferred.borrow().is_empty() {
+            return Ok(());
+        }
+        // Inside a savepoint, a rollback would undo the applied deltas after they left the log.
+        if !self.deferred_marks.borrow().is_empty() {
+            return Err(sqlite_invalid("ancestor totals flushed inside a savepoint"));
+        }
+        let log = std::mem::take(&mut *self.deferred.borrow_mut());
+        let mut start: std::collections::HashMap<i64, (i64, i64, i64)> = std::collections::HashMap::new();
+        for (id, logical, allocated, files) in log {
+            let entry = start.entry(id).or_default();
+            *entry = (entry.0 + logical, entry.1 + allocated, entry.2 + files);
+        }
+        // Parents are looked up once per flush (row ids can be reused after deletions).
+        let mut parents: std::collections::HashMap<i64, Option<i64>> = std::collections::HashMap::new();
+        let mut totals: std::collections::HashMap<i64, (i64, i64, i64)> = std::collections::HashMap::new();
+        let mut parent_of = self.conn.prepare_cached("SELECT parent FROM nodes WHERE id=?1")?;
+        for (id, delta) in start {
+            if delta == (0, 0, 0) {
+                continue;
+            }
+            let mut current = Some(id);
+            while let Some(node) = current {
+                let entry = totals.entry(node).or_default();
+                *entry = (entry.0 + delta.0, entry.1 + delta.1, entry.2 + delta.2);
+                current = match parents.get(&node) {
+                    Some(parent) => *parent,
+                    None => {
+                        let parent: Option<i64> = parent_of
+                            .query_row([node], |row| row.get(0))
+                            .optional()?
+                            .ok_or_else(|| sqlite_invalid("missing ancestor"))?;
+                        parents.insert(node, parent);
+                        parent
+                    }
+                };
+            }
+        }
+        let mut update = self.conn.prepare_cached(
+            "UPDATE nodes SET size=size+?1,allocated=allocated+?2,file_count=file_count+?3 WHERE id=?4",
+        )?;
+        for (id, (logical, allocated, files)) in totals {
+            if (logical, allocated, files) != (0, 0, 0) && update.execute(params![logical, allocated, files, id])? == 0
+            {
+                return Err(sqlite_invalid("missing ancestor"));
+            }
+        }
+        Ok(())
     }
 
     /// Runs `body` in `BEGIN IMMEDIATE … COMMIT`, rolling back on error.
@@ -457,6 +605,39 @@ impl Writer {
     }
 
     /// Creates the root node and its directory row if this is a new stage.
+    /// Turns this copy of the published saved map `snapshot_id` into the start of a new stage
+    /// of a rescan: no scan, seal, snapshot or progress of the old one (a new id follows), no
+    /// leftover bookkeeping, and a new full-refresh generation so every directory is listed
+    /// again before anything is published. Rows, owners, issues and the removal cursor stay.
+    /// Refuses copies that are not that map, have unfinished work or are mostly free pages.
+    pub fn prepare_seed(&mut self, snapshot_id: &str) -> Result<()> {
+        let info = schema::read_snapshot(&self.conn, &self.path)?;
+        if info.id != snapshot_id || info.root_path != self.root {
+            return Err(CoreError::SnapshotChanged);
+        }
+        let root = self.root.clone();
+        if self.directory(&root)?.is_none_or(|d| d.identity != self.root_identity) {
+            return Err(sqlite_invalid("the saved map belongs to another folder"));
+        }
+        if self.has_remaining_work()? {
+            return Err(sqlite_invalid("the saved map has unfinished work"));
+        }
+        let free: i64 = self.conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+        let pages: i64 = self.conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        if free * 4 > pages {
+            return Err(sqlite_invalid("the saved map is mostly free space; a fresh scan compacts it"));
+        }
+        self.transaction(|w| {
+            w.conn.execute_batch(
+                "DELETE FROM scan; DELETE FROM sealed; DELETE FROM metadata; DELETE FROM snapshot_issues;
+                 DELETE FROM orbit_async_progress; DELETE FROM dirty; DELETE FROM link_candidates;
+                 DELETE FROM link_rebuild; DELETE FROM dirty_links; DELETE FROM trim; DELETE FROM prune;
+                 DROP TABLE IF EXISTS replay_parents;",
+            )?;
+            w.mark_full_refresh()
+        })
+    }
+
     pub fn register_root(&mut self) -> Result<()> {
         let root = self.root.clone();
         let identity = self.root_identity;
@@ -1108,6 +1289,13 @@ impl Writer {
                     .query_row([id], |row| row.get(0))?;
                 cursor.fresh = epoch == 1 && !has_rows;
                 cursor.epoch = Some(epoch);
+                if !cursor.fresh {
+                    cursor.existing = Some(
+                        self.conn
+                            .prepare_cached("SELECT COUNT(*) FROM nodes WHERE parent=?1")?
+                            .query_row([id], |row| row.get(0))?,
+                    );
+                }
                 self.emit(if completion.is_some() { "fresh-epoch" } else { "batch-epoch" });
                 id
             }
@@ -1120,6 +1308,8 @@ impl Writer {
         let mut deltas = Deltas::default();
         let mut child = std::mem::take(&mut self.child);
         let mut fold = std::mem::take(&mut self.fold);
+        // Applied to the cursor only once the batch is written.
+        let (mut seen, mut unstamped) = (0i64, Vec::new());
         let result = (|| -> Result<()> {
             // The compact insert path keeps its statements for the whole batch.
             let mut fresh = if cursor.fresh {
@@ -1135,11 +1325,11 @@ impl Writer {
                 if is_dir || may_have_issues {
                     join_into(&mut child, parent, record.name);
                 }
-                fold.clear();
-                crate::fold::fold_into(record.name, &mut fold);
                 let traversable = !is_dir || self.traversable(&child, &record);
                 let inserted = match fresh.as_mut() {
                     Some(statements) => {
+                        fold.clear();
+                        crate::fold::fold_into(record.name, &mut fold);
                         self.insert_fresh(statements, parent_id, &record, &fold, traversable, epoch, &mut deltas)?
                     }
                     None => None,
@@ -1151,7 +1341,14 @@ impl Writer {
                         }
                         id
                     }
-                    None => self.upsert(parent_id, &record, &fold, traversable, epoch, &mut deltas)?,
+                    None => {
+                        let upserted = self.upsert(parent_id, &record, &mut fold, traversable, epoch, &mut deltas)?;
+                        seen += i64::from(upserted.existed);
+                        if upserted.untouched {
+                            unstamped.push(upserted.id);
+                        }
+                        upserted.id
+                    }
                 };
                 if may_have_issues {
                     self.conn.prepare_cached("DELETE FROM stage_issues WHERE path=?1")?.execute([&child])?;
@@ -1173,6 +1370,8 @@ impl Writer {
         self.child = child;
         self.fold = fold;
         result?;
+        cursor.seen += seen;
+        cursor.unstamped.extend(unstamped);
         self.adjust_ancestors(parent_id, deltas.logical, deltas.allocated, deltas.files)?;
         if let Some(completion) = completion {
             self.record_listing_issues(parent, completion.issue_count, completion.issues)?;
@@ -1269,19 +1468,52 @@ impl Writer {
         &self,
         parent_id: i64,
         record: &EntryRecord<'_>,
-        fold: &str,
+        fold: &mut String,
         traversable: bool,
         epoch: i64,
         deltas: &mut Deltas,
-    ) -> Result<i64> {
-        let existing: Option<(i64, i64, i64, i64, i64, i64, i64)> = self
+    ) -> Result<Upserted> {
+        let found: Option<ExistingRow> = self
             .conn
-            .prepare_cached("SELECT id,kind,dev,inode,size,allocated,raw_alloc FROM nodes WHERE parent=?1 AND name=?2")?
+            .prepare_cached(
+                "SELECT id,kind,dev,inode,size,allocated,raw_alloc,accessible,is_mount,links FROM nodes
+                 WHERE parent=?1 AND name=?2",
+            )?
             .query_row(params![parent_id, record.name], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+                Ok(ExistingRow {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    dev: row.get(2)?,
+                    inode: row.get(3)?,
+                    size: row.get(4)?,
+                    allocated: row.get(5)?,
+                    raw_alloc: row.get(6)?,
+                    accessible: row.get(7)?,
+                    is_mount: row.get(8)?,
+                    links: row.get(9)?,
+                })
             })
             .optional()?;
         let is_dir = record.is_dir();
+        // A relisted entry identical to its row (a rescan of unchanged data) is left as it is:
+        // no write, no index maintenance, no name folding. Its deltas and link marks are zero
+        // anyway; the listing remembers it in case stale rows need trimming (`finish`).
+        if let Some(row) = &found {
+            let same_entry = row.kind == record.kind as i64
+                && identity_from_sql(row.dev, row.inode) == record.id
+                && row.accessible == traversable
+                && row.is_mount == record.is_mount_point
+                && row.links == record.nlink as i64;
+            let same_size =
+                is_dir || (row.size == to_sql_size(record.size) && row.raw_alloc == to_sql_size(record.allocated));
+            if same_entry && same_size {
+                return Ok(Upserted { id: row.id, existed: true, untouched: true });
+            }
+        }
+        fold.clear();
+        crate::fold::fold_into(record.name, fold);
+        let fold = fold.as_str();
+        let existing = found.map(|r| (r.id, r.kind, r.dev, r.inode, r.size, r.allocated, r.raw_alloc));
         let (mut old_size, mut old_charge, mut old_count, mut unchanged) = (0, 0, 0, false);
         if let Some((_, kind, dev, inode, size, allocated, raw)) = existing
             && kind != KIND_DIR
@@ -1364,7 +1596,7 @@ impl Writer {
         if candidate {
             self.mark_link(record.id, Link::Candidate(id))?;
         }
-        Ok(id)
+        Ok(Upserted { id, existed: existing.is_some(), untouched: false })
     }
 
     fn register_directory(&self, path: &[u8], node_id: i64, identity: FileIdentity, fresh: bool) -> Result<()> {
@@ -1398,6 +1630,10 @@ impl Writer {
     /// Adds deltas to a directory node and all its ancestors.
     fn adjust_ancestors(&self, dir_id: i64, logical: i64, allocated: i64, files: i64) -> Result<()> {
         if logical == 0 && allocated == 0 && files == 0 {
+            return Ok(());
+        }
+        if self.group {
+            self.deferred.borrow_mut().push((dir_id, logical, allocated, files));
             return Ok(());
         }
         let changed = self
@@ -1448,21 +1684,38 @@ impl Writer {
             let epoch = match cursor.epoch {
                 Some(epoch) => epoch,
                 None => {
-                    let epoch: i64 = self
+                    let (epoch, id): (i64, i64) = self
                         .conn
-                        .prepare_cached("UPDATE dirs SET epoch=epoch+1 WHERE path=?1 RETURNING epoch")?
-                        .query_row([parent], |row| row.get(0))
+                        .prepare_cached("UPDATE dirs SET epoch=epoch+1 WHERE path=?1 RETURNING epoch,id")?
+                        .query_row([parent], |row| Ok((row.get(0)?, row.get(1)?)))
                         .optional()?
                         .ok_or_else(|| sqlite_invalid("missing node parent"))?;
                     self.emit("empty-epoch");
                     cursor.epoch = Some(epoch);
+                    // An empty listing saw none of the directory's rows.
+                    cursor.existing = Some(
+                        self.conn
+                            .prepare_cached("SELECT COUNT(*) FROM nodes WHERE parent=?1")?
+                            .query_row([id], |row| row.get(0))?,
+                    );
                     epoch
                 }
             };
             self.record_listing_issues(parent, issue_count, issues)?;
-            if cursor.fresh {
-                // Every row of a fresh listing carries its epoch: nothing can be stale, so the
-                // listing is acknowledged here instead of through a trim marker.
+            // A relisting that saw every row it started with has nothing stale to trim.
+            let complete = cursor.existing.is_some_and(|existing| existing <= cursor.seen);
+            if !cursor.fresh && !complete {
+                // Rows left untouched still carry an older epoch: stamp them so the trim below
+                // removes only what this listing did not see (`epoch` is in no index).
+                let mut stamp = self.conn.prepare_cached("UPDATE nodes SET epoch=?1 WHERE id=?2")?;
+                for id in &cursor.unstamped {
+                    stamp.execute(params![epoch, id])?;
+                }
+            }
+            if cursor.fresh || complete {
+                // Every row of a fresh listing carries its epoch, and a complete relisting saw
+                // every row: nothing can be stale, so the listing is acknowledged here instead of
+                // through a trim marker.
                 self.conn
                     .prepare_cached("UPDATE dirty SET pending=0 WHERE parent=?1 AND revision=?2")?
                     .execute(params![parent, expected_revision])?;
@@ -1508,6 +1761,7 @@ impl Writer {
     /// Removes up to 128 rows left over from an older epoch of a completed listing (stale
     /// directories become prune markers). Acknowledges the listing when nothing stale remains.
     pub fn trim_one_chunk(&mut self) -> Result<bool> {
+        self.flush_ancestors()?;
         let marker: Option<(Vec<u8>, i64, i64, i64)> = self
             .conn
             .prepare_cached("SELECT parent,epoch,revision,full_generation FROM trim ORDER BY parent LIMIT 1")?
@@ -1595,6 +1849,7 @@ impl Writer {
     /// directory rows, issues and finally the pruned node itself (or marks it inaccessible when
     /// the directory was blocked).
     pub fn prune_one_chunk(&mut self) -> Result<bool> {
+        self.flush_ancestors()?;
         let marker: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = self
             .conn
             .prepare_cached("SELECT path,parent,name FROM prune ORDER BY path LIMIT 1")?
@@ -1900,16 +2155,9 @@ impl Writer {
     /// Swift `DurableCrawler.markChanged`: marks the nearest registered directory (and its
     /// parent) dirty; a path outside the root starts a full refresh.
     pub fn mark_changed(&mut self, directory: &[u8]) -> Result<()> {
-        if !crate::paths::is_within(directory, &self.root) {
+        let Some(path) = self.nearest_registered(directory)? else {
             return self.transaction(|w| w.mark_full_refresh());
-        }
-        let mut path = directory.to_vec();
-        while self.directory(&path)?.is_none() {
-            if path == self.root {
-                return Err(sqlite_invalid("invalid changed directory"));
-            }
-            path = crate::paths::parent(&path).ok_or_else(|| sqlite_invalid("invalid changed directory"))?.to_vec();
-        }
+        };
         if path != self.root
             && let Some(parent) = crate::paths::parent(&path)
             && self.directory(parent)?.is_some()
@@ -1919,10 +2167,37 @@ impl Writer {
         self.mark_dirty(&path)
     }
 
+    /// Queues the listing of `directory` (or of its nearest registered ancestor) for repetition
+    /// with a new revision, and nothing else: its subfolders keep their listings. Relisting
+    /// reconciles its entries; a removed or replaced subfolder is pruned, a new one registered and
+    /// listed in full. A path outside the root starts a full refresh.
+    pub fn mark_listing_changed(&mut self, directory: &[u8]) -> Result<()> {
+        match self.nearest_registered(directory)? {
+            Some(path) => self.mark_dirty(&path),
+            None => self.transaction(|w| w.mark_full_refresh()),
+        }
+    }
+
+    /// `directory` or its nearest registered ancestor; `None` when it lies outside the root.
+    fn nearest_registered(&self, directory: &[u8]) -> Result<Option<Vec<u8>>> {
+        if !crate::paths::is_within(directory, &self.root) {
+            return Ok(None);
+        }
+        let mut path = directory.to_vec();
+        while self.directory(&path)?.is_none() {
+            if path == self.root {
+                return Err(sqlite_invalid("invalid changed directory"));
+            }
+            path = crate::paths::parent(&path).ok_or_else(|| sqlite_invalid("invalid changed directory"))?.to_vec();
+        }
+        Ok(Some(path))
+    }
+
     /// Queues `directory` and every registered directory below it for relisting with new
     /// revisions (a change monitor asked for a recursive reconciliation; Swift replaced the
-    /// whole subtree with a fresh scan). Unchanged child listings keep their rows, so only the
-    /// listings themselves are repeated. The root starts a full refresh instead.
+    /// whole subtree with a fresh scan). Every listing in the subtree is repeated, so this costs
+    /// in proportion to the subtree; prefer [`Writer::mark_listing_changed`] when the changed
+    /// folder is known. The root starts a full refresh instead.
     pub fn mark_subtree_changed(&mut self, directory: &[u8]) -> Result<()> {
         if directory == self.root.as_slice() || !crate::paths::is_within(directory, &self.root) {
             return self.transaction(|w| w.mark_full_refresh());
@@ -2095,6 +2370,7 @@ impl Writer {
 
     /// `(logical, allocated, files)` of a registered directory.
     pub fn folder_totals(&self, path: &[u8]) -> Result<Option<(i64, i64, i64)>> {
+        self.flush_ancestors()?;
         Ok(self
             .conn
             .query_row(

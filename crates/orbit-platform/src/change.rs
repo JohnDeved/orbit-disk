@@ -14,8 +14,13 @@ pub struct ChangeCheckpoint {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChangeBatch {
-    /// Directories to reconcile recursively. Paths may already be removed or renamed.
+    /// Directories whose own listing changed: re-list each (not its subfolders). Removed or
+    /// replaced subfolders are reconciled through that listing, new ones are mapped in full.
+    /// Paths may already be removed or renamed.
     pub directories: Vec<PathBuf>,
+    /// Directories to reconcile recursively (history coalesced changes below them). Paths may
+    /// already be removed or renamed.
+    pub subtrees: Vec<PathBuf>,
     /// History was lost (dropped events, wrapped IDs, root changed): rescan everything.
     pub full_refresh: bool,
     /// Replay of saved history has caught up with the present.
@@ -55,6 +60,14 @@ pub trait ChangeMonitor: Send {
 
     /// Stops delivery. After return, the sink is never called again.
     fn stop(&mut self);
+
+    /// Whether a checkpoint captured for `root` now can be replayed later, so every change made
+    /// to `root` after the capture (during a scan, say) is reported once monitoring starts.
+    /// Platforms or volumes without reusable history return `false`.
+    fn can_replay(&self, root: &Path) -> bool {
+        let _ = root;
+        false
+    }
 
     /// Replays the saved history of `checkpoint.root` from `checkpoint` and returns `true` only
     /// when the checkpoint still belongs to the current history, the replay records no change at

@@ -178,6 +178,9 @@ struct State {
     open: Vec<Arc<ListingBatch>>,
     sequence: u64,
     committed: u64,
+    /// The writer's pull position: batches it has written into a still-open transaction group
+    /// ([`Mailbox::consume`]). Never below `committed`; only `committed` is durable.
+    consumed: u64,
     revision: u64,
     bytes: usize,
     stats: MailboxStats,
@@ -188,6 +191,11 @@ struct State {
 }
 
 impl State {
+    /// The next batch for the writer follows this sequence.
+    fn cursor(&self) -> u64 {
+        self.committed.max(self.consumed)
+    }
+
     fn batch_at(&self, sequence: u64) -> Option<&Arc<ListingBatch>> {
         if sequence < self.frozen_base || sequence > self.sequence {
             return None;
@@ -320,16 +328,16 @@ impl Mailbox {
     /// stopping at a completion/failure or after `max_records`. Waits briefly when idle.
     pub fn next(&self, max_records: usize) -> Vec<Arc<ListingBatch>> {
         let mut state = self.state.lock();
-        if state.committed == state.sequence && !state.finished && !state.cancelled {
+        if state.cursor() == state.sequence && !state.finished && !state.cancelled {
             self.changed.wait_for(&mut state, NEXT_WAIT);
         }
-        if state.cancelled || state.committed >= state.sequence {
+        if state.cancelled || state.cursor() >= state.sequence {
             return Vec::new();
         }
-        let Some(first) = state.batch_at(state.committed + 1).cloned() else { return Vec::new() };
+        let Some(first) = state.batch_at(state.cursor() + 1).cloned() else { return Vec::new() };
         let mut result = Vec::new();
         let mut count = 0;
-        for sequence in state.committed + 1..=state.sequence {
+        for sequence in state.cursor() + 1..=state.sequence {
             let Some(batch) = state.batch_at(sequence) else { break };
             if batch.parent_path != first.parent_path
                 || (!result.is_empty() && count + batch.records.len() > max_records)
@@ -349,13 +357,13 @@ impl Mailbox {
     /// A group of small, finished, file-only folders that can be committed in one transaction.
     pub fn next_fresh_leaves(&self) -> Vec<Arc<ListingBatch>> {
         let state = self.state.lock();
-        if state.cancelled || state.committed >= state.sequence {
+        if state.cancelled || state.cursor() >= state.sequence {
             return Vec::new();
         }
         let mut result: Vec<Arc<ListingBatch>> = Vec::new();
         let (mut records, mut bytes) = (0, 0);
         let mut parents: HashSet<&[u8]> = HashSet::new();
-        for sequence in state.committed + 1..=state.sequence {
+        for sequence in state.cursor() + 1..=state.sequence {
             let Some(batch) = state.batch_at(sequence) else { break };
             let same_generation =
                 result.first().is_none_or(|first| first.expected_full_generation == batch.expected_full_generation);
@@ -378,6 +386,21 @@ impl Mailbox {
     }
 
     /// Marks everything through `sequence` as durable and releases it.
+    /// The writer wrote batches through `sequence` into a transaction group that is not committed
+    /// yet: they are no longer offered by [`Mailbox::next`], but stay pending (and in every
+    /// reader's snapshot) until [`Mailbox::acknowledge`] after the group's commit.
+    pub fn consume(&self, sequence: u64) {
+        let mut state = self.state.lock();
+        state.consumed = state.consumed.max(sequence.min(state.sequence));
+    }
+
+    /// The writer's transaction group was rolled back: offer everything not yet acknowledged
+    /// again.
+    pub fn rewind(&self) {
+        let mut state = self.state.lock();
+        state.consumed = state.committed;
+    }
+
     pub fn acknowledge(&self, sequence: u64) {
         {
             let mut state = self.state.lock();
@@ -480,6 +503,7 @@ impl Mailbox {
             state.frozen.clear();
             state.open.clear();
             state.committed = state.sequence;
+            state.consumed = state.sequence;
             state.frozen_base = state.sequence + 1;
             state.bytes = 0;
             state.stats.frontier = 0;
