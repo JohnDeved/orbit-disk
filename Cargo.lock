@@ -4015,7 +4015,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orbit-app-state"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "criterion",
  "orbit-automation",
@@ -4027,7 +4027,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-automation"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "libc",
  "serde_json",
@@ -4037,7 +4037,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-backend"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "orbit-app-state",
  "orbit-core",
@@ -4050,7 +4050,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-bench"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "criterion",
  "libc",
@@ -4065,7 +4065,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-control"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "libc",
  "orbit-automation",
@@ -4076,7 +4076,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-core"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "caseless",
  "crossbeam-channel",
@@ -4101,7 +4101,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-disk"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "futures",
  "gpui",
@@ -4116,7 +4116,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-native"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "orbit-platform",
  "orbit-platform-generic",
@@ -4126,7 +4126,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-platform"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "libc",
  "raw-window-handle",
@@ -4135,7 +4135,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-platform-generic"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "libc",
  "orbit-platform",
@@ -4144,7 +4144,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-platform-macos"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "criterion",
  "libc",
@@ -4156,7 +4156,7 @@ dependencies = [
 
 [[package]]
 name = "orbit-shell-macos"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "block2",
  "objc2",
@@ -4168,14 +4168,14 @@ dependencies = [
 
 [[package]]
 name = "orbit-sunburst"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "criterion",
 ]
 
 [[package]]
 name = "orbit-ui"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "futures",
  "gpui",
@@ -7403,7 +7403,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "serde_json",
  "sha2 0.10.9",
