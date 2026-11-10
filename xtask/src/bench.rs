@@ -1,24 +1,21 @@
-//! `cargo xtask bench-compare`: interleaved Rust vs. Swift v0.9.15 probe comparisons.
+//! `cargo xtask bench-compare`: repeated fresh-process runs of the `orbit-bench` probes.
 //!
-//! Builds the `orbit-bench` probes (release profile), then runs every suite in fresh processes,
-//! alternating which implementation goes first each round:
+//! Builds the probes (release profile), then runs every suite for `--rounds` rounds:
 //!
-//! - `indexing`: `indexing_probe` vs. Swift `IndexingProbe`, through the existing
-//!   `scripts/benchmarks/run-durable-indexing.py` runner (and its summarizer).
-//! - `marking`: `marking_probe` vs. Swift `MarkingProbe` (3 timed passes per process).
-//! - `pipeline`: `pipeline_probe` vs. Swift `PipelineProbe`, through
-//!   `scripts/benchmarks/run-indexing-pipeline.py`.
-//! - `discovery`: `discovery_probe sample` vs. Swift `DiscoveryProbe producer`
-//!   (`Benchmarks/Discovery`, built by `scripts/benchmarks/build-discovery.sh`) on the same
-//!   generated flat and mixed fixtures, 1/4/8 workers (4 with `--small`), with CPU and RSS.
-//! - `e2e`: `e2e_probe` (Rust only); the documented Swift reference is a different tree.
+//! - `indexing`: `indexing_probe` through `scripts/benchmarks/run-durable-indexing.py` (and its
+//!   summarizer).
+//! - `marking`: `marking_probe` (3 timed passes per process).
+//! - `pipeline`: `pipeline_probe` through `scripts/benchmarks/run-indexing-pipeline.py`.
+//! - `discovery`: `discovery_probe sample` on generated flat and mixed fixtures, 1/4/8 workers
+//!   (4 with `--small`), with CPU and RSS.
+//! - `e2e`: `e2e_probe` on generated trees.
 //!
 //! Writes `results.jsonl` (one line per sample, with the probe's raw output), `summary.md`
-//! (median/min/max and speedup) and per-run stderr under `raw/`. Generated fixtures live in a
-//! private directory under `target/xtask` that is deleted afterwards. Reports, not timing gates
-//! (see `docs/rust-port/README.md`, "Performance").
+//! (median/min/max) and per-run stderr under `raw/`. Generated fixtures live in a private
+//! directory under `target/xtask` that is deleted afterwards. Reports, not timing gates. To
+//! compare two builds, run each and compare the summaries, or pass both builds' probes to the
+//! Python runners (`--binary=label=path`, repeatable), which interleave them.
 
-use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
@@ -27,25 +24,23 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::{Args, Result, exec, target_dir, workspace_root};
 
-const USAGE: &str = "Usage: cargo xtask bench-compare --output NEW-DIR [--rounds N] [--swift-dir DIR] \
+const USAGE: &str = "Usage: cargo xtask bench-compare --output NEW-DIR [--rounds N] \
                      [--suites indexing,marking,pipeline,discovery,e2e] [--small]";
 const SUITES: [&str; 5] = ["indexing", "marking", "pipeline", "discovery", "e2e"];
 
 #[derive(Debug)]
 struct Options {
     rounds: u32,
-    swift_dir: PathBuf,
     output: PathBuf,
     suites: Vec<String>,
     small: bool,
 }
 
 fn parse(args: &[OsString]) -> Result<Options> {
-    let (mut rounds, mut swift_dir, mut output, mut suites, mut small) = (3, None, None, None, false);
+    let (mut rounds, mut output, mut suites, mut small) = (3, None, None, false);
     let mut args = Args::new(args);
     while let Some(arg) = args.next() {
         match arg? {
@@ -54,7 +49,11 @@ fn parse(args: &[OsString]) -> Result<Options> {
                 let parsed = value.to_str().and_then(|value| value.parse::<u32>().ok()).filter(|&value| value > 0);
                 rounds = parsed.ok_or_else(|| format!("--rounds needs a positive integer, got {value:?}"))?;
             }
-            "--swift-dir" => swift_dir = Some(PathBuf::from(args.value("--swift-dir")?)),
+            "--swift-dir" => {
+                return Err(
+                    "--swift-dir was removed with the Swift v0.9.15 probes; the suites run the Rust probes".into()
+                );
+            }
             "--output" => output = Some(PathBuf::from(args.value("--output")?)),
             "--suites" => {
                 let value = args.value("--suites")?.into_string().map_err(|_| "--suites must be UTF-8")?;
@@ -68,13 +67,8 @@ fn parse(args: &[OsString]) -> Result<Options> {
             other => return Err(format!("unexpected argument {other:?}\n{USAGE}")),
         }
     }
-    let swift_dir = match swift_dir {
-        Some(dir) => dir,
-        None => PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set; pass --swift-dir")?).join("orbit-bench"),
-    };
     Ok(Options {
         rounds,
-        swift_dir,
         output: output.ok_or(format!("--output is required\n{USAGE}"))?,
         suites: suites.unwrap_or_else(|| SUITES.map(str::to_string).to_vec()),
         small,
@@ -93,21 +87,11 @@ struct Sample {
     raw: Value,
 }
 
-/// A documented Swift number for a Rust-only suite.
-struct Reference {
-    suite: &'static str,
-    scenario: String,
-    metric: &'static str,
-    value: f64,
-    source: &'static str,
-}
-
 struct Run {
     options: Options,
     output: PathBuf,
     work: WorkDir,
     samples: Vec<Sample>,
-    references: Vec<Reference>,
     notes: Vec<String>,
     jsonl: fs::File,
 }
@@ -118,7 +102,6 @@ pub fn run(args: &[OsString]) -> Result<()> {
     if fs::symlink_metadata(&output).is_ok() {
         return Err(format!("{} already exists; bench-compare writes into a new directory", output.display()));
     }
-    let swift = swift_probes(&options.swift_dir, &options.suites)?;
 
     let root = workspace_root();
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
@@ -136,29 +119,21 @@ pub fn run(args: &[OsString]) -> Result<()> {
         .map_err(|error| format!("could not create {}: {error}", output.display()))?;
     let jsonl =
         fs::File::create_new(output.join("results.jsonl")).map_err(|error| format!("results.jsonl: {error}"))?;
-    let mut run = Run {
-        work: WorkDir::new()?,
-        output: output.clone(),
-        samples: Vec::new(),
-        references: Vec::new(),
-        notes: Vec::new(),
-        jsonl,
-        options,
-    };
-    let mut environment = environment(&root, swift.as_ref())?;
+    let mut run =
+        Run { work: WorkDir::new()?, output: output.clone(), samples: Vec::new(), notes: Vec::new(), jsonl, options };
+    let mut environment = environment(&root)?;
     eprintln!("bench-compare: load average before: {}", environment["load_before"].as_str().unwrap_or("?"));
 
     let suites = run.options.suites.clone();
-    let swift_path = |kind: &str| swift.as_ref().expect("loaded for the selected suites").path(kind);
     let mut loads = Vec::new();
     for suite in &suites {
         let before = load_average();
         eprintln!("bench-compare: suite {suite} (load {before})");
         match suite.as_str() {
-            "indexing" => run.indexing(&rust_dir.join("indexing_probe"), swift_path("indexing"))?,
-            "marking" => run.marking(&rust_dir.join("marking_probe"), swift_path("marking"))?,
-            "pipeline" => run.pipeline(&rust_dir.join("pipeline_probe"), swift_path("pipeline"))?,
-            "discovery" => run.discovery(&rust_dir.join("discovery_probe"), swift_path("discovery"))?,
+            "indexing" => run.indexing(&rust_dir.join("indexing_probe"))?,
+            "marking" => run.marking(&rust_dir.join("marking_probe"))?,
+            "pipeline" => run.pipeline(&rust_dir.join("pipeline_probe"))?,
+            "discovery" => run.discovery(&rust_dir.join("discovery_probe"))?,
             "e2e" => run.e2e(&rust_dir.join("e2e_probe"))?,
             _ => unreachable!("validated in parse"),
         }
@@ -176,11 +151,6 @@ pub fn run(args: &[OsString]) -> Result<()> {
 }
 
 // --- Suites ------------------------------------------------------------------------------------
-
-/// Interleaving: Rust first in odd rounds, Swift first in even rounds.
-fn ordered<'a>(round: u32, rust: &'a Path, swift: &'a Path) -> [(&'static str, &'a Path); 2] {
-    if round % 2 == 1 { [("rust", rust), ("swift", swift)] } else { [("swift", swift), ("rust", rust)] }
-}
 
 impl Run {
     fn record(&mut self, sample: Sample) -> Result<()> {
@@ -212,8 +182,8 @@ impl Run {
         String::from_utf8(output.stdout).map_err(|_| format!("{name} printed non-UTF-8 output"))
     }
 
-    /// The existing durable-indexing runner, interleaved, with its databases in the work dir.
-    fn indexing(&mut self, rust: &Path, swift: &Path) -> Result<()> {
+    /// The durable-indexing runner, with its databases in the work dir.
+    fn indexing(&mut self, rust: &Path) -> Result<()> {
         let shapes: &[&str] = if self.options.small {
             &["small-g0", "small-g1", "empty-g0", "empty-g1"]
         } else {
@@ -225,7 +195,6 @@ impl Run {
             Command::new("python3")
                 .arg(root.join("scripts/benchmarks/run-durable-indexing.py"))
                 .arg(format!("--binary=rust={}", rust.display()))
-                .arg(format!("--binary=swift={}", swift.display()))
                 .args(["--rounds", &self.options.rounds.to_string(), "--output"])
                 .arg(&work)
                 .arg("--shapes")
@@ -262,11 +231,12 @@ impl Run {
         Ok(())
     }
 
-    fn marking(&mut self, rust: &Path, swift: &Path) -> Result<()> {
+    fn marking(&mut self, rust: &Path) -> Result<()> {
         let counts: &[u32] = if self.options.small { &[50_000] } else { &[50_000, 100_000] };
         for round in 1..=self.options.rounds {
             for &count in counts {
-                for (label, probe) in ordered(round, rust, swift) {
+                {
+                    let (label, probe) = ("rust", rust);
                     let name = format!("r{round}-{count}-{label}");
                     let dir = self.work.0.join("marking").join(&name);
                     fs::create_dir_all(dir.parent().expect("has parent")).map_err(|error| error.to_string())?;
@@ -296,8 +266,8 @@ impl Run {
         Ok(())
     }
 
-    /// The existing pipeline runner (its fixture and caches live in its own `/private/tmp` dir).
-    fn pipeline(&mut self, rust: &Path, swift: &Path) -> Result<()> {
+    /// The pipeline runner (its fixture and caches live in its own `/private/tmp` dir).
+    fn pipeline(&mut self, rust: &Path) -> Result<()> {
         let shapes: &[u32] = if self.options.small { &[1000] } else { &[1000, 2000] };
         for &directories in shapes {
             let scenario = format!("{directories} folders x 10 files");
@@ -306,7 +276,6 @@ impl Run {
                 Command::new("python3")
                     .arg(workspace_root().join("scripts/benchmarks/run-indexing-pipeline.py"))
                     .arg(format!("--binary=rust={}", rust.display()))
-                    .arg(format!("--binary=swift={}", swift.display()))
                     .args(["--rounds", &self.options.rounds.to_string(), "--directories", &directories.to_string()])
                     .arg("--output")
                     .arg(&raw),
@@ -336,46 +305,38 @@ impl Run {
         Ok(())
     }
 
-    /// `discovery_probe sample` vs. Swift `DiscoveryProbe producer` on the same generated fixtures
-    /// (flat, mixed), 1/4/8 workers, one fresh process per sample, order alternating per round.
-    fn discovery(&mut self, rust: &Path, swift: &Path) -> Result<()> {
+    /// `discovery_probe sample` on generated fixtures (flat, mixed), 1/4/8 workers, one fresh
+    /// process per sample.
+    fn discovery(&mut self, rust: &Path) -> Result<()> {
         let dir = self.work.0.join("discovery");
         self.probe("discovery", "fixtures", Command::new(rust).arg("fixtures").arg("--dir").arg(&dir))?;
         let fixtures = ["flat", "mixed"];
         let workers: &[u32] = if self.options.small { &[4] } else { &[1, 4, 8] };
-        let mut expected = BTreeMap::new();
-        for fixture in fixtures {
-            expected.insert(fixture, discovery_manifest(&dir, fixture)?);
-        }
-        let command = |label: &str, fixture: &str, workers: u32| -> Command {
-            let workers = workers.to_string();
-            if label == "rust" {
-                let mut command = Command::new(rust);
-                command.arg("sample").arg("--dir").arg(&dir).args(["--fixture", fixture, "--workers", &workers]);
-                command
-            } else {
-                let (records, files) = expected[fixture];
-                let mut command = Command::new(swift);
-                command.arg("producer").arg(dir.join(fixture)).args([workers, records.to_string(), files.to_string()]);
-                command
-            }
+        let command = |fixture: &str, workers: u32| -> Command {
+            let mut command = Command::new(rust);
+            command.arg("sample").arg("--dir").arg(&dir).args([
+                "--fixture",
+                fixture,
+                "--workers",
+                &workers.to_string(),
+            ]);
+            command
         };
-        // Unmeasured warm-up of both implementations, as in `discovery_probe bench`.
+        // Unmeasured warm-up, as in `discovery_probe bench`.
         for fixture in fixtures {
-            for label in ["rust", "swift"] {
-                self.probe("discovery", &format!("warmup-{fixture}-{label}"), &mut command(label, fixture, 4))?;
-            }
+            self.probe("discovery", &format!("warmup-{fixture}"), &mut command(fixture, 4))?;
         }
         for round in 1..=self.options.rounds {
             for fixture in fixtures {
                 for index in 0..workers.len() {
                     // Rotate the worker order too, so no count always runs first.
                     let count = workers[(index + round as usize) % workers.len()];
-                    for (label, _) in ordered(round, rust, swift) {
-                        let name = format!("r{round}-{fixture}-w{count}-{label}");
+                    {
+                        let label = "rust";
+                        let name = format!("r{round}-{fixture}-w{count}");
                         let load = load_average();
-                        let stdout = self.probe("discovery", &name, &mut command(label, fixture, count))?;
-                        let mut raw = discovery_output(label, &stdout).map_err(|error| format!("{name}: {error}"))?;
+                        let stdout = self.probe("discovery", &name, &mut command(fixture, count))?;
+                        let mut raw = discovery_output(&stdout);
                         if raw["correct"] != json!(true) && raw["correct"] != json!("true") {
                             return Err(format!("{name}: incorrect inventory: {stdout}"));
                         }
@@ -410,11 +371,8 @@ impl Run {
         }
         let _ = fs::remove_dir_all(&dir);
         self.notes.push(
-            "discovery: discovery into the live inventory only (no writer). Swift runs `AsyncListingProducer` with a \
-             `LiveMappingInventory` (Benchmarks/Discovery/DiscoveryProbe.swift); its four-worker clamp is raised in the \
-             benchmark copy so 8 workers mean 8. CPU rows are process user/system time over the same span. The \
-             unpaired 2026-10-28 Swift numbers in docs/benchmarks/parallel-discovery.json are not comparable \
-             (see docs/benchmarks/rust-port/discovery-scaling.md)."
+            "discovery: discovery into the live inventory only (no writer). CPU rows are process user/system time \
+             over the same span (see docs/benchmarks/rust-port/discovery-scaling.md)."
                 .into(),
         );
         Ok(())
@@ -455,23 +413,7 @@ impl Run {
             }
             let _ = fs::remove_dir_all(&dir);
         }
-        if !self.options.small {
-            // docs/benchmarks/rust-port/session-wave-c.md: Swift on a real Documents folder.
-            for (metric, value) in [("total to publication", 9.74), ("discovery", 1.46), ("first full view", 1.68)] {
-                self.references.push(Reference {
-                    suite: "e2e",
-                    scenario: "180k files".into(),
-                    metric,
-                    value,
-                    source: "docs/benchmarks/rust-port/session-wave-c.md (real Documents folder, 179k files)",
-                });
-            }
-        }
-        self.notes.push(
-            "e2e: Rust only on a generated tree; the documented Swift reference was a real Documents folder, so it \
-             is indicative only and no speedup is computed."
-                .into(),
-        );
+        self.notes.push("e2e: a whole mapping session on a generated tree (sparse files).".into());
         Ok(())
     }
 
@@ -479,7 +421,7 @@ impl Run {
 
     fn summary(&self, environment: &Value) -> String {
         let mut out = String::new();
-        let _ = writeln!(out, "# Rust vs Swift v0.9.15: `cargo xtask bench-compare`\n");
+        let _ = writeln!(out, "# `cargo xtask bench-compare`\n");
         let field = |key: &str| environment[key].as_str().unwrap_or("?").to_string();
         let _ = writeln!(
             out,
@@ -494,18 +436,14 @@ impl Run {
         );
         let _ = writeln!(
             out,
-            "{} fresh-process round(s), implementations interleaved (order alternates per round){}. \
-             Load average before: {}; after: {}.\n",
+            "{} fresh-process round(s){}. Load average before: {}; after: {}.\n",
             self.options.rounds,
             if self.options.small { ", small shapes only" } else { "" },
             field("load_before"),
             field("load_after"),
         );
-        let _ = writeln!(
-            out,
-            "| Suite | Scenario | Metric | Rust median [min, max] | Swift median [min, max] | Speedup | n (Rust/Swift) |"
-        );
-        let _ = writeln!(out, "|---|---|---|---|---|---:|---|");
+        let _ = writeln!(out, "| Suite | Scenario | Metric | Median [min, max] | n |");
+        let _ = writeln!(out, "|---|---|---|---|---:|");
         // Rows in first-seen order.
         let mut keys: Vec<(&str, &str, &str, &str)> = Vec::new();
         for sample in &self.samples {
@@ -515,48 +453,18 @@ impl Run {
             }
         }
         for (suite, scenario, metric, unit) in keys {
-            let values = |label: &str| -> Vec<f64> {
-                self.samples
-                    .iter()
-                    .filter(|s| s.suite == suite && s.scenario == scenario && s.metric == metric && s.label == label)
-                    .map(|s| s.value)
-                    .collect()
-            };
-            let (rust, swift) = (stats(values("rust")), stats(values("swift")));
-            let reference =
-                self.references.iter().find(|r| r.suite == suite && r.scenario == scenario && r.metric == metric);
-            let swift_cell = match (&swift, reference) {
-                (Some(s), _) => cell(s, unit),
-                (None, Some(r)) => format!("{} (documented, not paired)", format_value(r.value, unit)),
-                (None, None) => "–".into(),
-            };
-            // Speedup only for paired time metrics; lower is better.
-            let speedup = match (&rust, &swift) {
-                (Some(r), Some(s)) if unit == "s" && r.median > 0.0 => format!("{:.2}×", s.median / r.median),
-                (Some(r), Some(s)) if r.median > 0.0 => format!("Swift/Rust {:.2}", s.median / r.median),
-                _ => "–".into(),
-            };
-            let n = |s: &Option<Stats>| s.as_ref().map_or(0, |s| s.n);
-            let _ = writeln!(
-                out,
-                "| {suite} | {scenario} | {metric} | {} | {swift_cell} | {speedup} | {}/{} |",
-                rust.as_ref().map_or("–".into(), |s| cell(s, unit)),
-                n(&rust),
-                n(&swift),
-            );
+            let values: Vec<f64> = self
+                .samples
+                .iter()
+                .filter(|s| s.suite == suite && s.scenario == scenario && s.metric == metric)
+                .map(|s| s.value)
+                .collect();
+            if let Some(stats) = stats(values) {
+                let _ = writeln!(out, "| {suite} | {scenario} | {metric} | {} | {} |", cell(&stats, unit), stats.n);
+            }
         }
-        let _ =
-            writeln!(out, "\nSpeedup is the Swift median divided by the Rust median (higher means Rust is faster).");
         for note in &self.notes {
             let _ = writeln!(out, "\n- {note}");
-        }
-        let sources: Vec<&str> = {
-            let mut s: Vec<&str> = self.references.iter().map(|r| r.source).collect();
-            s.dedup();
-            s
-        };
-        for source in sources {
-            let _ = writeln!(out, "- Documented Swift reference: {source}.");
         }
         let _ = writeln!(
             out,
@@ -566,30 +474,14 @@ impl Run {
     }
 }
 
-/// `records=N files=M` written by `discovery_probe fixtures` next to each fixture.
-fn discovery_manifest(dir: &Path, fixture: &str) -> Result<(u64, u64)> {
-    let path = dir.join(format!("{fixture}.manifest"));
-    let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let value = |key: &str| -> Result<u64> {
-        text.split_whitespace()
-            .find_map(|kv| kv.strip_prefix(key))
-            .and_then(|v| v.parse().ok())
-            .ok_or_else(|| format!("{}: no {key}", path.display()))
-    };
-    Ok((value("records=")?, value("files=")?))
-}
-
-/// The Rust probe prints `key=value` pairs, the Swift probe one JSON object.
-fn discovery_output(label: &str, stdout: &str) -> Result<Value> {
-    if label == "swift" {
-        return serde_json::from_str(stdout.trim()).map_err(|error| error.to_string());
-    }
+/// `discovery_probe sample` prints `key=value` pairs.
+fn discovery_output(stdout: &str) -> Value {
     let fields: serde_json::Map<String, Value> = stdout
         .split_whitespace()
         .filter_map(|kv| kv.split_once('='))
         .map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
         .collect();
-    Ok(Value::Object(fields))
+    Value::Object(fields)
 }
 
 struct Stats {
@@ -632,7 +524,6 @@ fn cell(stats: &Stats, unit: &str) -> String {
 fn label(row: &Value) -> Result<&'static str> {
     match row["label"].as_str() {
         Some("rust") => Ok("rust"),
-        Some("swift") => Ok("swift"),
         other => Err(format!("unexpected runner label {other:?}")),
     }
 }
@@ -663,69 +554,7 @@ fn keep_runner_output(work: &Path, raw: &Path) -> Result<()> {
     Ok(())
 }
 
-// --- Swift probes and environment ---------------------------------------------------------------
-
-struct SwiftProbes {
-    paths: BTreeMap<&'static str, PathBuf>,
-    manifests: Value,
-}
-
-impl SwiftProbes {
-    fn path(&self, kind: &str) -> &Path {
-        self.paths.get(kind).expect("loaded for every selected suite")
-    }
-}
-
-/// `DIR/swift-v0.9.15-<suite>/<Probe>` for every selected suite with a Swift probe, as built by
-/// `scripts/benchmarks/build-durable-indexing.sh` (indexing, marking, pipeline) and
-/// `scripts/benchmarks/build-discovery.sh` (discovery); each binary must match its manifest hash.
-/// `None` when no selected suite has one.
-fn swift_probes(dir: &Path, suites: &[String]) -> Result<Option<SwiftProbes>> {
-    const PROBES: [(&str, &str, &str); 4] = [
-        ("indexing", "IndexingProbe", "build-durable-indexing.sh <v0.9.15 checkout> {} grouped indexing"),
-        ("marking", "MarkingProbe", "build-durable-indexing.sh <v0.9.15 checkout> {} grouped marking"),
-        ("pipeline", "PipelineProbe", "build-durable-indexing.sh <v0.9.15 checkout> {} grouped pipeline"),
-        ("discovery", "DiscoveryProbe", "build-discovery.sh <v0.9.15 checkout> {}"),
-    ];
-    let mut manifests = serde_json::Map::new();
-    let mut paths = BTreeMap::new();
-    for (kind, binary, build) in PROBES {
-        if !suites.iter().any(|suite| suite == kind) {
-            continue;
-        }
-        let folder = dir.join(format!("swift-v0.9.15-{kind}"));
-        let path = folder.join(binary);
-        if !path.is_file() {
-            return Err(format!(
-                "Swift probe {} is missing. Build it from the v0.9.15 tag with `scripts/benchmarks/{}` or pass \
-                 --swift-dir.",
-                path.display(),
-                build.replace("{}", &folder.display().to_string()),
-            ));
-        }
-        let actual = sha256(&path)?;
-        let manifest: Value = fs::read_to_string(folder.join("manifest.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or(Value::Null);
-        if let Some(expected) = manifest["binary_sha256"].as_str()
-            && expected != actual
-        {
-            return Err(format!("{} does not match its manifest.json hash", path.display()));
-        }
-        manifests.insert(
-            kind.into(),
-            json!({"path": path, "binary_sha256": actual, "swift": manifest["swift"], "patches": manifest["patches"]}),
-        );
-        paths.insert(kind, path);
-    }
-    Ok((!paths.is_empty()).then_some(SwiftProbes { paths, manifests: Value::Object(manifests) }))
-}
-
-fn sha256(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    Ok(Sha256::digest(&bytes).iter().map(|byte| format!("{byte:02x}")).collect())
-}
+// --- Environment -------------------------------------------------------------------------------
 
 fn command_output(program: &str, args: &[&str]) -> String {
     Command::new(program)
@@ -741,7 +570,7 @@ fn load_average() -> String {
     command_output("sysctl", &["-n", "vm.loadavg"]).trim_matches(|c| c == '{' || c == '}' || c == ' ').to_string()
 }
 
-fn environment(root: &Path, swift: Option<&SwiftProbes>) -> Result<Value> {
+fn environment(root: &Path) -> Result<Value> {
     let memory: f64 = command_output("sysctl", &["-n", "hw.memsize"]).parse().unwrap_or(0.0);
     let root = root.to_string_lossy().to_string();
     Ok(json!({
@@ -755,13 +584,10 @@ fn environment(root: &Path, swift: Option<&SwiftProbes>) -> Result<Value> {
         "dirty": !command_output("git", &["-C", &root, "status", "--porcelain"]).is_empty(),
         "rustc": command_output("rustc", &["--version"]),
         "load_before": load_average(),
-        "swift_probes": swift.map_or(Value::Null, |swift| swift.manifests.clone()),
     }))
 }
 
-/// A private fixture directory under `target/xtask`, removed on drop. Not under `/tmp` or
-/// `$TMPDIR`: both resolve through `/private`, which Foundation strips from the Swift probes'
-/// paths ("missing node parent").
+/// A private fixture directory under `target/xtask`, removed on drop.
 struct WorkDir(PathBuf);
 
 impl WorkDir {
@@ -786,13 +612,6 @@ impl Drop for WorkDir {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn interleaving_alternates() {
-        let (rust, swift) = (Path::new("r"), Path::new("s"));
-        assert_eq!(ordered(1, rust, swift)[0].0, "rust");
-        assert_eq!(ordered(2, rust, swift)[0].0, "swift");
-    }
 
     #[test]
     fn median_of_even_and_odd() {

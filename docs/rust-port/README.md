@@ -38,7 +38,7 @@ Budget: the whole `cargo nextest run --workspace` stays under 60 s on an M-serie
 
 ## Performance
 - Every hot path has a criterion bench or a probe in `orbit-bench`.
-- Comparisons against Swift v0.9.15 run interleaved in fresh processes (`cargo xtask bench-compare`). They are reports, not CI timing gates.
+- Benchmarks run the `orbit-bench` probes in fresh processes (`cargo xtask bench-compare`). They are reports, not CI timing gates. The Swift v0.9.15 probes used for the port's comparisons remain at that tag.
 - Baseline numbers are in `docs/benchmarks/*.md|json`. Swift probe binaries are built under `~/orbit-bench/swift-v0.9.15-*`.
 
 ## Before handing back

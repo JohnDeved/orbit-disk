@@ -97,8 +97,8 @@ The default stays at 4 workers. On today's warm Data volume, 1–8 workers give 
 ## Reproduce
 
 ```sh
-# Swift probe from the v0.9.15 sources (Sources/ is unchanged on this branch).
-zsh scripts/benchmarks/build-discovery.sh <v0.9.15 checkout> ~/orbit-bench/swift-v0.9.15-discovery
+# The Swift probe and its build script were removed after the port; both remain at tag v0.9.15
+# (scripts/benchmarks/build-discovery.sh). The Rust side:
 cargo xtask bench-compare --suites discovery,pipeline --rounds 5 --output <new dir>
 # Kernel operations alone, and a long-running process for `sample <pid>`:
 cargo run --release -p orbit-bench --bin discovery_probe -- fixtures --dir <dir outside /private/tmp>

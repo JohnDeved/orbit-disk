@@ -31,7 +31,7 @@ Commands:
       Extract the pinned Sparkle release (framework, LICENSE, bin/ tools) into NEW-DIR.
   dmg APP OUTPUT.dmg
       Package an existing app into a disk image (scripts/package-dmg.sh).
-  bench-compare --output DIR [--rounds N] [--swift-dir DIR] [--suites LIST] [--small]
+  bench-compare --output DIR [--rounds N] [--suites LIST] [--small]
       Interleaved fresh-process comparison of the Rust and Swift v0.9.15 probes.";
 
 fn main() -> ExitCode {

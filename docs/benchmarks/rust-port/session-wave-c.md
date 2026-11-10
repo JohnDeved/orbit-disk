@@ -7,7 +7,7 @@ Fixtures were deleted after each measurement.
 ## Pipeline probe (discovery and writer overlapping through the session)
 
 `crates/orbit-bench/src/bin/pipeline_probe.rs` is the port of
-`Benchmarks/DurableIndexing/PipelineProbe.swift`: a full `MappingSession` (stage open, removal
+`Benchmarks/DurableIndexing/PipelineProbe.swift` (tag `v0.9.15`): a full `MappingSession` (stage open, removal
 journal anchoring, discovery workers, one writer thread, publication under the journal fence),
 then verification of the published database. Run interleaved with the Swift binary by
 `scripts/benchmarks/run-indexing-pipeline.py --rounds 3`. Like Swift, the probe keeps the stage

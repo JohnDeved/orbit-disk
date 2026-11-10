@@ -59,4 +59,4 @@ The previous marking implementation is unchanged from v0.9.14; this isolated com
 
 The frozen baseline was originally captured at v0.9.13, which was not published. All 39 core/SQLite source hashes match published v0.9.14 exactly. Final baseline and candidate harnesses use the same generated metadata and compiler settings. Machine load and substantial preexisting swap affected absolute results across measurement windows, so comparisons use interleaved controls within each window. Tests do not establish cold-disk, deep-tree, hardlink-heavy or concurrent-deletion throughput.
 
-[Probe source and reproduction commands](../../Benchmarks/DurableIndexing/README.md) document construction, timing boundaries, correctness checks and cleanup. Generated databases are excluded from the repository; numerical evidence and source hashes are retained.
+The Swift probe source and reproduction commands (`Benchmarks/DurableIndexing/README.md` at tag `v0.9.15`) document construction, timing boundaries, correctness checks and cleanup. Generated databases are excluded from the repository; numerical evidence and source hashes are retained.

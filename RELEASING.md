@@ -15,7 +15,7 @@ Both workflows share the jobs in `checks.yml`:
 - `macos-26`, lint: platform boundary check, `cargo fmt`, `cargo clippy -D warnings`.
 - `macos-26`, tests: `cargo nextest run --workspace`, `Tests/test_mcp.py` against the Rust `OrbitControl` and the updater copy overlay against the pinned Sparkle. Clippy with `--all-targets` also compiles the benchmarks.
 
-The macOS jobs select Xcode 26.6 through `DEVELOPER_DIR`; Rust comes from `rust-toolchain.toml`. App packaging and publishing wait for every check job. The Swift app was removed at the 0.10.0 cutover. The manual **Swift baseline** workflow still builds it, with its benchmark probes, from a tag (default `v0.9.15`) for `cargo xtask bench-compare`.
+The macOS jobs select Xcode 26.6 through `DEVELOPER_DIR`; Rust comes from `rust-toolchain.toml`. App packaging and publishing wait for every check job. The Swift app was removed at the 0.10.0 cutover; its sources and benchmark probes remain at tag `v0.9.15`.
 
 After publication, the release workflow renders the README screenshots from the released commit (`scripts/capture-marketing.sh`) and commits only the generated images to `main`. Until the app has the deterministic `--marketing-state` mode described in that script, the step is skipped with a warning. Ordinary pushes do not refresh screenshots.
 
@@ -149,7 +149,7 @@ Add an entitlement only with a reason recorded here. A real Developer ID run is 
 
 ## Benchmarks against the Swift app
 
-`cargo xtask bench-compare --output NEW-DIR [--rounds N] [--small] [--suites indexing,marking,pipeline,discovery,e2e] [--swift-dir DIR]` builds the `orbit-bench` probes and runs them against the Swift v0.9.15 probes (`~/orbit-bench/swift-v0.9.15-{indexing,marking,pipeline}` by default; the Swift baseline workflow builds them). Each run is a fresh process, and the order alternates each round. The script writes `results.jsonl`, `summary.md` (median, minimum, maximum and speedup), `environment.json` (machine, commit and load averages) and per-run logs under `raw/`. Discovery and end-to-end sessions have no Swift probe binary, so they show the documented Swift numbers without a speedup. The results are reports, not CI gates; run them on an idle machine.
+`cargo xtask bench-compare --output NEW-DIR [--rounds N] [--small] [--suites indexing,marking,pipeline,discovery,e2e]` builds the `orbit-bench` probes and runs every suite in fresh processes for the given number of rounds. It writes `results.jsonl`, `summary.md` (median, minimum and maximum), `environment.json` (machine, commit and load averages) and per-run logs under `raw/`. To compare two builds, run it for each, or pass both builds' probes to `scripts/benchmarks/run-durable-indexing.py` or `run-indexing-pipeline.py` (`--binary=label=path`, repeatable), which interleave them. For a real folder, `e2e_probe run --dir DIR` maps `DIR/root` (a symlink works), and `--workers N` and `--keep` help with profiling. The results are reports, not CI gates; run them on an idle machine.
 
 ## Update interface
 
