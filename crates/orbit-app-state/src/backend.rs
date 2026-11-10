@@ -121,6 +121,9 @@ pub struct Validation {
     pub rejections: Vec<String>,
     /// The mapped root still has its identity after validation.
     pub root_matches: bool,
+    /// Folders of accepted items that changed on disk since the map read them (replaced by a
+    /// save, for example): the map refreshes them, nobody has to.
+    pub stale_parents: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -328,11 +331,20 @@ fn validate<B: Backend + ?Sized>(backend: &B, request: &ValidateRequest, cancel:
             result.rejections.push(format!("{name}: {reason}"));
             continue;
         }
-        match item.meta.identity {
-            Some(expected) if backend.identity(&item.path) == Some(expected) => result.accepted.push(item.clone()),
-            _ => {
-                result.rejections.push(format!("{name}: changed since indexing. Refresh the map before collecting it."))
+        match (item.meta.identity, backend.identity(&item.path)) {
+            (Some(expected), Some(current)) if current == expected => result.accepted.push(item.clone()),
+            // Replaced since the map read it (an app saved it anew): collect what is there now,
+            // and let the map catch up. Removal checks the identity again before touching it.
+            (Some(_), Some(current)) => {
+                let mut item = item.clone();
+                item.meta.identity = Some(current);
+                let parent = crate::paths::parent_or_root(&item.path).to_vec();
+                if !result.stale_parents.contains(&parent) {
+                    result.stale_parents.push(parent);
+                }
+                result.accepted.push(item);
             }
+            _ => result.rejections.push(format!("{name}: no longer exists. It was moved or deleted.")),
         }
     }
     result.root_matches = root_before && backend.identity(&request.root) == Some(request.root_identity);

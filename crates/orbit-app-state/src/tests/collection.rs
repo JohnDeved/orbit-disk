@@ -82,19 +82,29 @@ fn drops_collapse_descendants_report_included_and_reject_ineligible_items() {
     assert!(!h.state.can_collect(&h.state.lookup_item(b"/r").unwrap()));
 }
 
+/// Items replaced since the map read them (an app saved them anew) are collected as they are
+/// now, under their current identity, and their folders refresh on their own: the map being
+/// behind never stops a drop. Items that are gone are skipped.
 #[test]
-fn replaced_items_are_rejected_instead_of_collected_under_their_old_identity() {
+fn replaced_items_are_collected_as_they_are_now_and_their_folders_refresh() {
     let mut h = harness();
     h.open_mapped(b"/r");
     h.backend.replace(b"/r/docs/y.txt");
     h.backend.replace(b"/r/big");
-    collect(&mut h, &["/r/docs/y.txt", "/r/big"]);
+    h.backend.delete(b"/r/file1");
+    collect(&mut h, &["/r/docs/y.txt", "/r/big", "/r/file1"]);
     h.run();
-    assert!(h.collection().is_empty());
-    assert_eq!(status(&h).as_deref(), Some("Skipped 2 items."));
-    let error = error(&h).unwrap();
-    assert!(error.contains("y.txt: changed since indexing. Refresh the map before collecting it."));
-    assert!(error.contains("big: changed since indexing."));
+    assert_eq!(h.collection(), ["/r/docs/y.txt", "/r/big"]);
+    let current = crate::backend::Backend::identity(&*h.backend, b"/r/docs/y.txt");
+    let collected = h.state.collection().unwrap().items().iter().find(|i| &*i.path == b"/r/docs/y.txt").cloned();
+    assert_eq!(collected.and_then(|i| i.meta.identity), current, "collected under its current identity");
+    assert!(error(&h).is_some_and(|e| e.starts_with("file1: no longer exists.")));
+    h.advance(crate::state::REFRESH_DELAY);
+    let refreshed = h.requests.iter().find_map(|(_, r)| match r {
+        Request::Refresh(refresh) => Some(refresh.paths.clone()),
+        _ => None,
+    });
+    assert_eq!(refreshed, Some(vec![b"/r".to_vec(), b"/r/docs".to_vec()]), "the changed folders refresh");
 }
 
 #[test]
@@ -143,7 +153,7 @@ fn large_drops_buffer_slices_recheck_before_commit_and_small_requests_overtake()
     assert_eq!(collection[128], "/r/many/zz", "the small request overtook the remainder");
     assert!(!collection.contains(&"/r/many/f0130".to_owned()), "a deleted buffered item never reappears");
     assert_eq!(status(&h).as_deref(), Some("Collection updated. Skipped 1 item."));
-    assert!(error(&h).unwrap().starts_with("f0130: changed since indexing."));
+    assert!(error(&h).unwrap().starts_with("f0130: no longer exists."));
 }
 
 #[test]
@@ -153,7 +163,7 @@ fn validation_belongs_to_its_root_across_switches() {
     h.open_mapped(b"/s");
     h.open(b"/r");
     collect(&mut h, &["/r/docs/x.txt"]);
-    h.backend.replace(b"/r/file1");
+    h.backend.delete(b"/r/file1");
     collect(&mut h, &["/r/file1"]);
     let held = h.take(is_validate).unwrap();
     h.open(b"/s");
@@ -167,14 +177,14 @@ fn validation_belongs_to_its_root_across_switches() {
     // Returning shows the outcome and the queued rejection.
     h.open(b"/r");
     assert_eq!(h.collection(), ["/r/docs/x.txt"]);
-    assert!(error(&h).is_some_and(|e| e.starts_with("file1: changed since indexing.")));
+    assert!(error(&h).is_some_and(|e| e.starts_with("file1: no longer exists.")));
 }
 
 #[test]
 fn completion_preserves_newer_status_and_queues_its_rejection_behind_a_newer_error() {
     let mut h = harness();
     h.open_mapped(b"/r");
-    h.backend.replace(b"/r/file1");
+    h.backend.delete(b"/r/file1");
     collect(&mut h, &["/r/docs/x.txt", "/r/file1"]);
     let held = h.take(is_validate).unwrap();
     h.send(Event::Pause);
@@ -189,7 +199,7 @@ fn completion_preserves_newer_status_and_queues_its_rejection_behind_a_newer_err
     assert_eq!(status(&h), paused, "a newer status is not overwritten");
     assert_eq!(error(&h), newer, "a newer error is not overwritten");
     h.send(Event::DismissError);
-    assert!(error(&h).is_some_and(|e| e.starts_with("file1: changed since indexing.")), "the rejection follows");
+    assert!(error(&h).is_some_and(|e| e.starts_with("file1: no longer exists.")), "the rejection follows");
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! Behavior tests driven by `FakeBackend` and explicit time. Each test names the Swift checks it
 //! covers in `TRIAGE-COVERAGE.md`.
 
+mod busy_drag;
 mod collection;
 mod hover;
 mod mapping;

@@ -390,6 +390,11 @@ impl AppState {
                 return;
             }
         };
+        if !validation.stale_parents.is_empty() && self.active == Some(session) {
+            // On demand: the folders of items that changed since the map read them.
+            self.pending_dirs.listings.extend(validation.stale_parents.iter().cloned());
+            self.schedule_refresh();
+        }
         let holds = self.confirmation_holds(session);
         let limit = MAX_COMMIT_BATCH;
         let Some(s) = self.session_mut(session) else { return };
