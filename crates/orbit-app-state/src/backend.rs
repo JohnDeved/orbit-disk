@@ -323,19 +323,22 @@ fn validate<B: Backend + ?Sized>(backend: &B, request: &ValidateRequest, cancel:
             return result;
         }
         let name = item.display_name();
-        if !item.meta.flags.accessible || item.meta.flags.is_symlink {
-            result.rejections.push(format!("{name}: this item cannot be collected."));
-            continue;
-        }
+        // The policy checks the item as it is now (symlinks, protected and hidden locations).
         if let Some(reason) = backend.rejection_reason(&item.path, &request.root) {
             result.rejections.push(format!("{name}: {reason}"));
             continue;
         }
-        match (item.meta.identity, backend.identity(&item.path)) {
+        let current = backend.identity(&item.path);
+        if !item.meta.flags.accessible && current.is_some_and(|current| item.meta.identity == Some(current)) {
+            result.rejections.push(format!("{name}: Orbit Disk can't read this folder."));
+            continue;
+        }
+        match (item.meta.identity, current) {
             (Some(expected), Some(current)) if current == expected => result.accepted.push(item.clone()),
-            // Replaced since the map read it (an app saved it anew): collect what is there now,
-            // and let the map catch up. Removal checks the identity again before touching it.
-            (Some(_), Some(current)) => {
+            // Replaced since the map read it (an app saved it anew), or not identified yet:
+            // collect what is there now, and let the map catch up. Removal checks the identity
+            // again before touching it.
+            (_, Some(current)) => {
                 let mut item = item.clone();
                 item.meta.identity = Some(current);
                 let parent = crate::paths::parent_or_root(&item.path).to_vec();

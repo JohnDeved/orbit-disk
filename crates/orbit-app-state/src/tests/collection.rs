@@ -72,13 +72,19 @@ fn drops_collapse_descendants_report_included_and_reject_ineligible_items() {
     h.run();
     assert_eq!(status(&h).as_deref(), Some("Skipped 1 item."));
     assert_eq!(error(&h).as_deref(), Some("a.bin: System and Library folders are protected."));
-    // Already included or never collectable: nothing starts.
+    // The map may be behind: a drag always starts, and the drop says why nothing was added.
     h.send(Event::DismissError);
-    drag_items(&mut h, 3, &["/r/docs/y.txt"]);
-    assert_eq!(h.state.drag_id(), None);
-    assert_eq!(status(&h).as_deref(), Some("These items are already included in the collection."));
-    drag_items(&mut h, 4, &["/r"]);
-    assert_eq!(status(&h).as_deref(), Some("These items cannot be collected. Refresh the map if they have changed."));
+    let drag = drag_items(&mut h, 3, &["/r/docs/y.txt"]);
+    assert_eq!(h.state.drag_id(), Some(drag));
+    h.send(Event::DragDrop { drag });
+    h.run();
+    assert_eq!(status(&h).as_deref(), Some("1 item already included."));
+    let drag = drag_items(&mut h, 4, &["/r"]);
+    assert_eq!(h.state.drag_id(), Some(drag));
+    h.send(Event::DragDrop { drag });
+    h.run();
+    assert_eq!(status(&h).as_deref(), Some("Skipped 1 item."));
+    assert_eq!(error(&h).as_deref(), Some("r: The mapped folder cannot be removed."));
     assert!(!h.state.can_collect(&h.state.lookup_item(b"/r").unwrap()));
 }
 

@@ -155,18 +155,11 @@ impl AppState {
             // Large groups validate eligibility per slice in the background.
             (candidates, Some(Arc::new(context)))
         } else {
+            // The map's flags may be out of date while it updates: the drag always starts, and
+            // the drop checks each item on disk (with the reason it can't be collected, if so).
             let all = candidates.all();
             let (eligible, omitted): (Vec<Item>, Vec<Item>) =
                 all.into_iter().partition(|item| can_begin_collection(item, &context));
-            if eligible.is_empty() {
-                let included = omitted.iter().all(|item| has_collected_ancestor(&item.path, &context.collected, true));
-                self.set_status(Some(if included {
-                    "These items are already included in the collection.".into()
-                } else {
-                    "These items cannot be collected. Refresh the map if they have changed.".into()
-                }));
-                return;
-            }
             let mut ordered = eligible;
             ordered.extend(omitted);
             (Candidates::Items(ordered.into()), None)
