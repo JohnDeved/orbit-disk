@@ -13,6 +13,7 @@ use orbit_sunburst::CollectionState;
 
 use super::{MapPanel, layers};
 use crate::host::{AppHost, Host};
+use crate::overlay::{FlightKind, OverlayLayer};
 use crate::settings::{Settings, SettingsStore};
 
 /// `/r`: `big` (100: `a.bin`), `docs` (30: `x.txt`), `file1` (10); mapped and settled.
@@ -180,6 +181,121 @@ fn a_short_press_opens_and_a_press_beyond_the_threshold_drags_the_pressed_segmen
     });
     cx.simulate_mouse_up(docs, MouseButton::Left, Modifiers::none());
     assert_eq!(current(&host, cx), "/r");
+}
+
+/// The window's overlay layer, as `Panels::new` installs it.
+fn overlay(host: &Host, cx: &mut VisualTestContext) -> Entity<OverlayLayer> {
+    cx.update(|_, cx| {
+        let layer = cx.new(|_| OverlayLayer::new(host));
+        OverlayLayer::install(&layer, cx);
+        layer
+    })
+}
+
+#[gpui::test]
+fn hovering_a_segment_shows_its_row_as_a_tooltip_below_the_pointer(cx: &mut TestAppContext) {
+    let (host, map, cx) = open(cx);
+    let overlay = overlay(&host, cx);
+    let tip = |cx: &mut VisualTestContext| cx.read(|cx| overlay.read(cx).tip().cloned());
+    let caption = |cx: &mut VisualTestContext| {
+        tip(cx).map(|tip| (tip.name.to_string(), tip.detail.to_string(), tip.size.to_string()))
+    };
+
+    let center_name = |cx: &mut VisualTestContext| cx.read(|cx| map.read(cx).center.name.clone());
+    let resting = center_name(cx);
+    let big = inside(&map, segment(&host, &map, "big", cx), cx);
+    move_to(cx, big);
+    assert_eq!(caption(cx), Some(("big".into(), "1 file".into(), "100 bytes".into())), "the row's text");
+    assert_eq!(center_name(cx), resting, "the center keeps describing the folder: the tooltip has the item");
+    assert!(tip(cx).is_some_and(|tip| tip.share.ends_with('%')), "with its share of the folder");
+
+    // A deeper ring says where its item is.
+    let file = inside(&map, segment(&host, &map, "a.bin", cx), cx);
+    move_to(cx, file);
+    assert_eq!(caption(cx), Some(("a.bin".into(), "BIN · in big".into(), "100 bytes".into())));
+
+    let hole = center(&map, cx);
+    move_to(cx, hole);
+    assert_eq!(tip(cx), None, "the center has its own caption");
+    move_to(cx, big);
+    assert!(tip(cx).is_some());
+    cx.simulate_mouse_down(big, MouseButton::Left, Modifiers::none());
+    assert_eq!(tip(cx), None, "a press hides it (a drag shows its own card)");
+    cx.simulate_mouse_up(big, MouseButton::Left, Modifiers::none());
+}
+
+#[gpui::test]
+fn a_drag_released_outside_a_drop_target_flies_back(cx: &mut TestAppContext) {
+    let (host, map, cx) = open(cx);
+    let overlay = overlay(&host, cx);
+    let docs = inside(&map, segment(&host, &map, "docs", cx), cx);
+    cx.simulate_mouse_down(docs, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(docs + point(px(40.), px(0.)), MouseButton::Left, Modifiers::none());
+    assert!(cx.read(|cx| host.state(cx).drag_id().is_some()));
+    let ghost = cx.read(|cx| map.read(cx).drag.as_ref().and_then(|drag| drag.ghost.clone()));
+    let ghost = ghost.expect("the drag carries the pressed segment");
+    assert_eq!(ghost.grab, docs, "grabbed where it was pressed");
+    assert!(matches!(ghost.look, crate::ghost::GhostLook::Segment { .. }));
+    assert_eq!(ghost.label.name.as_ref(), "docs");
+    assert!(cx.read(|cx| map.read(cx).lifted.is_some()), "the segment leaves a gap in the map");
+    cx.simulate_mouse_up(docs + point(px(40.), px(0.)), MouseButton::Left, Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(cx.read(|cx| overlay.read(cx).flights()), vec![FlightKind::Return]);
+    assert!(cx.read(|cx| map.read(cx).lifted.is_some()), "the gap stays until the segment is back");
+
+    // Landing closes the gap (at once without motion).
+    cx.update(|_, cx| crate::theme::set_reduce_motion(true, cx));
+    cx.simulate_mouse_down(docs, MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(docs + point(px(40.), px(0.)), MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_move(docs + point(px(60.), px(0.)), MouseButton::Left, Modifiers::none());
+    cx.simulate_mouse_up(docs + point(px(60.), px(0.)), MouseButton::Left, Modifiers::none());
+    cx.run_until_parked();
+    assert!(cx.read(|cx| map.read(cx).lifted.is_none()), "back in place: the segment shows again");
+}
+
+/// A background refresh that replaces the layout between the press and the drag never stops
+/// the drag: the pressed item is captured at the press and dragged by its path.
+#[gpui::test]
+fn a_layout_replaced_after_the_press_still_drags_the_pressed_item(cx: &mut TestAppContext) {
+    let (host, map, cx) = open(cx);
+    let docs = inside(&map, segment(&host, &map, "docs", cx), cx);
+    cx.simulate_mouse_down(docs, MouseButton::Left, Modifiers::none());
+    let source = cx.update(|_, cx| {
+        map.update(cx, |map, cx| {
+            let press = map.press.clone().expect("a press");
+            let pressed = press.pressed.expect("the pressed segment's drag payload");
+            // As if a refresh had published a new layout meanwhile.
+            map.drag_source(&pressed, press.layout_revision.wrapping_sub(1), cx)
+        })
+    });
+    match source {
+        Some(orbit_app_state::DragSource::Items(paths)) => assert_eq!(&*paths[0], b"/r/docs"),
+        other => panic!("expected the pressed item by path, got {other:?}"),
+    }
+    cx.simulate_mouse_up(docs, MouseButton::Left, Modifiers::none());
+}
+
+/// A drag from the list crosses the map without hovering it, exactly like a drag from the map:
+/// no hover event, no outline, no tooltip. Hover resumes once the drag ends.
+#[gpui::test]
+fn a_drag_from_the_list_does_not_hover_the_map(cx: &mut TestAppContext) {
+    let (host, map, cx) = open(cx);
+    let overlay = overlay(&host, cx);
+    let big = inside(&map, segment(&host, &map, "big", cx), cx);
+    let drag = orbit_app_state::DragId(99);
+    let source = orbit_app_state::DragSource::Items(vec![std::sync::Arc::from(&b"/r/file1"[..])]);
+    cx.update(|_, cx| host.send(Event::DragBegin { drag, source, label: "file1".into() }, cx));
+    assert_eq!(cx.read(|cx| host.state(cx).drag_id()), Some(drag));
+    let events = handled(&host, cx);
+    move_to(cx, big);
+    move_to(cx, big + point(px(2.), px(2.)));
+    assert_eq!(handled(&host, cx), events, "no hover reaches the state");
+    assert_eq!(cx.read(|cx| overlay.read(cx).tip().cloned()), None, "no tooltip");
+    assert!(cx.read(|cx| map.read(cx).pointer == orbit_sunburst::Hit::None), "no outline");
+
+    cx.update(|_, cx| host.send(Event::DragEnd { drag }, cx));
+    move_to(cx, big + point(px(1.), px(0.)));
+    assert!(cx.read(|cx| overlay.read(cx).tip().is_some()), "hover is back after the drag");
 }
 
 #[gpui::test]

@@ -191,6 +191,20 @@ pub const TRACK_TRANSITION: std::time::Duration = std::time::Duration::from_mill
 pub const FOOTER_FADE: std::time::Duration = std::time::Duration::from_millis(180);
 /// Coarse refresh of "Indexed · updated … ago" while it is visible (minute granularity).
 pub const AGE_REFRESH: std::time::Duration = std::time::Duration::from_secs(30);
+/// The map tooltip fades in over this when it appears (not between segments).
+pub const TIP_FADE: std::time::Duration = std::time::Duration::from_millis(120);
+/// A tooltip hidden for less than this reappears without fading (crossing a gap between rings).
+pub const TIP_REAPPEAR: std::time::Duration = std::time::Duration::from_millis(250);
+/// A grabbed row or segment lifting off the UI (and a large segment shrinking to carry size).
+pub const DRAG_LIFT: std::time::Duration = std::time::Duration::from_millis(220);
+/// The drag card and the tray easing into and out of "Release to collect".
+pub const DROP_TARGET_FADE: std::time::Duration = std::time::Duration::from_millis(150);
+/// A dropped card flying into the tray's glyph.
+pub const DROP_FLIGHT: std::time::Duration = std::time::Duration::from_millis(380);
+/// The tray glyph's pop when items arrive.
+pub const TRAY_POP: std::time::Duration = std::time::Duration::from_millis(320);
+/// A drag released outside the tray sliding back into its place.
+pub const DRAG_RETURN: std::time::Duration = std::time::Duration::from_millis(260);
 /// One turn of the activity indicator.
 pub const SPINNER_PERIOD: std::time::Duration = std::time::Duration::from_millis(900);
 /// The footer action button.
@@ -208,12 +222,6 @@ pub const TOOLBAR_OPEN_WIDTH: Pixels = px(132.);
 /// Breadcrumb row: Up button, opening indicator slot and file count column.
 pub const BREADCRUMB_UP_WIDTH: Pixels = px(64.);
 pub const BREADCRUMB_COUNT_WIDTH: Pixels = px(138.);
-
-/// `t` in 0..=1 eased out (cubic), like SwiftUI's `.easeOut`.
-pub fn ease_out(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    1.0 - (1.0 - t).powi(3)
-}
 
 /// The age of a saved map for "Indexed · updated {age} ago", at minute granularity (the footer
 /// refreshes it every [`AGE_REFRESH`]): "less than a minute", "5 min", "2 hr, 5 min", "3 days, 4 hr".

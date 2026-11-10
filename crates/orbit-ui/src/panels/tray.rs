@@ -6,10 +6,17 @@
 //! release over it sends `DragDrop`. At rest it is unboxed; during a drag the whole area gains a
 //! dashed coral outline, and over it a solid coral target with "Release to collect". The outline is
 //! an overlay, so the states never move the contents.
+//!
+//! Motion: the outline and target fade in and out ([`theme::DROP_TARGET_FADE`]) and the glyph
+//! rises slightly while a release would collect. A drop sends the card flying into the glyph
+//! (`OverlayLayer::collect`), and the glyph pops as it lands ([`theme::TRAY_POP`]); items added
+//! any other way pop it at once. Reduce Motion keeps the states and drops the motion.
+
+use std::time::Instant;
 
 use gpui::{
-    Context, DragMoveEvent, InteractiveElement, IntoElement, ParentElement, Render, Styled, Subscription, Window, div,
-    px,
+    Bounds, Context, DragMoveEvent, InteractiveElement, IntoElement, ParentElement, Pixels, Render, Styled,
+    Subscription, Transformation, Window, div, point, px, size,
 };
 use orbit_app_state::{DragId, Event, Regions};
 
@@ -17,6 +24,8 @@ use crate::components::{ButtonStyle, CollectionDrag, activity_indicator, button}
 use crate::frame_stats;
 use crate::host::Host;
 use crate::icons::{Icon, icon};
+use crate::motion::{Transition, progress};
+use crate::overlay::{OverlayLayer, square};
 use crate::theme;
 
 pub const REGIONS: Regions = Regions::TRAY;
@@ -25,17 +34,37 @@ pub struct TrayPanel {
     host: Host,
     /// The drag and over-state last reported with `DragOverTray` (pointer moves repeat it).
     reported: Option<(DragId, bool)>,
+    /// The drop area's bounds from the last drag move (where a dropped card flies to).
+    area: Option<Bounds<Pixels>>,
+    /// Opacity of the drag outline, and of the "Release to collect" target.
+    dragging: Option<Transition>,
+    ready: Option<Transition>,
+    /// When the glyph's pop starts (in the future while a dropped card is still flying).
+    pop: Option<Instant>,
+    /// Items in the collection at the last render (an increase pops the glyph).
+    count: usize,
     _subscriptions: Vec<Subscription>,
 }
 
 impl TrayPanel {
     pub fn new(host: &Host, cx: &mut Context<Self>) -> Self {
         let subscriptions = host.observe(REGIONS, cx).into_iter().chain([theme::observe_motion(cx)]).collect();
-        Self { host: host.clone(), reported: None, _subscriptions: subscriptions }
+        let count = host.state(cx).collection().map_or(0, |c| c.len());
+        Self {
+            host: host.clone(),
+            reported: None,
+            area: None,
+            dragging: None,
+            ready: None,
+            pop: None,
+            count,
+            _subscriptions: subscriptions,
+        }
     }
 
     fn drag_moved(&mut self, event: &DragMoveEvent<CollectionDrag>, _: &mut Window, cx: &mut Context<Self>) {
         let drag = event.drag(cx).drag;
+        self.area = Some(event.bounds);
         let over = event.bounds.contains(&event.event.position);
         let was_over = self.reported.is_some_and(|(id, over)| id == drag && over);
         if self.reported == Some((drag, over)) {
@@ -47,22 +76,55 @@ impl TrayPanel {
         }
     }
 
-    fn dropped(&mut self, payload: &CollectionDrag, _: &mut Window, cx: &mut Context<Self>) {
+    fn dropped(&mut self, payload: &CollectionDrag, window: &mut Window, cx: &mut Context<Self>) {
         self.reported = None;
+        let accepted = self.host.state(cx).drop_target_active();
         self.host.send(Event::DragDrop { drag: payload.drag }, cx);
+        let (Some(area), Some(overlay)) = (self.area, OverlayLayer::global(cx)) else { return };
+        if accepted && !theme::reduce_motion(cx) {
+            // The glyph's center: the area's 20-point inset plus half the 36-point slot.
+            let glyph = point(area.origin.x + px(20. + 18.), area.center().y);
+            let pointer = window.mouse_position();
+            overlay.update(cx, |layer, cx| layer.collect(payload.clone(), pointer, square(glyph, 30.), cx));
+            // Pop as the card lands, not when the collection changes.
+            self.pop = Some(Instant::now() + theme::DROP_FLIGHT.mul_f32(0.8));
+            self.count = usize::MAX;
+        }
     }
 }
 
 impl Render for TrayPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         frame_stats::rendered(REGIONS);
         let reduce_motion = theme::reduce_motion(cx);
+        let now = Instant::now();
         let state = self.host.state(cx);
         let collection = state.collection();
         let count = collection.map_or(0, |c| c.len());
         let dragging = state.drag_label().map(str::to_owned);
         let is_dragging = dragging.is_some();
         let ready = state.drop_target_active();
+        // A drop already scheduled its pop (count is reset to MAX until it lands).
+        if count > self.count && !reduce_motion {
+            self.pop = Some(now);
+        }
+        self.count = count;
+        let ease = |slot: &mut Option<Transition>, on: bool| {
+            let to = if on { 1.0 } else { 0.0 };
+            let transition = slot.get_or_insert_with(|| Transition::settled(to, theme::DROP_TARGET_FADE, now));
+            transition.retarget(to, !reduce_motion, now);
+            *transition
+        };
+        let (drag_fade, ready_fade) = (ease(&mut self.dragging, is_dragging), ease(&mut self.ready, ready));
+        let pop = self.pop.map(|start| progress(start, theme::TRAY_POP, now));
+        if pop.is_some_and(|p| p >= 1.0) {
+            self.pop = None;
+        }
+        if drag_fade.running(now) || ready_fade.running(now) || self.pop.is_some() {
+            window.request_animation_frame();
+        }
+        let (drag_fade, ready_fade) = (drag_fade.value(now), ready_fade.value(now));
+        let glyph_scale = (1.0 + 0.08 * ready_fade) * (1.0 + 0.22 * (std::f32::consts::PI * pop.unwrap_or(0.0)).sin());
         let validating = state.is_validating_collection();
         let updating = state.is_updating_collection();
         let title = if ready {
@@ -90,24 +152,26 @@ impl Render for TrayPanel {
         let glyph = if !is_dragging && (validating || updating) {
             activity_indicator("tray-activity", px(18.), reduce_motion, Icon::Loader)
         } else {
-            icon(Icon::TrayDown).size(px(34.)).text_color(theme::color(theme::CORAL)).into_any_element()
+            icon(Icon::TrayDown)
+                .size(px(34.))
+                .text_color(theme::color(theme::CORAL))
+                .with_transformation(Transformation::scale(size(glyph_scale, glyph_scale)))
+                .into_any_element()
         };
         let host = self.host.clone();
-        let outline = div().absolute().top_0().left_0().size_full().rounded(theme::RADIUS_CARD);
-        let outline = if ready {
-            Some(outline.border_2().border_color(theme::color(theme::CORAL)))
-        } else if is_dragging {
-            Some(outline.border_1().border_dashed().border_color(theme::color(theme::CORAL)))
-        } else {
-            None
-        };
-        let fill = if ready {
-            theme::with_alpha(theme::CORAL, 0.16)
-        } else if is_dragging {
-            theme::with_alpha(theme::CORAL, 0.06)
-        } else {
-            theme::with_alpha(theme::CORAL, 0.0)
-        };
+        // Two outline layers that fade independently: the dashed drag outline, and above it the
+        // solid "Release to collect" target with its stronger fill.
+        let layer = || div().absolute().top_0().left_0().size_full().rounded(theme::RADIUS_CARD);
+        let outline = (drag_fade > 0.0).then(|| {
+            layer()
+                .opacity(drag_fade * (1.0 - ready_fade))
+                .border_1()
+                .border_dashed()
+                .border_color(theme::color(theme::CORAL))
+        });
+        let target =
+            (ready_fade > 0.0).then(|| layer().opacity(ready_fade).border_2().border_color(theme::color(theme::CORAL)));
+        let fill = theme::with_alpha(theme::CORAL, 0.06 * drag_fade.max(ready_fade) + 0.10 * ready_fade);
         div().size_full().pt(theme::TRAY_GAP).px(px(theme::TRAY_MARGIN.0)).pb(px(theme::TRAY_MARGIN.1)).child(
             div()
                 .id("tray-drop-area")
@@ -154,7 +218,8 @@ impl Render for TrayPanel {
                     can_review,
                     move |_, _, cx| host.send(Event::BeginReview, cx),
                 )))
-                .children(outline),
+                .children(outline)
+                .children(target),
         )
     }
 }
@@ -174,6 +239,7 @@ mod tests {
     use crate::components::{CollectionDrag, DragPreview};
     use crate::host::{AppHost, Host};
     use crate::icons::Icon;
+    use crate::overlay::{FlightKind, OverlayLayer};
     use crate::settings::{Settings, SettingsStore};
 
     /// A drag source above the tray, standing in for a map sector or file row.
@@ -218,11 +284,22 @@ mod tests {
         let (_bench, cx) = cx.add_window_view({
             let host = host.clone();
             move |_, cx| DragBench {
-                payload: CollectionDrag { drag, label: "file1".into(), detail: "10 bytes".into(), icon: Icon::File },
+                payload: CollectionDrag {
+                    drag,
+                    label: "file1".into(),
+                    detail: "10 bytes".into(),
+                    icon: Icon::File,
+                    ghost: None,
+                },
                 tray: cx.new(|cx| TrayPanel::new(&host, cx)),
             }
         });
         cx.run_until_parked();
+        let overlay = cx.update(|_, cx| {
+            let layer = cx.new(|_| OverlayLayer::new(&host));
+            OverlayLayer::install(&layer, cx);
+            layer
+        });
         let path = Harness::path("/r/file1");
         cx.update(|_, cx| {
             host.send(
@@ -246,6 +323,7 @@ mod tests {
 
         cx.simulate_mouse_up(tray, MouseButton::Left, Modifiers::none());
         cx.run_until_parked();
+        assert_eq!(cx.read(|cx| overlay.read(cx).flights()), vec![FlightKind::Collect], "the card flies into the tray");
         cx.read(|cx| {
             let state = host.state(cx);
             assert_eq!(state.drag_id(), None, "the drop consumed the drag");

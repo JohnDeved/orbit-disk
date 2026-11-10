@@ -116,71 +116,137 @@ pub struct CollectionDrag {
     /// Secondary line (the dragged size).
     pub detail: SharedString,
     pub icon: Icon,
+    /// The grabbed element the drag carries ([`crate::ghost`]); without one, a plain card
+    /// beside the pointer.
+    pub ghost: Option<crate::ghost::Ghost>,
 }
 
-/// The drag preview (Swift `dragPreview`): a 240 × 56 card 12 points right of the pointer,
-/// vertically centered on it. `offset` is the pointer position inside the dragged element when
-/// the drag started (GPUI draws the view at `pointer − offset`).
+/// The drag preview (Swift `dragPreview`): the grabbed element itself, attached to the pointer
+/// where it was grabbed ([`crate::ghost`]). It lifts off over [`theme::DRAG_LIFT`] and, while
+/// the tray would accept it, eases into the "Release to collect" look ([`theme::DROP_TARGET_FADE`]).
+/// GPUI draws the active drag view every frame at `pointer − offset`, so it reads the pointer
+/// and the drop state itself ([`crate::overlay::OverlayLayer::drop_target_active`]). A drag
+/// without a ghost shows a 240 × 56 card 12 points right of the pointer.
 pub struct DragPreview {
     payload: CollectionDrag,
     offset: gpui::Point<gpui::Pixels>,
+    lifted: std::time::Instant,
+    over: Option<crate::motion::Transition>,
 }
 
 impl DragPreview {
     pub const SIZE: (f32, f32) = (240., 56.);
+    /// The plain card's top-left relative to the pointer.
+    pub const POINTER_GAP: (f32, f32) = (12., -28.);
 
     pub fn new(payload: &CollectionDrag, offset: gpui::Point<gpui::Pixels>) -> Self {
-        Self { payload: payload.clone(), offset }
+        Self { payload: payload.clone(), offset, lifted: std::time::Instant::now(), over: None }
+    }
+
+    /// The plain card's bounds for a pointer at `pointer`.
+    pub fn card_bounds(pointer: gpui::Point<gpui::Pixels>) -> gpui::Bounds<gpui::Pixels> {
+        let (width, height) = Self::SIZE;
+        let (dx, dy) = Self::POINTER_GAP;
+        gpui::Bounds::new(gpui::point(pointer.x + px(dx), pointer.y + px(dy)), gpui::size(px(width), px(height)))
+    }
+
+    /// Where `payload`'s card is with the pointer at `pointer` (where a drop flight starts).
+    pub fn payload_bounds(payload: &CollectionDrag, pointer: gpui::Point<gpui::Pixels>) -> gpui::Bounds<gpui::Pixels> {
+        payload.ghost.as_ref().map_or_else(|| Self::card_bounds(pointer), |ghost| ghost.card_bounds(pointer))
     }
 }
 
 impl gpui::Render for DragPreview {
-    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
-        let (width, height) = Self::SIZE;
-        div()
-            .pl(self.offset.x + px(12.))
-            .pt((self.offset.y - px(height / 2.)).max(px(0.)))
-            .font_family(theme::FONT_FAMILY)
-            .child(
-                div()
-                    .w(px(width))
-                    .h(px(height))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(11.))
-                    .pl(px(13.))
-                    .pr(px(14.))
-                    .rounded(px(8.))
-                    .bg(theme::with_alpha(0x242424, 0.98))
-                    .border_1()
-                    .border_color(theme::color(0x858585))
-                    .child(icon(self.payload.icon).size(px(20.)).text_color(theme::color(theme::TEXT)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .child(
-                                div()
-                                    .text_size(theme::TEXT_ROW)
-                                    .font_weight(theme::WEIGHT_MEDIUM)
-                                    .text_color(theme::color(theme::TEXT))
-                                    .truncate()
-                                    .child(self.payload.label.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(theme::TEXT_SMALL)
-                                    .text_color(theme::color(0xc7c7c7))
-                                    .truncate()
-                                    .child(self.payload.detail.clone()),
-                            ),
-                    ),
-            )
+    fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        use crate::motion::{Transition, ease_out, progress};
+        let now = std::time::Instant::now();
+        let animate = !theme::reduce_motion(cx);
+        let target = if crate::overlay::OverlayLayer::drop_target_active_in(cx) { 1.0 } else { 0.0 };
+        let over = self.over.get_or_insert_with(|| Transition::settled(target, theme::DROP_TARGET_FADE, now));
+        over.retarget(target, animate, now);
+        let lift = if animate { progress(self.lifted, theme::DRAG_LIFT, now) } else { 1.0 };
+        if animate && (lift < 1.0 || over.running(now)) {
+            window.request_animation_frame();
+        }
+        let over = over.value(now);
+        // GPUI draws this view at `pointer − offset`: a layer moved back by that much has the
+        // window's origin, so the ghost is placed in window coordinates.
+        let pointer = window.mouse_position();
+        let view_origin = pointer - self.offset;
+        let layer = div()
+            .absolute()
+            .left(-view_origin.x)
+            .top(-view_origin.y)
+            .w(window.viewport_size().width)
+            .h(window.viewport_size().height)
+            .font_family(theme::FONT_FAMILY);
+        let layer = match &self.payload.ghost {
+            Some(ghost) => layer.child(ghost.element(pointer, crate::ghost::Pose { lift, over })),
+            None => {
+                let card = Self::card_bounds(pointer);
+                layer.child(
+                    div().absolute().left(card.origin.x).top(card.origin.y).opacity(ease_out(lift)).child(drag_card(
+                        &self.payload,
+                        over,
+                        ease_out(lift),
+                    )),
+                )
+            }
+        };
+        div().relative().child(layer)
     }
+}
+
+/// The drag card itself: icon, name and size. `over` (0..=1) blends in the drop-target look,
+/// `lift` (0..=1) the shadow of a card held above the window.
+pub fn drag_card(payload: &CollectionDrag, over: f32, lift: f32) -> Div {
+    let (width, height) = DragPreview::SIZE;
+    let border = crate::motion::lerp_color(theme::color(0x858585).into(), theme::color(theme::CORAL).into(), over);
+    div()
+        .relative()
+        .w(px(width))
+        .h(px(height))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(11.))
+        .pl(px(13.))
+        .pr(px(14.))
+        .rounded(px(8.))
+        .bg(theme::with_alpha(0x242424, 0.98))
+        .border_1()
+        .border_color(border)
+        .shadow(vec![gpui::BoxShadow {
+            color: gpui::hsla(0., 0., 0., 0.45 * lift),
+            offset: gpui::point(px(0.), px(4. + 6. * lift)),
+            blur_radius: px(10. + 12. * lift),
+            spread_radius: px(0.),
+        }])
+        .child(icon(payload.icon).size(px(20.)).text_color(theme::color(theme::TEXT)))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .text_size(theme::TEXT_ROW)
+                        .font_weight(theme::WEIGHT_MEDIUM)
+                        .text_color(theme::color(theme::TEXT))
+                        .truncate()
+                        .child(payload.label.clone()),
+                )
+                .child(
+                    div()
+                        .text_size(theme::TEXT_SMALL)
+                        .text_color(theme::color(0xc7c7c7))
+                        .truncate()
+                        .child(payload.detail.clone()),
+                ),
+        )
+        .when(over > 0.0, |el| el.child(crate::ghost::plus_badge(over)))
 }
 
 // --- chrome panels ---

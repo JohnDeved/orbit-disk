@@ -36,6 +36,7 @@ use crate::components::{activity_indicator, small_button, tooltip, truncate_midd
 use crate::frame_stats;
 use crate::host::Host;
 use crate::icons::{Icon, icon};
+use crate::motion::Transition;
 use crate::theme;
 
 pub const REGIONS: Regions = Regions::FOOTER;
@@ -173,41 +174,6 @@ fn percent_text(done: f64) -> String {
     }
 }
 
-/// An eased transition of one value (a track share, the block opacity).
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Transition {
-    from: f32,
-    to: f32,
-    start: Instant,
-    duration: Duration,
-}
-
-impl Transition {
-    fn settled(value: f32, duration: Duration, now: Instant) -> Self {
-        Self { from: value, to: value, start: now, duration }
-    }
-
-    fn value(&self, now: Instant) -> f32 {
-        let elapsed = now.saturating_duration_since(self.start).as_secs_f32();
-        let t = if self.duration.is_zero() { 1.0 } else { elapsed / self.duration.as_secs_f32() };
-        self.from + (self.to - self.from) * theme::ease_out(t)
-    }
-
-    fn running(&self, now: Instant) -> bool {
-        self.from != self.to && now.saturating_duration_since(self.start) < self.duration
-    }
-
-    /// Moves towards `to` from the value shown now (jumps when `animate` is false).
-    fn retarget(&mut self, to: f32, animate: bool, now: Instant) {
-        if to == self.to {
-            return;
-        }
-        self.from = if animate { self.value(now) } else { to };
-        self.to = to;
-        self.start = now;
-    }
-}
-
 /// The shown (eased) values of one frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Shown {
@@ -267,7 +233,7 @@ impl FooterPanel {
 
     /// The indexed share the track is moving to, `None` before the first progress render.
     pub fn share_target(&self) -> Option<f32> {
-        self.share.map(|t| t.to)
+        self.share.map(|t| t.target())
     }
 
     fn root_label(&mut self, name: &str, window: &Window) -> SharedString {

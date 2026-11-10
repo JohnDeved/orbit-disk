@@ -19,6 +19,7 @@ pub mod tray;
 use gpui::{AppContext, Context, Entity};
 
 use crate::host::Host;
+use crate::overlay::OverlayLayer;
 use crate::sheets::SheetsLayer;
 
 /// The window's panel views.
@@ -33,10 +34,15 @@ pub struct Panels {
     pub footer: Entity<footer::FooterPanel>,
     pub tray: Entity<tray::TrayPanel>,
     pub sheets: Entity<SheetsLayer>,
+    /// The map tooltip and drag flights above the panels ([`crate::overlay`]).
+    pub overlay: Entity<OverlayLayer>,
 }
 
 impl Panels {
     pub fn new<V: 'static>(host: &Host, cx: &mut Context<V>) -> Self {
+        // Before the panels: they find the overlay through its global.
+        let overlay = cx.new(|_| OverlayLayer::new(host));
+        OverlayLayer::install(&overlay, cx);
         Self {
             toolbar: cx.new(|cx| toolbar::ToolbarPanel::new(host, cx)),
             breadcrumbs: cx.new(|cx| toolbar::BreadcrumbBar::new(host, cx)),
@@ -47,6 +53,7 @@ impl Panels {
             footer: cx.new(|cx| footer::FooterPanel::new(host, cx)),
             tray: cx.new(|cx| tray::TrayPanel::new(host, cx)),
             sheets: cx.new(|cx| SheetsLayer::new(host, cx)),
+            overlay,
         }
     }
 }

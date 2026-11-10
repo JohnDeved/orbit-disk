@@ -305,6 +305,8 @@ impl Render for MainWindow {
                         style().h(theme::TRAY_HEIGHT + theme::TRAY_GAP + px(theme::TRAY_MARGIN.1)).w_full(),
                     ))),
             )
+            // Not cached: it is tiny, and it re-renders on its own while the pointer moves.
+            .child(panels.overlay.clone())
             .child(slot(Regions::SHEETS, panels.sheets.clone(), style().absolute().top_0().left_0().size_full()))
             .child(frame_stats::end_marker())
     }

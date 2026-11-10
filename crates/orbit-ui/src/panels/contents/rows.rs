@@ -7,6 +7,7 @@ use gpui::{Hsla, SharedString};
 use orbit_app_state::{AppState, RowView};
 use orbit_core::paths::file_name;
 use orbit_core::types::ScanState;
+use orbit_core::view::NodeMeta;
 use orbit_sunburst::CollectionState;
 
 use crate::theme;
@@ -110,20 +111,8 @@ fn format_row(state: &AppState, display: usize) -> Option<RowText> {
         theme::display(orbit_app_state::paths::parent_or_root(&item.path)).into()
     } else if updating {
         "Updating sizes".into()
-    } else if !meta.flags.accessible {
-        "Not scanned".into()
-    } else if meta.state == ScanState::Pending {
-        "Waiting to map".into()
-    } else if meta.state == ScanState::Scanning {
-        let phase = if state.is_scanning() { "Mapping" } else { "Incomplete" };
-        format!("{} files found · {phase}", theme::format_count(meta.file_count)).into()
-    } else if meta.flags.is_symlink {
-        "Symbolic link".into()
-    } else if meta.flags.is_dir {
-        let noun = if meta.file_count == 1 { "file" } else { "files" };
-        format!("{} {noun}", theme::format_count(meta.file_count)).into()
     } else {
-        file_type(name)
+        node_detail(&meta, name, state.is_scanning())
     };
     let size: SharedString = if updating {
         "Updating…".into()
@@ -150,6 +139,27 @@ fn format_row(state: &AppState, display: usize) -> Option<RowText> {
         theme::chart(state.color_ordinal(name).unwrap_or(0), 0)
     };
     Some(RowText { name: theme::display(name).into(), mark, detail, size, share, swatch, is_dir: meta.flags.is_dir })
+}
+
+/// The secondary line of an item's row (and of its map tooltip): its readability or mapping
+/// state, "Symbolic link", the file count of a folder, or a file's type. `mapping`: a mapping
+/// is running (an unfinished folder is being mapped rather than incomplete).
+pub(crate) fn node_detail(meta: &NodeMeta, name: &[u8], mapping: bool) -> SharedString {
+    if !meta.flags.accessible {
+        "Not scanned".into()
+    } else if meta.state == ScanState::Pending {
+        "Waiting to map".into()
+    } else if meta.state == ScanState::Scanning {
+        let phase = if mapping { "Mapping" } else { "Incomplete" };
+        format!("{} files found · {phase}", theme::format_count(meta.file_count)).into()
+    } else if meta.flags.is_symlink {
+        "Symbolic link".into()
+    } else if meta.flags.is_dir {
+        let noun = if meta.file_count == 1 { "file" } else { "files" };
+        format!("{} {noun}", theme::format_count(meta.file_count)).into()
+    } else {
+        file_type(name)
+    }
 }
 
 /// Uppercased extension (`"PNG"`), or `"File"`.

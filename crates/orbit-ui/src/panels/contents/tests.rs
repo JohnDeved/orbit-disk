@@ -216,6 +216,19 @@ fn row_drags_start_beyond_the_threshold_and_escape_cancels_them(cx: &mut TestApp
     assert_eq!(w.cx.read(|cx| w.host.state(cx).drag_label().map(str::to_owned)).as_deref(), Some("docs"));
     w.move_to(docs + point(px(3.), px(40.)), Some(MouseButton::Left));
     assert!(gpui_drag(&mut w), "the pointer carries the typed payload");
+    // The row itself is grabbed where it was pressed, and its place in the list dims.
+    let ghost = w.cx.read(|cx| {
+        let list = w.list.read(cx);
+        list.press.as_ref().and_then(|press| press.ghost.clone())
+    });
+    let ghost = ghost.expect("the drag carries the pressed row");
+    let crate::ghost::GhostLook::Row { bounds, folder } = ghost.look else { panic!("a row ghost") };
+    assert!(folder, "docs is a folder: the lifted row keeps its arrow");
+    assert_eq!(ghost.grab, docs);
+    assert!(bounds.contains(&docs), "the row's own bounds: {bounds:?}");
+    assert_eq!(ghost.label.name.as_ref(), "docs");
+    let lifted = w.cx.read(|cx| w.list.read(cx).lifted);
+    assert_eq!(lifted.map(|l| (l.row.0, l.shown)), Some((1, true)), "dimmed once the lifted row is drawn");
 
     w.cx.simulate_keystrokes("escape");
     assert_eq!(drag_id(&mut w), None, "Escape ends the drag without a drop");
@@ -232,6 +245,25 @@ fn row_drags_start_beyond_the_threshold_and_escape_cancels_them(cx: &mut TestApp
     w.cx.simulate_mouse_up(docs + point(px(0.), px(30.)), MouseButton::Left, Modifiers::none());
     assert_eq!(drag_id(&mut w), None);
     assert!(!gpui_drag(&mut w));
+}
+
+/// While something is dragged (here from the map) the rows are not hovered, so neither are
+/// their map segments; hover resumes after the drag.
+#[gpui::test]
+fn rows_are_not_hovered_while_something_is_dragged(cx: &mut TestAppContext) {
+    let h = mapped([("big/a.bin".into(), 100), ("docs/x.txt".into(), 30), ("file1".into(), 10)]);
+    let mut w = open(h, cx);
+    let drag = orbit_app_state::DragId(77);
+    let source = orbit_app_state::DragSource::Items(vec![std::sync::Arc::from(&b"/r/big"[..])]);
+    let host = w.host.clone();
+    w.cx.update(|_, cx| host.send(Event::DragBegin { drag, source, label: "big".into() }, cx));
+    let docs = w.row_point(1);
+    w.move_to(docs, None);
+    w.move_to(docs + point(px(1.), px(1.)), None);
+    assert_eq!(w.row_hover(), None, "no row hover during the drag");
+    w.cx.update(|_, cx| host.send(Event::DragEnd { drag }, cx));
+    w.move_to(docs + point(px(2.), px(0.)), None);
+    assert_eq!(w.row_hover().as_deref(), Some("/r/docs"), "hover resumes");
 }
 
 #[gpui::test]

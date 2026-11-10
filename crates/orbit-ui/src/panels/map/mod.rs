@@ -52,8 +52,10 @@ use layers::{Grid, Raster};
 use crate::actions::OpenFolder;
 use crate::components::{ButtonStyle, CollectionDrag, DragPreview, button, truncate_middle};
 use crate::frame_stats;
+use crate::ghost::{Ghost, GhostLook};
 use crate::host::Host;
 use crate::icons::{Icon, icon};
+use crate::overlay::{OverlayLayer, TipContent};
 use crate::theme;
 
 pub const REGIONS: Regions = Regions::MAP;
@@ -127,11 +129,42 @@ enum PressTarget {
     Center,
 }
 
-#[derive(Clone, Copy, Debug)]
+/// A segment lifted off the map: its outline, and whether its gap shows yet (from the frame GPUI
+/// draws the drag view until the segment lands back).
+#[derive(Clone, Debug)]
+struct Lifted {
+    points: Arc<[Point<Pixels>]>,
+    shown: bool,
+}
+
+/// A pressed segment's drag payload (see [`Press::pressed`]).
+#[derive(Clone, Debug)]
+struct Pressed {
+    index: SegmentIndex,
+    item: PressedItem,
+    label: SharedString,
+    detail: SharedString,
+    icon: Icon,
+    ghost: Option<Ghost>,
+}
+
+#[derive(Clone, Debug)]
+enum PressedItem {
+    Node(Arc<[u8]>),
+    /// A group of small items, by its folder.
+    Group {
+        parent: Arc<[u8]>,
+    },
+}
+
+#[derive(Clone, Debug)]
 struct Press {
     position: Point<Pixels>,
     target: PressTarget,
     layout_revision: u64,
+    /// What a drag of the pressed segment carries, captured at the press: a background refresh
+    /// may replace the layout before the drag starts, and must not stop it.
+    pressed: Option<Pressed>,
     /// Held for segment presses only (the center is a plain button).
     gesture: Option<GestureId>,
     /// Moved beyond the drag threshold: never a click.
@@ -166,6 +199,11 @@ pub struct MapPanel {
     drag: Option<CollectionDrag>,
     /// The layout changed: re-hit-test at the pointer after the next layout.
     refresh_hover: bool,
+    /// The outline of the segment a drag lifted off the map, darkened while it is away (until
+    /// it has slid back after a release without a drop).
+    lifted: Option<Lifted>,
+    /// The tooltip's segment and presentation revision, and its content.
+    tip: Option<((SegmentIndex, u64), Option<TipContent>)>,
     can_go_up: bool,
     center: CenterText,
     /// The middle-truncated center name for (name, slot width, lines).
@@ -196,6 +234,8 @@ impl MapPanel {
             press: None,
             drag: None,
             refresh_hover: false,
+            tip: None,
+            lifted: None,
             can_go_up: false,
             center: CenterText::default(),
             center_name: None,
@@ -263,6 +303,34 @@ impl MapPanel {
             Hit::Segment(index) => Some(index),
             _ => self.row_hovered.or(pinned.map(|(index, _)| index)).or(self.selected),
         }
+    }
+
+    /// The segment the center describes: a pinned group or the selection, never what is
+    /// hovered (the tooltip and the related Contents row show that).
+    fn center_segment(&self) -> Option<SegmentIndex> {
+        let pinned = self.pinned_group.filter(|(_, revision)| Some(*revision) == self.layout_revision());
+        pinned.map(|(index, _)| index).or(self.selected)
+    }
+
+    /// The segment `index` as the drag carries it: its outline and color, grabbed at `at`, with
+    /// its tooltip's text as the label.
+    fn ghost(&self, state: &AppState, index: SegmentIndex, at: Point<Pixels>) -> Option<Ghost> {
+        let presentation = self.presentation.as_ref()?;
+        let (_, metrics) = self.chart?;
+        let segment = presentation.layout.segments().get(index)?;
+        let mut flat = Vec::new();
+        presentation.layout.sector(&metrics, index).flatten(0.5, &mut flat);
+        let points: Arc<[Point<Pixels>]> = flat.iter().map(|p| point(px(p.x as f32), px(p.y as f32))).collect();
+        let (mut min, mut max) = (*points.first()?, *points.first()?);
+        for p in points.iter() {
+            (min.x, min.y, max.x, max.y) = (min.x.min(p.x), min.y.min(p.y), max.x.max(p.x), max.y.max(p.y));
+        }
+        let bounds = Bounds::new(min, size(max.x - min.x, max.y - min.y));
+        Some(Ghost {
+            grab: at,
+            look: GhostLook::Segment { points, color: theme::segment_color(segment.color()), bounds },
+            label: tip_content(state, presentation, index)?,
+        })
     }
 
     fn outlined(&self) -> [Option<SegmentIndex>; 2] {
@@ -412,6 +480,14 @@ impl MapPanel {
             let bounds = Bounds::new(origin, size(px(2. * radius), px(2. * radius)));
             window.paint_quad(fill(bounds, theme::white(CENTER_HOVER_ALPHA)).corner_radii(px(radius)));
         }
+        if let Some(Lifted { points, shown: true }) = &self.lifted {
+            // The gap the lifted segment left.
+            let mut hole = gpui::PathBuilder::fill();
+            hole.add_polygon(points, true);
+            if let Ok(path) = hole.build() {
+                window.paint_path(path, theme::with_alpha(theme::CANVAS, 0.72));
+            }
+        }
         if let Some(outlines) = &self.outlines {
             for path in &outlines.paths {
                 window.paint_path(path.clone(), theme::white(layers::OUTLINE_ALPHA));
@@ -427,14 +503,47 @@ impl MapPanel {
     /// frame harness calls it directly).
     pub fn pointer_moved(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let inside = self.chart.is_some_and(|(bounds, _)| bounds.contains(&position));
-        let hit = if inside { self.hit(position) } else { Hit::None };
+        // While anything is dragged (a segment, or a row from the list) the map is not hovered:
+        // no outline, no tooltip, no related rows.
+        let hit = if inside && self.host.state(cx).drag_id().is_none() { self.hit(position) } else { Hit::None };
         self.set_pointer(hit, cx);
+        self.update_tip(position, cx);
+    }
+
+    /// Shows the tooltip of the segment under the pointer at `position` beside it, or hides it
+    /// (over the center or outside the chart, and while a press or drag is held).
+    fn update_tip(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(overlay) = OverlayLayer::global(cx) else { return };
+        let segment = match self.pointer {
+            Hit::Segment(index) if self.press.is_none() && self.drag.is_none() => Some(index),
+            _ => None,
+        };
+        let content = segment.zip(self.presentation.as_ref()).and_then(|(index, presentation)| {
+            let key = (index, presentation.revision);
+            if self.tip.as_ref().is_none_or(|(cached, _)| *cached != key) {
+                self.tip = Some((key, tip_content(self.host.state(cx), presentation, index)));
+            }
+            self.tip.as_ref().and_then(|(_, content)| content.clone())
+        });
+        overlay.update(cx, |layer, cx| match content {
+            Some(content) => layer.show_tip(content, position, cx),
+            None => layer.hide_tip(cx),
+        });
+    }
+
+    fn hide_tip(&mut self, cx: &mut Context<Self>) {
+        if let Some(overlay) = OverlayLayer::global(cx) {
+            overlay.update(cx, |layer, cx| layer.hide_tip(cx));
+        }
     }
 
     /// Updates the local pointer zone; tells the state only when the hovered segment changed.
     fn set_pointer(&mut self, hit: Hit, cx: &mut Context<Self>) {
         if self.drag.is_some() || hit == self.pointer {
             return;
+        }
+        if !matches!(hit, Hit::Segment(_)) {
+            self.hide_tip(cx);
         }
         self.pointer = hit;
         let segment = match hit {
@@ -460,18 +569,29 @@ impl MapPanel {
             }
             if exceeds_drag_threshold(xy(press.position), xy(position)) {
                 press.moved = true;
-                if let PressTarget::Segment(index) = press.target {
-                    let revision = press.layout_revision;
-                    self.begin_drag(index, revision, window, cx);
+                if matches!(press.target, PressTarget::Segment(_)) {
+                    self.begin_drag(window, cx);
                 }
                 return;
             }
         }
-        let hit = if inside { self.hit(position) } else { Hit::None };
+        // While anything is dragged (a segment, or a row from the list) the map is not hovered:
+        // no outline, no tooltip, no related rows.
+        let hit = if inside && self.host.state(cx).drag_id().is_none() { self.hit(position) } else { Hit::None };
         self.set_pointer(hit, cx);
+        self.update_tip(position, cx);
+    }
+
+    /// The pointer left the window: nothing is hovered.
+    fn mouse_exited(&mut self, cx: &mut Context<Self>) {
+        if self.press.is_none() {
+            self.set_pointer(Hit::None, cx);
+        }
+        self.hide_tip(cx);
     }
 
     fn mouse_down(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.hide_tip(cx);
         // A press whose release never arrived still owes its gesture end.
         if let Some(gesture) = self.press.take().and_then(|press| press.gesture) {
             self.host.send(Event::GestureEnd(gesture), cx);
@@ -488,7 +608,11 @@ impl MapPanel {
                 if let Some(gesture) = gesture {
                     self.host.send(Event::GestureBegin(gesture), cx);
                 }
-                self.press = Some(Press { position, target, layout_revision, gesture, moved: false });
+                let pressed = match target {
+                    PressTarget::Segment(index) => self.pressed(index, position, cx),
+                    PressTarget::Center => None,
+                };
+                self.press = Some(Press { position, target, layout_revision, pressed, gesture, moved: false });
             }
         }
         self.set_pointer(hit, cx);
@@ -496,9 +620,17 @@ impl MapPanel {
 
     fn mouse_up(&mut self, position: Point<Pixels>, inside: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(press) = self.press.take() else { return };
-        if let Some(drag) = self.drag.take() {
-            // A drop target handles this same mouse-up after us: end the drag once it has.
-            cx.defer_in(window, move |map, _, cx| map.end_drag(drag.drag, press.gesture, cx));
+        if let Some(card) = self.drag.take() {
+            // A drop target handles this same mouse-up after us: end the drag once it has. A drag
+            // nobody accepted returns its card to where it was picked up.
+            cx.defer_in(window, move |map, _, cx| {
+                if map.host.state(cx).drag_id() == Some(card.drag) {
+                    give_back(card.clone(), position, press.position, Self::on_land(cx), cx);
+                } else {
+                    map.lifted = None;
+                }
+                map.end_drag(card.drag, press.gesture, cx);
+            });
             return;
         }
         if !press.moved && inside && Some(press.layout_revision) == self.layout_revision() {
@@ -532,26 +664,69 @@ impl MapPanel {
         self.host.send(event, cx);
     }
 
-    fn begin_drag(&mut self, index: SegmentIndex, layout_revision: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(presentation) = self.presentation.clone() else { return };
-        if presentation.layout_revision != layout_revision {
-            return;
-        }
+    /// The drag payload of segment `index` pressed at `at`, captured with the layout of the press.
+    fn pressed(&self, index: SegmentIndex, at: Point<Pixels>, cx: &mut Context<Self>) -> Option<Pressed> {
+        let presentation = self.presentation.as_ref()?;
         let state = self.host.state(cx);
-        let Some(subject) = Subject::of(state, &presentation, Some(index)) else { return };
-        let label = subject.name.clone();
+        let folder = state.folder()?;
+        let subject = Subject::of(state, presentation, Some(index))?;
         let icon = match subject.kind {
             SubjectKind::Group => Icon::Layers,
             SubjectKind::Node { is_dir: true } => Icon::FolderFill,
             SubjectKind::Node { is_dir: false } | SubjectKind::Folder => Icon::FileFill,
         };
-        let detail: SharedString = theme::format_bytes(subject.size).into();
+        let segment = presentation.layout.segments().get(index)?;
+        let item = match segment.node {
+            Some(ix) => PressedItem::Node(Arc::from(folder.path(ix))),
+            None => PressedItem::Group { parent: Arc::from(folder.path(presentation.layout.group(index)?.parent)) },
+        };
+        Some(Pressed {
+            index,
+            item,
+            label: subject.name,
+            detail: theme::format_bytes(subject.size).into(),
+            icon,
+            ghost: self.ghost(state, index, at),
+        })
+    }
+
+    /// The drag source of `pressed` in the current layout: the pressed segment while the layout
+    /// is the one of the press; after a refresh replaced it, the pressed item by path, or the
+    /// same folder's group of small items.
+    fn drag_source(&self, pressed: &Pressed, layout_revision: u64, cx: &Context<Self>) -> Option<DragSource> {
+        let presentation = self.presentation.as_ref()?;
+        if presentation.layout_revision == layout_revision {
+            return Some(DragSource::Segment { segment: pressed.index, layout_revision });
+        }
+        match &pressed.item {
+            PressedItem::Node(path) => Some(DragSource::Items(vec![Arc::clone(path)])),
+            PressedItem::Group { parent } => {
+                let folder = self.host.state(cx).folder()?;
+                let layout = &presentation.layout;
+                let segment = (0..layout.segments().len()).find(|&index| {
+                    layout.segments()[index].node.is_none()
+                        && layout.group(index).is_some_and(|group| folder.path(group.parent) == **parent)
+                })?;
+                Some(DragSource::Segment { segment, layout_revision: presentation.layout_revision })
+            }
+        }
+    }
+
+    fn begin_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(press) = self.press.as_ref() else { return };
+        let Some(pressed) = press.pressed.clone() else { return };
+        let Some(source) = self.drag_source(&pressed, press.layout_revision, cx) else { return };
         let drag = DragId(self.next_id());
-        let source = DragSource::Segment { segment: index, layout_revision };
-        self.host.send(Event::DragBegin { drag, source, label: label.to_string() }, cx);
+        self.host.send(Event::DragBegin { drag, source, label: pressed.label.to_string() }, cx);
         // The state refuses drags it cannot collect (it says why in the status line).
         if self.host.state(cx).drag_id() == Some(drag) {
-            self.drag = Some(CollectionDrag { drag, label, detail, icon });
+            // The gap shows once GPUI draws the lifted segment (`chart_element`'s drag view).
+            self.lifted = pressed.ghost.as_ref().and_then(|ghost| match &ghost.look {
+                GhostLook::Segment { points, .. } => Some(Lifted { points: Arc::clone(points), shown: false }),
+                GhostLook::Row { .. } => None,
+            });
+            let Pressed { label, detail, icon, ghost, .. } = pressed;
+            self.drag = Some(CollectionDrag { drag, label, detail, icon, ghost });
             window.focus(&self.focus);
             cx.notify();
         }
@@ -567,12 +742,29 @@ impl MapPanel {
         cx.notify();
     }
 
+    /// What a returning segment does when it lands: the map shows it again (that same frame).
+    fn on_land(cx: &Context<Self>) -> impl FnOnce(&mut App) + 'static {
+        let map = cx.entity().downgrade();
+        move |cx| {
+            map.update(cx, |map, cx| {
+                if map.drag.is_none() && map.lifted.take().is_some() {
+                    cx.notify();
+                }
+            })
+            .ok();
+        }
+    }
+
     /// Escape during a drag.
     fn cancel_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(drag) = self.drag.take() else { return };
         cx.stop_active_drag(window);
-        let gesture = self.press.take().and_then(|press| press.gesture);
-        self.end_drag(drag.drag, gesture, cx);
+        let press = self.press.take();
+        match press.as_ref().map(|press| press.position) {
+            Some(origin) => give_back(drag.clone(), window.mouse_position(), origin, Self::on_land(cx), cx),
+            None => self.lifted = None,
+        }
+        self.end_drag(drag.drag, press.and_then(|press| press.gesture), cx);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -616,7 +808,7 @@ impl MapPanel {
             self.selected_key = selected;
         }
         self.center = match &self.presentation {
-            Some(presentation) => center_text(state, presentation, self.active_segment()),
+            Some(presentation) => center_text(state, presentation, self.center_segment()),
             None => CenterText::default(),
         };
     }
@@ -640,7 +832,19 @@ impl MapPanel {
             // GPUI tracks a press for typed drags only on elements with click or drag listeners.
             .on_click(|_, _, _| {})
             .when_some(self.drag.clone(), |el, payload| {
-                el.on_drag(payload, |payload, offset, _, cx| cx.new(|_| DragPreview::new(payload, offset)))
+                let map = cx.entity().downgrade();
+                el.on_drag(payload, move |payload, offset, _, cx| {
+                    // The drag view appears now: only now does the segment leave its gap, so the
+                    // two change in the same frame.
+                    map.update(cx, |map, cx| {
+                        if let Some(lifted) = map.lifted.as_mut().filter(|lifted| !lifted.shown) {
+                            lifted.shown = true;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                    cx.new(|_| DragPreview::new(payload, offset))
+                })
             })
     }
 }
@@ -706,6 +910,14 @@ fn paint_chart(entity: &Entity<MapPanel>, prepaint: ChartPrepaint, window: &mut 
         }
     });
     window.on_mouse_event({
+        let entity = entity.clone();
+        move |_: &gpui::MouseExitEvent, phase, _, cx| {
+            if phase == DispatchPhase::Capture {
+                entity.update(cx, |map, cx| map.mouse_exited(cx));
+            }
+        }
+    });
+    window.on_mouse_event({
         let (entity, hitbox) = (entity.clone(), hitbox.clone());
         move |event: &MouseDownEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && event.button == MouseButton::Left && hitbox.is_hovered(window) {
@@ -722,6 +934,69 @@ fn paint_chart(entity: &Entity<MapPanel>, prepaint: ChartPrepaint, window: &mut 
             }
         }
     });
+}
+
+/// A drag nobody accepted: its card returns from `pointer` to `origin`.
+fn give_back(
+    card: CollectionDrag,
+    pointer: Point<Pixels>,
+    origin: Point<Pixels>,
+    on_land: impl FnOnce(&mut App) + 'static,
+    cx: &mut App,
+) {
+    match OverlayLayer::global(cx) {
+        Some(overlay) => overlay.update(cx, |layer, cx| layer.give_back(card, pointer, origin, on_land, cx)),
+        // Never inline: the caller may be inside its own panel's update.
+        None => cx.defer(on_land),
+    }
+}
+
+/// The tooltip of segment `index`: the item formatted like its Contents row, with where it is
+/// when it lies below the shown folder's own children. Groups read "12 grouped items".
+pub fn tip_content(state: &AppState, presentation: &Presentation<NodeIx>, index: SegmentIndex) -> Option<TipContent> {
+    let folder = state.folder()?;
+    let layout = &presentation.layout;
+    let segment = layout.segments().get(index)?;
+    let (name, detail, scanning, parent): (SharedString, SharedString, bool, NodeIx) = match segment.node {
+        Some(ix) => {
+            let meta = folder.meta(ix);
+            let name = folder.name(ix);
+            let detail = crate::panels::contents::node_detail(meta, name, state.is_scanning());
+            (theme::display(name).into(), detail, meta.state == ScanState::Scanning, folder.tree().node(ix).parent)
+        }
+        None => {
+            let group = layout.group(index)?;
+            let count = group.members.len() as u64;
+            let name = format!("{} grouped {}", theme::format_count(count), plural(count, "item", "items"));
+            (name.into(), "Smaller items".into(), !group.complete, group.parent)
+        }
+    };
+    let mut detail = detail.to_string();
+    if parent != FolderTree::FOLDER {
+        // Where a deeper ring's item is, from the shown folder down ("in Games › Saves").
+        let mut chain = Vec::new();
+        let mut ix = parent;
+        while ix != FolderTree::FOLDER && chain.len() < 64 {
+            chain.push(theme::display(folder.name(ix)));
+            ix = folder.tree().node(ix).parent;
+        }
+        chain.reverse();
+        detail = format!("{detail} · in {}", chain.join(" › "));
+    }
+    let total = folder.folder_meta().size;
+    let share: SharedString = if scanning {
+        "so far".into()
+    } else {
+        theme::format_percent(if total > 0 { segment.size as f64 / total as f64 } else { 0.0 }).into()
+    };
+    Some(TipContent {
+        swatch: theme::segment_color(segment.color()),
+        name,
+        mark: presentation.state(index),
+        detail: detail.into(),
+        size: theme::format_bytes(segment.size).into(),
+        share,
+    })
 }
 
 fn xy(point: Point<Pixels>) -> (f64, f64) {

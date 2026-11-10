@@ -1,5 +1,5 @@
 //! Contents list: the right column's header ("Contents" / "Search results" and the sort menu),
-//! the 48-point status block (count and sort state, search state, the hovered map path, the
+//! the 48-point status block (count and sort state, search state, the
 //! 300-match note), the empty states, and a virtualized list of fixed 40-point rows. Observes
 //! [`Regions::LIST`].
 //!
@@ -35,6 +35,8 @@
 mod rows;
 mod tracking;
 
+pub(crate) use self::rows::node_detail;
+
 #[cfg(test)]
 mod tests;
 
@@ -60,8 +62,10 @@ use self::rows::{RowCache, RowText};
 use self::tracking::{Anchor, RowKey, ScrollHover, Settle};
 use crate::components::{CollectionDrag, DragPreview, tooltip};
 use crate::frame_stats;
+use crate::ghost::{Ghost, GhostLook};
 use crate::host::Host;
 use crate::icons::{Icon, icon};
+use crate::overlay::TipContent;
 use crate::theme;
 
 pub const REGIONS: Regions = Regions::LIST;
@@ -99,6 +103,9 @@ pub struct ContentsPanel {
     thumb_drag: Option<ThumbDrag>,
     menu: Option<OpenMenu>,
     cache: RowCache,
+    /// The row a drag lifted out of the list: dimmed from the frame GPUI draws the lifted row
+    /// until it lands back.
+    lifted: Option<LiftedRow>,
     view: ListView,
     anchor: Anchor,
     _subscriptions: Vec<Subscription>,
@@ -132,6 +139,56 @@ struct Press {
     drag: Option<DragId>,
     /// Escape cancelled the drag; the release neither drags nor clicks.
     cancelled: bool,
+    /// The pressed row as the drag carries it (set when the drag starts).
+    ghost: Option<Ghost>,
+}
+
+impl Press {
+    /// The drag card of this press's drag `drag`.
+    fn card(&self, drag: DragId) -> CollectionDrag {
+        CollectionDrag {
+            drag,
+            label: self.label.clone(),
+            detail: theme::format_bytes(self.size).into(),
+            icon: if self.is_dir { Icon::FolderFill } else { Icon::FileFill },
+            ghost: self.ghost.clone(),
+        }
+    }
+}
+
+/// A drag nobody accepted: its card returns from `pointer` to where the press started.
+fn give_back(
+    card: CollectionDrag,
+    pointer: Point<Pixels>,
+    origin: Point<Pixels>,
+    on_land: impl FnOnce(&mut App) + 'static,
+    cx: &mut App,
+) {
+    match crate::overlay::OverlayLayer::global(cx) {
+        Some(overlay) => overlay.update(cx, |layer, cx| layer.give_back(card, pointer, origin, on_land, cx)),
+        // Never inline: the caller may be inside its own panel's update.
+        None => cx.defer(on_land),
+    }
+}
+
+/// The row a drag lifted out of the list (display row, list revision), and whether its gap
+/// shows yet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LiftedRow {
+    row: (usize, u64),
+    shown: bool,
+}
+
+/// What a returning row does when it lands: the list shows it again (that same frame).
+fn row_landed(list: gpui::WeakEntity<ContentsPanel>) -> impl FnOnce(&mut App) + 'static {
+    move |cx| {
+        list.update(cx, |list, cx| {
+            if list.press.as_ref().is_none_or(|press| press.drag.is_none()) && list.lifted.take().is_some() {
+                cx.notify();
+            }
+        })
+        .ok();
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -189,6 +246,7 @@ impl ContentsPanel {
             thumb_drag: None,
             menu: None,
             cache: RowCache::default(),
+            lifted: None,
             view: ListView::default(),
             anchor: Anchor::default(),
             _subscriptions: host.observe(REGIONS, cx),
@@ -244,6 +302,16 @@ impl ContentsPanel {
     }
 
     /// The display row under `position` (window coordinates).
+    /// The painted bounds of display row `display` (its rounded fill), in window coordinates.
+    fn row_bounds(&self, display: usize) -> Option<Bounds<Pixels>> {
+        let base = self.base();
+        let list = base.bounds();
+        let top = list.top() + base.offset().y + theme::ROW_HEIGHT * display as f32;
+        (list.size.width > px(12.)).then(|| {
+            Bounds::new(point(list.left() + px(8.), top), gpui::size(list.size.width - px(12.), theme::ROW_HEIGHT))
+        })
+    }
+
     fn row_at(&self, position: Point<Pixels>, state: &AppState) -> Option<usize> {
         let base = self.base();
         let bounds = base.bounds();
@@ -294,7 +362,9 @@ impl ContentsPanel {
     fn hover_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let state = self.host.state(cx);
         let revision = state.list_revision();
-        match self.row_at(position, state) {
+        // While anything is dragged the rows are not hovered (nor, through them, the map).
+        let row = if state.drag_id().is_some() { None } else { self.row_at(position, state) };
+        match row {
             Some(display) => {
                 if self.hovered == Some((display, revision)) && state.row_hover().is_some() {
                     return;
@@ -357,6 +427,20 @@ impl ContentsPanel {
         let (display, row) = row;
         let path: Arc<[u8]> = row.path().into();
         let (is_dir, size) = (row.meta().flags.is_dir, row.meta().size);
+        // What a drag of this row carries, captured now: a background refresh may reload the
+        // list before the drag starts, and must neither stop it nor change what it shows.
+        let ghost = self.row_bounds(display).zip(self.cache.get(state, display)).map(|(bounds, text)| Ghost {
+            grab: event.position,
+            look: GhostLook::Row { bounds, folder: is_dir },
+            label: TipContent {
+                swatch: text.swatch,
+                name: text.name,
+                mark: text.mark,
+                detail: text.detail,
+                size: text.size,
+                share: text.share,
+            },
+        });
         let label: SharedString = theme::display(row.name()).into();
         let revision = state.list_revision();
         let gesture = GestureId(self.token());
@@ -373,6 +457,7 @@ impl ContentsPanel {
             gesture,
             drag: None,
             cancelled: false,
+            ghost,
         });
         self.shared.tracking.set(true);
         self.host.send(Event::GestureBegin(gesture), cx);
@@ -394,7 +479,9 @@ impl ContentsPanel {
             return;
         }
         self.clicks.moved();
+        let lifted = press.ghost.is_some().then_some(LiftedRow { row: (press.display, press.revision), shown: false });
         let drag = DragId(self.token());
+        self.lifted = lifted;
         let Some(press) = self.press.as_mut() else { return };
         press.drag = Some(drag);
         let source = DragSource::Items(vec![Arc::clone(&press.path)]);
@@ -420,12 +507,24 @@ impl ContentsPanel {
             && self.row_at(event.position, state) == Some(press.display);
         let open = self.clicks.release(inside);
         let host = self.host.clone();
-        // After this event's drop targets ran: a drag nobody accepted ends here.
+        let pointer = event.position;
+        let list = cx.entity();
+        // After this event's drop targets ran: a drag nobody accepted ends here, and its row
+        // slides back into the list.
         window.defer(cx, move |_, cx| {
-            if let Some(drag) = press.drag
-                && host.state(cx).drag_id() == Some(drag)
-            {
-                host.send(Event::DragEnd { drag }, cx);
+            if let Some(drag) = press.drag {
+                let returning = host.state(cx).drag_id() == Some(drag);
+                if returning {
+                    host.send(Event::DragEnd { drag }, cx);
+                    give_back(press.card(drag), pointer, press.origin, row_landed(list.downgrade()), cx);
+                } else {
+                    // Collected: the row stays where it is, now marked.
+                    list.update(cx, |list, cx| {
+                        if list.lifted.take().is_some() {
+                            cx.notify();
+                        }
+                    });
+                }
             }
             host.send(Event::GestureEnd(press.gesture), cx);
             if let Some(path) = open {
@@ -449,9 +548,11 @@ impl ContentsPanel {
         let Some(press) = self.press.as_mut() else { return false };
         let Some(drag) = press.drag.take() else { return false };
         press.cancelled = true;
+        let (card, origin) = (press.card(drag), press.origin);
         self.clicks.cancel();
         cx.stop_active_drag(window);
         self.host.send(Event::DragEnd { drag }, cx);
+        give_back(card, window.mouse_position(), origin, row_landed(cx.entity().downgrade()), cx);
         cx.notify();
         true
     }
@@ -856,9 +957,12 @@ impl ContentsPanel {
                 .child(icon(Icon::File).size(px(12.)).text_color(slate))
                 .into_any_element()
         };
+        let lifted = self.lifted == Some(LiftedRow { row: (display, revision), shown: true });
         div()
             .id(display)
             .h(theme::ROW_HEIGHT)
+            // The row a drag lifted out of the list leaves its place behind.
+            .when(lifted, |el| el.opacity(0.3))
             .w_full()
             .pl(px(8.))
             .pr(px(4.))
@@ -1078,16 +1182,13 @@ fn caption(state: &AppState) -> String {
     format!("{} {} · {order}", theme::format_count(rows), if rows == 1 { "item" } else { "items" })
 }
 
-/// Second status line: the hovered map path (`true`), or the search limit note.
-fn note(state: &AppState) -> Option<(bool, SharedString)> {
-    if let Some(description) = state.hover_description() {
-        return Some((true, SharedString::from(description.to_owned())));
-    }
+/// Second status line: the search limit note. (The hovered map item is the map's tooltip.)
+fn note(state: &AppState) -> Option<SharedString> {
     let limited = state.filtering()
         && !state.is_searching()
         && !state.search_outdated()
         && state.search_match_count() > SEARCH_LIMIT;
-    limited.then(|| (false, "Showing the 300 largest matches. Refine your search for more.".into()))
+    limited.then(|| "Showing the 300 largest matches. Refine your search for more.".into())
 }
 
 /// The empty list's icon, message and optional hint; `None` before any folder is shown.
@@ -1135,12 +1236,7 @@ impl Render for ContentsPanel {
         let empty = (count == 0).then(|| empty_state(state));
         let drag = self.press.as_ref().and_then(|press| {
             let drag = press.drag.filter(|drag| state.drag_id() == Some(*drag))?;
-            Some(CollectionDrag {
-                drag,
-                label: press.label.clone(),
-                detail: theme::format_bytes(press.size).into(),
-                icon: if press.is_dir { Icon::FolderFill } else { Icon::FileFill },
-            })
+            Some(press.card(drag))
         });
         let menu = self.menu.as_ref().map(|open| self.menu(open, state, cx));
         let slate = theme::color(theme::SLATE);
@@ -1193,19 +1289,7 @@ impl Render for ContentsPanel {
             .gap(px(4.))
             .text_size(theme::TEXT_SMALL)
             .child(div().h(px(14.)).text_color(slate).truncate().child(caption))
-            .when_some(note, |el, (hover, text)| {
-                el.child(if hover {
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap(px(4.))
-                        .text_color(theme::color(theme::CORAL))
-                        .child(icon(Icon::Pointer).size(px(11.)).mt(px(1.)).text_color(theme::color(theme::CORAL)))
-                        .child(div().flex_1().min_w_0().line_clamp(2).child(text))
-                } else {
-                    div().text_color(slate).line_clamp(2).child(text)
-                })
-            });
+            .when_some(note, |el, text| el.child(div().text_color(slate).line_clamp(2).child(text)));
 
         let body = match empty {
             Some(empty) => div()
@@ -1255,7 +1339,19 @@ impl Render for ContentsPanel {
                         // Lets GPUI record the press, so the drag attached after our threshold can start.
                         .on_click(|_, _, _| {})
                         .when_some(drag, |el, payload| {
-                            el.on_drag(payload, |payload, offset, _, cx| cx.new(|_| DragPreview::new(payload, offset)))
+                            let list = cx.entity().downgrade();
+                            el.on_drag(payload, move |payload, offset, _, cx| {
+                                // The lifted row appears now: only now does its place dim, so the
+                                // two change in the same frame.
+                                list.update(cx, |list, cx| {
+                                    if let Some(lifted) = list.lifted.as_mut().filter(|lifted| !lifted.shown) {
+                                        lifted.shown = true;
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
+                                cx.new(|_| DragPreview::new(payload, offset))
+                            })
                         })
                         .child(
                             uniform_list(
