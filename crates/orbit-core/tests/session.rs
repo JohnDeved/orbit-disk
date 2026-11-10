@@ -670,7 +670,9 @@ fn changes_inside_an_unreadable_folder_relist_only_its_parent() {
 
 /// Refreshes exclude cloud storage under the user's home exactly like the mapping did: a
 /// recursive refresh above `Library/CloudStorage` never lists the provider folders (on macOS
-/// those are placeholders that fail with EDEADLK rather than download).
+/// those are placeholders that fail with EDEADLK rather than download). Only macOS reports cloud
+/// storage roots; the generic platform has none to exclude.
+#[cfg(target_os = "macos")]
 #[test]
 fn refresh_keeps_cloud_storage_excluded() {
     let fx = Fixture::new();
