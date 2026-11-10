@@ -615,6 +615,44 @@ fn reads_of_a_replaced_saved_map_answer_from_its_replacement() {
     assert!(search.is_ok(), "{search:?}");
 }
 
+/// A refresh asked of a saved map that another refresh already replaced (the app dropped that
+/// reply: it paused or moved to another location meanwhile) refreshes the replacement instead
+/// of failing with "the saved map changed".
+#[test]
+fn a_refresh_of_a_superseded_map_refreshes_its_replacement() {
+    use orbit_app_state::Backend as _;
+    use orbit_app_state::backend::RefreshRequest;
+    let fx = Fixture::new();
+    let root = fx.tree("root");
+    let mut app = App::new(&fx, None);
+    app.open(&root);
+    app.until("the saved map", |a| a.published(&root));
+    let stale = app.state.snapshot().unwrap().clone();
+    let session = app.state.active_session_id().unwrap();
+    let request = |snapshot, folder: &str| RefreshRequest {
+        session,
+        root: Arc::from(bytes(&root)),
+        snapshot,
+        paths: vec![bytes(&root.join(folder))],
+        subtrees: Vec::new(),
+        retry_unreadable: false,
+    };
+    write(&root.join("docs/first.txt"), 111);
+    let first = app.backend.refresh(&request(stale.id, "docs"), &Cancellation::new()).unwrap();
+    assert_ne!(first.id, stale.id);
+
+    write(&root.join("big/second.bin"), 222);
+    let second = app.backend.refresh(&request(stale.id, "big"), &Cancellation::new()).unwrap();
+    assert_ne!(second.id, first.id, "the replacement was refreshed");
+    let maps = app.fixture_maps();
+    let saved = maps.snapshot(&bytes(&root)).unwrap();
+    for (folder, name) in [("docs", "first.txt"), ("big", "second.bin")] {
+        let tree = maps.view(&saved, &bytes(&root.join(folder)), &[], None).unwrap();
+        let names: Vec<&[u8]> = tree.children(FolderTree::FOLDER).iter().map(|&ix| tree.name(ix)).collect();
+        assert!(names.contains(&name.as_bytes()), "{folder}/{name} is in the saved map");
+    }
+}
+
 /// A quick Refresh retries folders the map could not read: once readable (access granted, which
 /// no change history reports), their contents appear without any reported change.
 #[test]

@@ -1656,6 +1656,21 @@ impl AppState {
             self.refresh_request = None;
         }
         if generation != self.generation {
+            // Paused or moved on meanwhile, but the backend published this refresh: its session
+            // keeps the new saved map, so neither a later update nor reattaching asks for the
+            // map it replaced ("the saved map changed").
+            if let (Ok(updated), Some(id)) = (&result, session) {
+                let active = self.active == Some(id);
+                if let Some(s) = self.session_mut(id)
+                    && s.saved.as_ref().is_some_and(|saved| saved.root == updated.root)
+                {
+                    s.saved = Some(updated.clone());
+                }
+                if active && self.snapshot.as_ref().is_some_and(|s| s.root == updated.root && s.id != updated.id) {
+                    self.snapshot = Some(updated.clone());
+                    self.folder_cache.clear();
+                }
+            }
             return;
         }
         self.quiet_refresh = false;

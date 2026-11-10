@@ -299,6 +299,30 @@ fn refresh_after_a_pause_reopens_the_saved_map() {
     assert!(!h.state.updates_paused());
 }
 
+/// A refresh whose reply arrives after the user moved to another location was still published:
+/// the session keeps the new saved map, so returning to it (and its next update) uses that map
+/// rather than the one it replaced, which the backend reported as "the saved map changed".
+#[test]
+fn a_refresh_published_after_moving_on_is_kept() {
+    let mut h = harness();
+    h.backend.add_file(b"/s/other.txt", 5);
+    h.open_mapped(b"/r");
+    let before = h.state.snapshot().unwrap().id;
+    let session = h.state.active_session_id().unwrap();
+    h.backend.add_file(b"/r/docs/new.txt", 3);
+    changes(&mut h, &["/r/docs"]);
+    h.advance(REFRESH_DELAY);
+    let refresh = h.take(|r| matches!(r, Request::Refresh(_))).expect("a refresh request");
+    h.open_mapped(b"/s");
+    h.deliver(refresh);
+    h.run();
+    let saved = h.state.session(session).and_then(|s| s.saved.as_ref()).map(|s| s.id);
+    assert!(saved.is_some_and(|id| id != before), "the session keeps the published map: {saved:?} vs {before}");
+    h.send(Event::OpenLocation { path: b"/r".to_vec(), force: false });
+    h.run();
+    assert_eq!(h.state.snapshot().map(|s| s.id), saved, "returning shows the published map");
+}
+
 /// Without change history Refresh has nothing to replay: it rescans. Rescan Everything always
 /// does.
 #[test]

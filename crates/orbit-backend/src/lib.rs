@@ -567,7 +567,12 @@ impl<P: Platform> Backend for EngineBackend<P> {
 
     fn refresh(&self, request: &RefreshRequest, cancel: &Cancellation) -> Result<SnapshotInfo, String> {
         let inner = &*self.inner;
+        // The app's snapshot can trail the saved map: it drops a refresh reply that arrives after
+        // it paused or moved to another location, though that refresh was published. The listed
+        // folders are read from the disk again either way, so the map that replaced it is
+        // refreshed instead (once more if another refresh replaces it meanwhile).
         let saved = inner.saved_snapshot(request.snapshot)?;
+        let mut saved = inner.replacement(&saved).unwrap_or(saved);
         let entry = inner.entry(request.session);
         // Only history whose folders this refresh re-lists may be marked as applied. A failed
         // refresh forgets those batches: the retry then keeps the older position (safe).
@@ -576,8 +581,19 @@ impl<P: Platform> Backend for EngineBackend<P> {
         if request.retry_unreadable {
             listings.extend(result_message(inner.maps.retry_candidates(&saved, RETRY_LIMIT))?);
         }
-        let updated =
-            result_message(inner.maps.refresh(&saved, &listings, &request.subtrees, checkpoint.as_ref(), cancel))?;
+        let mut attempts = 0;
+        let updated = loop {
+            match inner.maps.refresh(&saved, &listings, &request.subtrees, checkpoint.as_ref(), cancel) {
+                Err(CoreError::SnapshotChanged) if attempts < 2 => match inner.replacement(&saved) {
+                    Some(current) => {
+                        saved = current;
+                        attempts += 1;
+                    }
+                    None => return Err(message(&CoreError::SnapshotChanged)),
+                },
+                result => break result_message(result)?,
+            }
+        };
         let (info, _) = inner.describe(&updated)?;
         if let Some(entry) = entry {
             entry.set_saved(updated.clone());
