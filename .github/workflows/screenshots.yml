@@ -41,7 +41,10 @@ jobs:
       - name: Fit the display to the capture window
         # Runners boot into a small 1x mode that cuts the 1280x810 window short.
         working-directory: source
-        run: osascript -l JavaScript scripts/marketing/display.js 1280 810
+        run: |
+          osascript -l JavaScript scripts/marketing/display.js 1280 810
+          echo 'After the script exited:'
+          osascript -l JavaScript scripts/marketing/display.js | grep '^screen'
       - name: Build the app
         working-directory: source
         run: ./build-app.sh --release-mode --output "$RUNNER_TEMP/capture/Orbit Disk.app"

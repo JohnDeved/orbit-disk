@@ -51,7 +51,15 @@ function run(argv) {
     return lines.join('\n');
   }
   const best = fits[0];
-  const error = $.CGDisplaySetDisplayMode(display, best.mode, $());
+  // A configuration completed for the session outlasts this script (CGDisplaySetDisplayMode's
+  // change ends with the process that made it).
+  const config = Ref();
+  let error = $.CGBeginDisplayConfiguration(config);
+  if (error === 0) {
+    error = $.CGConfigureDisplayWithDisplayMode(config[0], display, best.mode, $());
+    if (error === 0) error = $.CGCompleteDisplayConfiguration(config[0], $.kCGConfigureForSession);
+    else $.CGCancelDisplayConfiguration(config[0]);
+  }
   lines.push(error === 0
     ? `switched to ${best.width}x${best.height}@${best.scale}x`
     : `couldn't switch to ${best.width}x${best.height}@${best.scale}x (error ${error})`);
