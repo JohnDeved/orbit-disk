@@ -2,6 +2,13 @@ name: Refresh README screenshots
 
 on:
   workflow_call:
+  # A manual run captures without publishing unless asked to, to check the capture path.
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Commit the refreshed screenshots to main
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -16,7 +23,7 @@ env:
 
 jobs:
   capture:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: macos-26
     timeout-minutes: 40
     env:
@@ -31,6 +38,8 @@ jobs:
         run: |
           xcrun -sdk macosx metal --version 2>/dev/null || xcodebuild -downloadComponent MetalToolchain
           xcrun -sdk macosx metal --version
+      - name: Show the display
+        run: system_profiler SPDisplaysDataType | grep -E 'Resolution|Retina|Main Display|UI Looks like' || true
       - name: Build the app
         working-directory: source
         run: ./build-app.sh --release-mode --output "$RUNNER_TEMP/capture/Orbit Disk.app"
@@ -48,13 +57,20 @@ jobs:
           (( capture_status == 0 )) || exit "$capture_status"
           echo 'captured=true' >> "$GITHUB_OUTPUT"
         shell: zsh {0}
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: steps.capture.outputs.captured == 'true'
+        with:
+          name: readme-screenshots
+          path: |
+            source/docs/screenshots
+            source/docs/art
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.capture.outputs.captured == 'true' && (github.event_name != 'workflow_dispatch' || inputs.publish)
         with:
           ref: main
           path: publish
       - name: Commit updated screenshots
-        if: steps.capture.outputs.captured == 'true'
+        if: steps.capture.outputs.captured == 'true' && (github.event_name != 'workflow_dispatch' || inputs.publish)
         working-directory: publish
         run: |
           images=(docs/screenshots/orbit-overview.png docs/screenshots/orbit-collection.png docs/art/orbit-navigate-light.png docs/art/orbit-navigate-dark.png docs/art/orbit-collect-light.png docs/art/orbit-collect-dark.png)

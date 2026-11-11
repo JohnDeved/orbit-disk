@@ -154,6 +154,8 @@ pub struct WindowFacts {
     pub animating: bool,
     /// The content has the requested size (always true without one).
     pub sized: bool,
+    /// The content size the window has.
+    pub viewport: Size<Pixels>,
 }
 
 /// The next thing the runner does.
@@ -226,10 +228,24 @@ impl Director {
     }
 
     /// Why the state is not settled yet (for the give-up message).
-    pub fn describe(&self, host: &AppHost) -> String {
+    pub fn describe(&self, host: &AppHost, window: WindowFacts) -> String {
         let state = host.state();
+        let waiting: Vec<&str> = [
+            (state.is_opening(), "opening"),
+            (state.is_validating_collection(), "validating"),
+            (state.is_updating_collection(), "updating the collection"),
+            (state.is_sorting_rows(), "sorting"),
+            (state.error().is_some(), "an error"),
+            (window.sheet_open != self.target.shows_sheet(), "the sheet"),
+            (window.animating, "the footer animation"),
+            (!window.sized, "the window size"),
+        ]
+        .into_iter()
+        .filter_map(|(pending, name)| pending.then_some(name))
+        .collect();
         format!(
-            "step {}/{}, root {:?}, folder {:?}, selected {:?}, collected {}, review {}, in flight {}",
+            "step {}/{}, root {:?}, folder {:?}, selected {:?}, collected {}, review {}, in flight {}, window {}x{}, \
+             waiting for [{}]",
             self.next,
             self.target.steps().len(),
             state.root_path().map(theme::display),
@@ -238,6 +254,9 @@ impl Director {
             state.collection().map_or(0, |c| c.len()),
             state.show_review(),
             host.in_flight(),
+            f32::from(window.viewport.width),
+            f32::from(window.viewport.height),
+            waiting.join(", "),
         )
     }
 }
@@ -279,15 +298,7 @@ pub fn drive(
             let poll = window.update(cx, |main, window, cx| {
                 let host = main.host().clone();
                 let panels = main.panels();
-                let facts = WindowFacts {
-                    sheet_open: panels.sheets.read(cx).is_open(cx),
-                    animating: panels.footer.read(cx).is_animating(),
-                    sized: run.window_size.is_none_or(|size| {
-                        let viewport = window.viewport_size();
-                        (viewport.width - size.width).abs() < gpui::px(0.5)
-                            && (viewport.height - size.height).abs() < gpui::px(0.5)
-                    }),
-                };
+                let facts = facts(main, window, run, cx);
                 match director.poll(host.read(cx), facts) {
                     Poll::Send(event) => {
                         host.send(event, cx);
@@ -314,7 +325,7 @@ pub fn drive(
         }
         if !settled {
             let detail = window
-                .update(cx, |main, _, cx| director.describe(main.host().read(cx)))
+                .update(cx, |main, window, cx| director.describe(main.host().read(cx), facts(main, window, run, cx)))
                 .unwrap_or_else(|_| "the window closed".into());
             cx.update(|cx| failed(format!("{} was not reached: {detail}", run.state), cx)).ok();
             return;
@@ -349,6 +360,19 @@ pub fn drive(
         }
         cx.update(ready).ok();
     })
+}
+
+fn facts(main: &MainWindow, window: &gpui::Window, run: MarketingRun, cx: &App) -> WindowFacts {
+    let panels = main.panels();
+    let viewport = window.viewport_size();
+    WindowFacts {
+        sheet_open: panels.sheets.read(cx).is_open(cx),
+        animating: panels.footer.read(cx).is_animating(),
+        sized: run.window_size.is_none_or(|size| {
+            (viewport.width - size.width).abs() < gpui::px(0.5) && (viewport.height - size.height).abs() < gpui::px(0.5)
+        }),
+        viewport,
+    }
 }
 
 #[cfg(test)]
