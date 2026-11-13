@@ -21,7 +21,10 @@
 <br>
 
 <p align="center">
-  <img src="docs/screenshots/orbit-hero.png" width="100%" alt="The Orbit Disk window, showing a sample Home folder of 346 GB and 77,561 files. Projects, the largest folder (92.86 GB, 26.8%), is selected on the map and in the Contents list. Downloads (31.56 GB) is already collected: its arcs are striped and checked, its row reads In Collection, and the tray shows 1 item in collection next to the Review Collection button.">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/orbit-hero-dark.png">
+  <img src="docs/screenshots/orbit-hero-light.png" width="100%" alt="The Orbit Disk window, showing a sample Home folder of 346 GB and 77,561 files. Projects, the largest folder (92.86 GB, 26.8%), is selected on the map and in the Contents list. Downloads (31.56 GB) is already collected: its arcs are striped and checked, its row reads In Collection, and the tray shows 1 item in collection next to the Review Collection button.">
+</picture>
 </p>
 <p align="center"><sub>Screenshots show the app’s built-in sample data.</sub></p>
 
@@ -49,7 +52,7 @@ Pointing at an arc shows a tooltip with its size and highlights its row in the C
 <p>
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/art/card-collect-dark.png">
-  <img src="docs/art/card-collect-light.png" width="100%" alt="Step 1, drag an arc or a row: a grabbing pointer holds the selected Downloads arc on the Home map, whose center reads Downloads, 31.56 GB. Step 2, drop it in the tray: a dashed arrow leads down to the tray under the map, now showing 1 item in collection, 31.56 GB. Step 3, marked on the map: an arrow leads to the same map afterwards, where the Downloads arcs are circled, striped and checked.">
+  <img src="docs/art/card-collect-light.png" width="100%" alt="Step 1, drag an arc or a row: a grabbing pointer holds the selected Downloads arc on the Home map, whose center reads Downloads, 31.56 GB. Step 2, drop it in the tray: a dashed arrow leads down to the tray under the map, now showing 1 item in collection, 31.56 GB. Step 3, marked on the map: an arrow leads to the same map afterwards, where a leader points up to the Downloads arcs, circled, striped and checked.">
 </picture>
 </p>
 
