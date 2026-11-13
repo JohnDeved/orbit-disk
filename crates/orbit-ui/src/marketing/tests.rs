@@ -120,3 +120,37 @@ fn review_opens_the_review_of_collected_downloads(cx: &mut TestAppContext) {
     });
     assert!(sheet_open(window, cx));
 }
+
+#[gpui::test]
+fn downloads_selects_downloads_without_collecting(cx: &mut TestAppContext) {
+    let window = reach(MarketingState::Downloads, cx);
+    state(window, cx, |state| {
+        assert_eq!(state.current_path(), Some(fixture::HOME));
+        assert_eq!(selected(state), Some(sample::path(sample::DOWNLOADS)));
+        assert!(collected(state).is_empty());
+    });
+    assert!(!sheet_open(window, cx));
+}
+
+#[gpui::test]
+fn projects_open_opens_projects_without_a_selection(cx: &mut TestAppContext) {
+    let window = reach(MarketingState::ProjectsOpen, cx);
+    state(window, cx, |state| {
+        assert_eq!(state.current_path(), Some(&sample::path(sample::PROJECTS)[..]));
+        assert_eq!(selected(state), None);
+        assert!(collected(state).is_empty());
+    });
+    assert!(!sheet_open(window, cx));
+}
+
+#[gpui::test]
+fn hero_selects_projects_with_downloads_collected(cx: &mut TestAppContext) {
+    let window = reach(MarketingState::Hero, cx);
+    state(window, cx, |state| {
+        assert_eq!(state.current_path(), Some(fixture::HOME));
+        assert_eq!(selected(state), Some(sample::path(sample::PROJECTS)));
+        assert_eq!(collected(state), vec![sample::path(sample::DOWNLOADS)]);
+        assert!(!state.show_review());
+    });
+    assert!(!sheet_open(window, cx));
+}

@@ -23,7 +23,7 @@ pub struct Args {
 }
 
 const USAGE: &str = "usage: OrbitDisk [--fixture] [--fixture-entries N] [--scan PATH] [--frame-harness [SCRIPT]]
-                 [--marketing-state overview|collection|projects|review|trash-confirm|permanent-delete] [--appearance dark] [--window-size WxH]
+                 [--marketing-state overview|downloads|collection|hero|projects|projects-open|review|trash-confirm|permanent-delete] [--appearance dark] [--window-size WxH]
 
   --marketing-state STATE  show a README screenshot state on the sample Home (implies --fixture,
                            in-memory settings, reduced motion); prints `marketing-state: ready` on
@@ -66,7 +66,7 @@ impl Args {
                     let value = args.next();
                     let state = value.as_deref().and_then(|v| MarketingState::parse(v.to_str()?));
                     parsed.marketing = Some(state.ok_or_else(|| {
-                        format!("--marketing-state needs one of overview, collection, projects, review\n{USAGE}")
+                        format!("--marketing-state needs one of overview, downloads, collection, hero, projects, projects-open, review, trash-confirm, permanent-delete\n{USAGE}")
                     })?);
                     parsed.fixture = true;
                 }
