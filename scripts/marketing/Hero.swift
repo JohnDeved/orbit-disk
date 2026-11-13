@@ -39,7 +39,7 @@ func spotlight(dark: Bool) {
     NSGraphicsContext.saveGraphicsState()
     shape.addClip()
     if dark {
-        srgb(0x121318).setFill()
+        srgb(0x262932).setFill()
         shape.fill()
         let coralCenter = NSPoint(x: canvas.width * 0.18, y: canvas.height * 0.85)
         let indigoCenter = NSPoint(x: canvas.width * 0.85, y: canvas.height * 0.12)

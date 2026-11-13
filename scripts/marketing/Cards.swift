@@ -61,7 +61,7 @@ struct Theme {
     let shadow: CGFloat
 }
 let themes = [
-    Theme(name: "dark", halo: srgb(0x121318, 0.85), pillFill: srgb(0xF2EEE6), pillText: srgb(0x17171A), pillEdge: nil,
+    Theme(name: "dark", halo: srgb(0x262932, 0.85), pillFill: srgb(0xF2EEE6), pillText: srgb(0x17171A), pillEdge: nil,
           pillShadow: 0.45, accent: srgb(0xFF8F66), shadow: 0.6),
     Theme(name: "light", halo: srgb(0xFFFFFF, 0.9), pillFill: srgb(0xFFFFFF), pillText: srgb(0x1F242C),
           pillEdge: NSColor.black.withAlphaComponent(0.09), pillShadow: 0.16, accent: srgb(0xD4562D), shadow: 0.24),
@@ -215,7 +215,7 @@ func spotlight(theme: Theme) {
     NSGraphicsContext.saveGraphicsState()
     shape.addClip()
     if dark {
-        srgb(0x121318).setFill()
+        srgb(0x262932).setFill()
         shape.fill()
         let coralCenter = NSPoint(x: card.width * 0.18, y: card.height * 0.85), indigoCenter = NSPoint(x: card.width * 0.85, y: card.height * 0.12)
         NSGradient(colors: [srgb(0xFF8F66, 0.05), srgb(0xFF8F66, 0)])!
