@@ -218,9 +218,9 @@ func spotlight(theme: Theme) {
         srgb(0x121318).setFill()
         shape.fill()
         let coralCenter = NSPoint(x: card.width * 0.18, y: card.height * 0.85), indigoCenter = NSPoint(x: card.width * 0.85, y: card.height * 0.12)
-        NSGradient(colors: [srgb(0xFF8F66, 0.30), srgb(0xFF8F66, 0)])!
+        NSGradient(colors: [srgb(0xFF8F66, 0.05), srgb(0xFF8F66, 0)])!
             .draw(fromCenter: coralCenter, radius: 0, toCenter: coralCenter, radius: 620, options: [])
-        NSGradient(colors: [srgb(0x6E6BFF, 0.26), srgb(0x6E6BFF, 0)])!
+        NSGradient(colors: [srgb(0x6E6BFF, 0.05), srgb(0x6E6BFF, 0)])!
             .draw(fromCenter: indigoCenter, radius: 0, toCenter: indigoCenter, radius: 640, options: [])
     } else {
         NSGradient(colors: [srgb(0xFFEDE4), srgb(0xF6F1FA), srgb(0xE6ECFF)], atLocations: [0, 0.5, 1], colorSpace: .sRGB)!
