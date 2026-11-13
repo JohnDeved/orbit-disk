@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Assets/OrbitDisk.svg" width="96" alt="Orbit Disk icon: a coral planet with an ivory orbital ring on a charcoal tile">
+  <img src="Assets/OrbitDisk.svg" width="96" alt="Orbit Disk icon: a charcoal planet with a coral slice lifted out of it and a slate ring, on a warm-white tile">
 </p>
 
 <h1 align="center">Orbit Disk</h1>
