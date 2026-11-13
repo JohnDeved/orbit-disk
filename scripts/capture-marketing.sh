@@ -6,7 +6,7 @@
 # Launches `OrbitDisk --fixture` (deterministic generated tree, isolated HOME so no settings or
 # saved maps leak in) once per state, finds its window through CGWindowList (JavaScript for
 # Automation, scripts/marketing/window-id.js; no Swift, no Python modules), captures it with
-# `screencapture -l`, then composes docs/screenshots/orbit-hero.png and docs/art/card-*.png with
+# `screencapture -l`, then composes docs/screenshots/orbit-hero-*.png and docs/art/card-*.png with
 # the standalone scripts/marketing/{Hero,Cards}.swift compositors (AppKit image drawing only; they
 # do not compile the app). docs/art/perf-*.svg and download-mac.svg are hand-written, not rendered.
 #

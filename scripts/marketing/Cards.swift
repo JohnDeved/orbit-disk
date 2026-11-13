@@ -11,9 +11,9 @@ import Foundation
 //                       map and list (collection)
 //   card-review-*.png   open the review → Move to Trash or Delete Permanently, each confirmed
 //   Cards INPUT_DIRECTORY OUTPUT_DIRECTORY
-// Cards have no background of their own: everything around the crops is transparent, so GitHub's
-// page color (light, dark or dimmed) shows through. Only the pills, arrows and their halos differ
-// between the light and dark variants, which the README picks with <picture>.
+// Each card sits on a themed "spotlight" panel, picked by the README with <picture>: light is a soft
+// peach-to-periwinkle gradient, dark is charcoal with a coral glow (top left) and an indigo glow
+// (bottom right). Faint orbit rings echo the app icon. Corners outside the panel are transparent.
 // Every capture is a full 1280 × 810 pt window; crops below are in window points. PNGs are
 // written at 1.5× (1800 px: sharp in a Retina README column, lighter than 2×).
 
@@ -49,7 +49,7 @@ func capture(_ name: String) -> CGImage {
 
 struct Theme {
     let name: String
-    /// Behind arrows and leaders where they cross map rings: close to the page color.
+    /// Behind arrows and leaders where they cross map rings: close to the panel color.
     let halo: NSColor
     let pillFill: NSColor
     let pillText: NSColor
@@ -61,7 +61,7 @@ struct Theme {
     let shadow: CGFloat
 }
 let themes = [
-    Theme(name: "dark", halo: srgb(0x0D1117, 0.85), pillFill: srgb(0xF2EEE6), pillText: srgb(0x17171A), pillEdge: nil,
+    Theme(name: "dark", halo: srgb(0x121318, 0.85), pillFill: srgb(0xF2EEE6), pillText: srgb(0x17171A), pillEdge: nil,
           pillShadow: 0.45, accent: srgb(0xFF8F66), shadow: 0.6),
     Theme(name: "light", halo: srgb(0xFFFFFF, 0.9), pillFill: srgb(0xFFFFFF), pillText: srgb(0x1F242C),
           pillEdge: NSColor.black.withAlphaComponent(0.09), pillShadow: 0.16, accent: srgb(0xD4562D), shadow: 0.24),
@@ -205,6 +205,40 @@ func step(_ number: Int, _ label: String, at x: CGFloat, _ y: CGFloat, leading: 
     digits.draw(at: NSPoint(x: x - numberSize.width / 2, y: card.height - y - numberSize.height / 2), withAttributes: numberAttrs)
 }
 
+/// How far content moves down inside its panel (see `render`).
+let contentShift: CGFloat = 19
+
+/// Fills the card with the theme's spotlight panel.
+func spotlight(theme: Theme) {
+    let dark = theme.name == "dark"
+    let shape = NSBezierPath(roundedRect: NSRect(origin: .zero, size: card).insetBy(dx: 1, dy: 1), xRadius: 28, yRadius: 28)
+    NSGraphicsContext.saveGraphicsState()
+    shape.addClip()
+    if dark {
+        srgb(0x121318).setFill()
+        shape.fill()
+        let coralCenter = NSPoint(x: card.width * 0.18, y: card.height * 0.85), indigoCenter = NSPoint(x: card.width * 0.85, y: card.height * 0.12)
+        NSGradient(colors: [srgb(0xFF8F66, 0.30), srgb(0xFF8F66, 0)])!
+            .draw(fromCenter: coralCenter, radius: 0, toCenter: coralCenter, radius: 620, options: [])
+        NSGradient(colors: [srgb(0x6E6BFF, 0.26), srgb(0x6E6BFF, 0)])!
+            .draw(fromCenter: indigoCenter, radius: 0, toCenter: indigoCenter, radius: 640, options: [])
+    } else {
+        NSGradient(colors: [srgb(0xFFEDE4), srgb(0xF6F1FA), srgb(0xE6ECFF)], atLocations: [0, 0.5, 1], colorSpace: .sRGB)!
+            .draw(in: shape, angle: -25)
+    }
+    let center = NSPoint(x: card.width / 2, y: card.height / 2)
+    for (radius, alpha) in zip([260, 400, 560] as [CGFloat], dark ? [0.09, 0.065, 0.045] : [0.10, 0.075, 0.05] as [CGFloat]) {
+        let ring = NSBezierPath(ovalIn: NSRect(x: center.x - radius, y: center.y - radius, width: radius * 2, height: radius * 2))
+        ring.lineWidth = 1.5
+        (dark ? srgb(0xFFF5DE, alpha) : srgb(0x3B4560, alpha)).setStroke()
+        ring.stroke()
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    (dark ? NSColor.white.withAlphaComponent(0.10) : NSColor.black.withAlphaComponent(0.06)).setStroke()
+    shape.lineWidth = 1
+    shape.stroke()
+}
+
 func render(_ name: String, height: CGFloat = 640, theme: Theme, _ content: () -> Void) throws {
     card = NSSize(width: 1200, height: height)
     guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(card.width * pixelScale), pixelsHigh: Int(card.height * pixelScale),
@@ -216,8 +250,15 @@ func render(_ name: String, height: CGFloat = 640, theme: Theme, _ content: () -
     NSGraphicsContext.current = context
     context.cgContext.clear(CGRect(origin: .zero, size: card))
 
-    // No card background: the page shows through.
+    spotlight(theme: theme)
+    // Content is laid out from y = 0 with its first row of pills at y ≈ 21; shifting it down gives
+    // the same 40 pt inset at the top as at the sides. Each card's height adds the same at the bottom.
+    NSGraphicsContext.saveGraphicsState()
+    let shift = NSAffineTransform()
+    shift.translateX(by: 0, yBy: -contentShift)
+    shift.concat()
     content()
+    NSGraphicsContext.restoreGraphicsState()
 
     context.flushGraphics()
     NSGraphicsContext.restoreGraphicsState()
@@ -243,7 +284,7 @@ func stepWidth(_ label: String) -> CGFloat {
 
 for theme in themes {
     // Map: click the Projects arc on Home (before), Projects opens (after); the center goes back up.
-    try render("card-map", theme: theme) {
+    try render("card-map", height: 677, theme: theme) {
         let scale: CGFloat = 1.1, side = (mapX.upperBound - mapX.lowerBound) * 1.1
         let before = (left: CGFloat(40), top: CGFloat(96)), after = (left: CGFloat(1160) - side, top: CGFloat(96))
         picture("orbit-overview.png", x: mapX, bands: [mapY], at: before.left, before.top, scale: scale, shadow: theme.shadow)
@@ -255,7 +296,7 @@ for theme in themes {
         step(1, "Click an arc", at: before.left + 27, row, theme: theme)
         // The opened folder's breadcrumb (window 238…420, 62…90), shown above the opened map.
         let crumb = (scale: CGFloat(1.15), width: CGFloat(198 * 1.15), height: CGFloat(40 * 1.15))
-        let crumbLeft = 1160 - crumb.width, crumbTop = row - crumb.height / 2
+        let crumbLeft = 1155 - crumb.width, crumbTop = row - crumb.height / 2
         picture("orbit-projects-open.png", x: 230...428, bands: [56...96], at: crumbLeft, crumbTop, scale: crumb.scale, radius: 10,
                 shadow: theme.shadow + 0.1)
         target(crumbLeft, crumbTop, crumb.width, crumb.height, radius: 10, theme: theme)
@@ -269,7 +310,7 @@ for theme in themes {
     }
     // Collect: drag the selected Downloads arc (before) down into the tray, which sits under the map as
     // in the app; it is marked on the map (after).
-    try render("card-collect", height: 610, theme: theme) {
+    try render("card-collect", height: 631, theme: theme) {
         let scale: CGFloat = 0.88, side = (mapX.upperBound - mapX.lowerBound) * 0.88
         let before = (left: CGFloat(40), top: CGFloat(96)), after = (left: CGFloat(1160) - side, top: CGFloat(96))
         picture("orbit-downloads.png", x: mapX, bands: [mapY], at: before.left, before.top, scale: scale, shadow: theme.shadow)
@@ -289,14 +330,15 @@ for theme in themes {
               CGPoint(x: after.left - 12, y: 330), theme: theme)
         let hatch = place(436, 300, cropX: mapX.lowerBound, cropY: mapY.lowerBound, left: after.left, top: after.top, scale: scale)
         target(hatch.x - 30, hatch.y - 42, 66, 86, radius: 12, theme: theme)
-        // Label 3 sits in the gap left of the map, level with the stripes, with a short leader to them.
-        let label = "Marked on the map"
-        let labelEnd = after.left - 24
-        leader(from: CGPoint(x: labelEnd, y: hatch.y), to: CGPoint(x: hatch.x - 37, y: hatch.y), theme: theme)
-        step(3, label, at: labelEnd - stepWidth(label) + 27, hatch.y, theme: theme)
+        // Label 3 sits under the map on the same row as label 2, so the steps read left to right, with a
+        // leader up to the circled stripes.
+        let label = "Marked on the map", labelRow = tray.top + tray.height / 2
+        let labelX = 1160 - stepWidth(label) + 27
+        leader(from: CGPoint(x: hatch.x + 3, y: labelRow - 29), to: CGPoint(x: hatch.x + 3, y: hatch.y + 49), theme: theme)
+        step(3, label, at: labelX, labelRow, theme: theme)
     }
     // Review: open the review from the tray, then choose: Move to Trash, or delete permanently.
-    try render("card-review", theme: theme) {
+    try render("card-review", height: 647, theme: theme) {
         let scale: CGFloat = 0.8
         // The tray's Review Collection button (window 1092…1240, 744…772).
         picture("orbit-collection.png", x: 1080...1252, bands: [736...780], at: 40, 124, scale: 1.1, radius: 12, shadow: theme.shadow)
