@@ -78,7 +78,7 @@ jobs:
         if: steps.capture.outputs.captured == 'true' && (github.event_name != 'workflow_dispatch' || inputs.publish)
         working-directory: publish
         run: |
-          images=(docs/screenshots/orbit-overview.png docs/screenshots/orbit-collection.png docs/art/orbit-navigate-light.png docs/art/orbit-navigate-dark.png docs/art/orbit-collect-light.png docs/art/orbit-collect-dark.png)
+          images=(docs/screenshots/orbit-hero.png docs/art/card-{map,collect,review}-{light,dark}.png)
           for path in "${images[@]}"; do cp "../source/$path" "$path"; done
           git add "${images[@]}"
           if git diff --cached --quiet; then exit 0; fi
