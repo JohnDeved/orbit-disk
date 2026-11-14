@@ -218,8 +218,13 @@ fn views_while_mapping_are_monotone_and_the_saved_map_matches_the_disk() {
     let progress = session.progress();
     assert!(progress.discovery_complete);
     assert_eq!(progress.cached_file_count, Some(reference(&fx.root).0));
-    // The stage was retired after publication.
-    assert!(!orbit_core::lease::has_stage(&fx.paths.staging, &root, session.root_identity()));
+    // The stage is retired after publication. The outcome becomes visible first (readers switch
+    // to the saved map at once), so the files may still be there for a moment.
+    let deadline = std::time::Instant::now() + WAIT;
+    while orbit_core::lease::has_stage(&fx.paths.staging, &root, session.root_identity()) {
+        assert!(std::time::Instant::now() < deadline, "the stage was not retired after publication");
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[test]
