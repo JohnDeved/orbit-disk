@@ -7,7 +7,7 @@
 <h3 align="center">Find what’s filling your Mac.</h3>
 
 <p align="center">
-  Orbit Disk scans your whole drive at about 95,000 files a second, and you can explore while it does. Each ring goes one folder deeper and each arc is sized by what’s inside, so the space hogs stand out. Collect what you don’t need; nothing is deleted until you confirm it in the review.
+  Orbit Disk scans your whole drive at about 270,000 files a second, and you can explore while it does. Each ring goes one folder deeper and each arc is sized by what’s inside, so the space hogs stand out. Collect what you don’t need; nothing is deleted until you confirm it in the review.
 </p>
 
 <p align="center">
@@ -80,11 +80,11 @@ You can collect files while the first scan is still running.
 <p>
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/art/perf-dark.svg">
-  <img src="docs/art/perf-light.svg" width="100%" alt="95,000 files per second found on a whole Mac: Apple M5, 5.1 million files in 55 seconds. 60 to 82 seconds to a saved map with all 5.1 million files indexed. 10 ms to the first view, which fills in as it scans. A smooth 120 Hz interface, with a p99 frame interval of 6.2 ms.">
+  <img src="docs/art/perf-light.svg" width="100%" alt="270,000 files per second found on a whole Mac: Apple M5, 5.1 million files in 19 seconds. 32 to 37 seconds to a saved map with all 5.1 million files indexed. 20 ms to the first view, which fills in as it scans. A smooth 120 Hz interface, with a p99 frame interval of 6.2 ms.">
 </picture>
 </p>
 
-Measured by scanning a whole Mac (Apple M5, 16 GB, 500 GB SSD) twice: the 5.1 million files it could read without Full Disk Access were found in 53–55 seconds, and the map was indexed and saved after 60–82 seconds. You don’t have to wait for that: the scan engine’s first view is ready in about 10 ms, and the map fills in as the scan runs. The 120 Hz figure is from the 0.10.0 release measurements. Older Macs, external disks and a cold start are slower. Method and raw output: [whole-drive benchmark](docs/benchmarks/whole-drive.md).
+Measured by scanning a whole Mac (Apple M5, 16 GB, 500 GB SSD) four times: the 5.1 million files it could read without Full Disk Access were found in 18.5–21 seconds, and the map was indexed and saved after 32–37 seconds. You don’t have to wait for that: the scan engine’s first view is ready in about 20 ms, and the map fills in as the scan runs. The 120 Hz figure is from the 0.10.0 release measurements. Older Macs, external disks and a cold start are slower. Method and raw output: [whole-drive benchmark](docs/benchmarks/whole-drive.md).
 
 The next time, the map is already there. Finished maps are saved in a local SQLite index and usually reopen without a full scan; when macOS provides usable change history (FSEvents), changed folders update in the background. Search reads the saved index by name.
 
