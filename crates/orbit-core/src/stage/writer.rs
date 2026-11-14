@@ -299,6 +299,14 @@ impl Writer {
         };
         writer.transaction(|w| {
             w.conn.execute_batch(schema::INVENTORY_DDL)?;
+            // A new stage builds its two size indexes once, when it is sealed: maintained row by
+            // row, every insert and every ancestor total update moved index entries, and on a
+            // whole-drive map that made writing about 9 s slower. Mapping does not read them (the
+            // live inventory answers views and search); a stage reopened later gets them back
+            // from `INVENTORY_DDL` above.
+            if version == 0 {
+                w.conn.execute_batch(schema::DEFERRED_INDEX_DROP)?;
+            }
             w.conn.execute_batch(schema::STAGE_DDL)?;
             w.conn.execute_batch(&format!(
                 "PRAGMA application_id={}; PRAGMA user_version={}",
@@ -720,6 +728,22 @@ impl Writer {
     pub fn seal(&mut self, identity: &str, event_id: u64, elapsed: f64) -> Result<schema::SnapshotInfo> {
         let root = self.root.clone();
         let path = self.path.clone();
+        // Building the deferred indexes sorts every node; the writer's in-memory temp store
+        // would hold those sort runs in RAM (about 500 MB more on a 5-million-file map).
+        self.conn.execute_batch("PRAGMA temp_store=FILE; PRAGMA cache_size=-32768;")?;
+        let sealed = self.seal_inner(identity, event_id, elapsed, root, path);
+        self.conn.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA cache_size=-262144;")?;
+        sealed
+    }
+
+    fn seal_inner(
+        &mut self,
+        identity: &str,
+        event_id: u64,
+        elapsed: f64,
+        root: Vec<u8>,
+        path: PathBuf,
+    ) -> Result<schema::SnapshotInfo> {
         self.transaction(|w| {
             if w.has_remaining_work()? {
                 return Err(sqlite_invalid("stage has pending work"));
@@ -761,6 +785,8 @@ impl Writer {
             for (ord, message) in issues.iter().enumerate() {
                 w.conn.execute("INSERT INTO snapshot_issues VALUES(?1,?2)", params![ord as i64, message])?;
             }
+            // The size indexes a new stage deferred (see `open`); no-op when they exist.
+            w.conn.execute_batch(schema::DEFERRED_INDEX_DDL)?;
             w.conn.execute("INSERT OR REPLACE INTO sealed(singleton,snapshot_id,published) VALUES(1,?1,0)", [&id])?;
             Ok(schema::SnapshotInfo {
                 id,

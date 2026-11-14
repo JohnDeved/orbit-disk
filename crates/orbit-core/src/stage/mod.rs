@@ -189,6 +189,9 @@ pub struct Stage<P: Platform> {
     /// The highest mailbox sequence written into the open transaction group, acknowledged once
     /// the group commits.
     group_ack: Option<u64>,
+    /// The root was validated for the open transaction group: its other steps skip the check,
+    /// and the group validates again right before it commits.
+    group_root_checked: bool,
     observer: Option<Box<dyn LocalObserver>>,
 }
 
@@ -326,6 +329,7 @@ impl<P: Platform> Stage<P> {
             parents: Vec::new(),
             before_acknowledge: None,
             group_ack: None,
+            group_root_checked: false,
             observer: None,
         })))
     }
@@ -409,6 +413,7 @@ impl<P: Platform> Stage<P> {
             parents: Vec::new(),
             before_acknowledge: None,
             group_ack: None,
+            group_root_checked: false,
             observer: None,
         })
     }
@@ -770,6 +775,7 @@ impl<P: Platform> Stage<P> {
         let started = std::time::Instant::now();
         self.writer.begin_group()?;
         self.group_ack = None;
+        self.group_root_checked = false;
         self.parents.clear();
         let (mut records, mut completed, mut progressed) = (0usize, None, false);
         let outcome = loop {
@@ -793,9 +799,15 @@ impl<P: Platform> Stage<P> {
             }
         };
         let committed = outcome.and_then(|outcome| {
+            // Steps after the first skipped the root check: a root replaced while the group was
+            // open rolls the whole group back.
+            if self.group_root_checked {
+                self.validate_root()?;
+            }
             self.writer.commit_group()?;
             Ok(outcome)
         });
+        self.group_root_checked = false;
         match committed {
             Ok(outcome) => {
                 if let Some(sequence) = self.group_ack.take() {
@@ -819,7 +831,13 @@ impl<P: Platform> Stage<P> {
         if mailbox.is_cancelled() && self.async_listing.is_none() && mailbox.is_drained() {
             return Ok(None);
         }
-        self.validate_root()?;
+        // Inside a transaction group the root is checked once per group (and again before it
+        // commits) instead of once per step: each check reopens the root, and on a whole-drive
+        // map these opens took about 5% of the writer's time.
+        if !(self.writer.in_group() && self.group_root_checked) {
+            self.validate_root()?;
+            self.group_root_checked = self.writer.in_group();
+        }
         // Finish marking the old queue before accepting this generation's listings; otherwise
         // their completions are rejected and every discovered folder is walked again.
         if self.writer.mark_full_refresh_chunk()? {

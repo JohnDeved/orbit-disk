@@ -62,6 +62,11 @@ fn main() {
             }
         }
         Some("scaling") => scaling(&args),
+        Some("walk") => {
+            let root = PathBuf::from(arg(&args, "--root").expect("--root"));
+            let workers: usize = arg(&args, "--workers").map_or(discovery::DEFAULT_WORKERS, |w| w.parse().unwrap());
+            walk(&root, workers);
+        }
         _ => {
             eprintln!("usage: discovery_probe fixtures|bench|sample|micro --dir DIR ...");
             std::process::exit(2);
@@ -190,6 +195,38 @@ fn sample(dir: &Path, fixture: &str, workers: usize) {
         progress.records,
         report.cursor.opens,
         report.cursor.revalidations,
+    );
+}
+
+/// Discovery alone (live inventory, no index writer) over a real folder such as `/` or `~`.
+fn walk(root: &Path, workers: usize) {
+    let root = fs::canonicalize(root).unwrap();
+    let root_bytes = root.as_os_str().as_bytes().to_vec();
+    let platform = Arc::new(Native::new());
+    let (_, identity) = platform.open_root(&root).unwrap();
+    let scope = TraversalScope::new(&root_bytes, identity, platform.volume_layout(&root, identity));
+    let live = Arc::new(LiveInventory::new(scope));
+    let cancel = Cancellation::new();
+    let mailbox = Mailbox::new(Arc::from(root_bytes.clone()), identity, cancel.clone(), || {}, live.hook());
+    let before = usage();
+    let started = Instant::now();
+    let options = DiscoveryOptions { workers, ..DiscoveryOptions::default() };
+    let handle = discovery::start(platform, mailbox.clone(), live.clone(), options, cancel).unwrap();
+    let report = handle.join();
+    let discovery_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let after = usage();
+    let totals = live.totals();
+    println!(
+        "root={} workers={workers} discovery_ms={discovery_ms:.1} files={} directories={} failures={} \
+         files_per_s={:.0} user_ms={:.0} system_ms={:.0} peak_rss_mib={:.0}",
+        root.display(),
+        totals.files,
+        report.directories,
+        report.failures,
+        totals.files as f64 / (discovery_ms / 1000.0),
+        after.user_ms - before.user_ms,
+        after.system_ms - before.system_ms,
+        after.peak_rss as f64 / 1_048_576.0,
     );
 }
 

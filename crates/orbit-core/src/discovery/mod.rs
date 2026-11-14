@@ -57,14 +57,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Default worker count. `discovery_probe bench` on a 10-core M5 (Nov 2026) found elapsed time
-/// flat from 1 to 10 workers because the kernel serialized directory opens and listings
-/// (`discovery_probe scaling` shows the raw platform calls do not scale either), while system
-/// CPU grew with every worker. Four matches the Swift build, which scaled ~2.7x with four
-/// workers when the kernel did not serialize. Root cause and paired Swift numbers:
-/// `docs/benchmarks/rust-port/discovery-scaling.md` (opens and per-file attribute reads are
-/// serialized system-wide; where the kernel parallelizes, four workers are ~2.3x faster than one).
-pub const DEFAULT_WORKERS: usize = 4;
+/// Default worker count. On a whole Mac (Apple M5, 10 cores, Nov 2026) discovery alone took
+/// 26–28 s with four workers and 17–19 s with eight; 12 and 16 were no faster (17.0 and 18.5 s)
+/// and spent far more system CPU. Opening a folder for reading is serialized system-wide (about
+/// 18 µs each); listing and the metadata reads behind it scale, so eight workers keep the open
+/// path busy while others list. On a small, cached fixture 1–8 workers can measure the same
+/// (`docs/benchmarks/rust-port/discovery-scaling.md`): more workers help where folders are not
+/// cached, as on a whole drive.
+pub const DEFAULT_WORKERS: usize = 8;
 /// Records in the first published batch of a directory (immediately visible, fresh-leaf sized).
 pub const FIRST_BATCH: usize = LISTING_BATCH;
 /// Records per later batch of a wide directory (fewer lock round trips).
@@ -139,6 +139,10 @@ pub struct DiscoveryReport {
     pub deferred: u64,
     pub cursor: CursorStats,
     pub peak_spool_batches: usize,
+    /// Most bytes waiting for the writer in the mailbox.
+    pub peak_pending_bytes: usize,
+    /// Time workers waited for the writer at the mailbox's pending limit.
+    pub writer_wait: Duration,
     pub cancelled: bool,
     /// The mapped root was replaced during discovery (discovery was cancelled).
     pub root_replaced: bool,
@@ -388,6 +392,7 @@ impl<P: Platform> Control for Shared<P> {
 
     fn report(&self) -> DiscoveryReport {
         let c = &self.counters;
+        let mailbox = self.mailbox.stats();
         DiscoveryReport {
             directories: c.directories.load(Ordering::Relaxed),
             records: c.records.load(Ordering::Relaxed),
@@ -401,6 +406,8 @@ impl<P: Platform> Control for Shared<P> {
                 uncached: c.uncached.load(Ordering::Relaxed),
             },
             peak_spool_batches: self.spool.peak_buffered(),
+            peak_pending_bytes: mailbox.peak_pending_bytes,
+            writer_wait: mailbox.limited,
             cancelled: self.cancel.is_cancelled(),
             root_replaced: self.root_replaced.load(Ordering::Relaxed),
             elapsed: self.elapsed.lock().unwrap_or_else(|| self.started.elapsed()),

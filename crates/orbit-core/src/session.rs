@@ -56,6 +56,12 @@ const WRITER_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const WRITER_IDLE_WAIT: Duration = Duration::from_millis(100);
 /// Wait between settlement attempts once the stage has no work (Swift: 50 ms).
 const SETTLE_WAIT: Duration = Duration::from_millis(50);
+/// Default [`SessionOptions::pending_limit`]. Whole-drive discovery lists files faster than the
+/// stage saves them, so listings queue for the writer: on a 5.1-million-file Mac the backlog
+/// peaked at about 850 MiB. Lower limits cost discovery time without saving any sooner (512 MiB:
+/// found in 21 s instead of 18 s, saved after 33 s either way), so the limit sits above that and
+/// only bounds larger drives.
+pub const PENDING_LIMIT: usize = 1 << 30;
 /// The folder being listed is recorded at most this often (progress footer and opening view).
 pub const CURRENT_PATH_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -341,6 +347,9 @@ pub struct SessionOptions {
     pub busy_retry: Duration,
     /// Sampling interval of [`MappingSession::current_path`].
     pub current_path_interval: Duration,
+    /// Most bytes of discovered listings waiting for the stage writer before discovery waits
+    /// ([`Mailbox::set_pending_limit`]).
+    pub pending_limit: usize,
 }
 
 impl Default for SessionOptions {
@@ -360,6 +369,7 @@ impl Default for SessionOptions {
             before_publish: None,
             busy_retry: STAGE_BUSY_RETRY,
             current_path_interval: CURRENT_PATH_INTERVAL,
+            pending_limit: PENDING_LIMIT,
         }
     }
 }
@@ -741,6 +751,7 @@ impl<P: Platform> MappingSession<P> {
                 },
             )
         };
+        mailbox.set_pending_limit(options.pending_limit);
         stage.set_local_observer(Some(Box::new(LiveFeed { live: slot.clone(), notifier: notifier.clone() })));
         let shared = Arc::new(Shared {
             paths: paths.clone(),

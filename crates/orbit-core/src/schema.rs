@@ -55,6 +55,12 @@ CREATE TRIGGER IF NOT EXISTS node_search_generation AFTER UPDATE OF search_name 
 END;
 ";
 
+/// The size-ordered indexes of `nodes` (also in [`INVENTORY_DDL`]). A new stage drops them while
+/// it is written and builds them when it is sealed, in one sorted pass.
+pub const DEFERRED_INDEX_DDL: &str = "CREATE INDEX IF NOT EXISTS children_by_size ON nodes(parent,size DESC,name);
+CREATE INDEX IF NOT EXISTS nodes_by_size ON nodes(size DESC,id,search_name,parent);";
+pub const DEFERRED_INDEX_DROP: &str = "DROP INDEX IF EXISTS children_by_size; DROP INDEX IF EXISTS nodes_by_size;";
+
 /// Stage bookkeeping: queue, listing epochs, trim/prune work, hard-link reconciliation, the
 /// scan-start checkpoint, the seal marker and the mailbox watermark.
 pub const STAGE_DDL: &str = "

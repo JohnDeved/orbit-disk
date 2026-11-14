@@ -17,7 +17,7 @@ use crate::records::{BatchTotals, RecordBatch};
 use orbit_platform::{Cancellation, FileIdentity};
 use parking_lot::{Condvar, Mutex};
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -165,6 +165,8 @@ pub struct MailboxStats {
     pub peak_frontier_bytes: usize,
     pub reuse_deferred: usize,
     pub retry_deferred: usize,
+    /// Time [`Mailbox::enqueue`] waited for the writer at the pending limit.
+    pub limited: Duration,
 }
 
 type Page = Arc<Vec<Arc<ListingBatch>>>;
@@ -223,6 +225,8 @@ pub struct Mailbox {
     changed: Condvar,
     on_accepted: Hook,
     on_batch: BatchHook,
+    /// [`Mailbox::enqueue`] waits while this many bytes are pending (`usize::MAX`: never).
+    pending_limit: AtomicUsize,
 }
 
 impl std::fmt::Debug for Mailbox {
@@ -252,7 +256,16 @@ impl Mailbox {
             changed: Condvar::new(),
             on_accepted: Box::new(on_accepted),
             on_batch: Box::new(on_batch),
+            pending_limit: AtomicUsize::new(usize::MAX),
         })
+    }
+
+    /// Bounds the writer's backlog: once `bytes` of batches are pending (not yet acknowledged),
+    /// [`Mailbox::enqueue`] waits for the writer before accepting more. Discovery can list a
+    /// whole drive faster than the stage saves it; without a bound every listed record would
+    /// wait in memory. Only set this when a writer drains the mailbox.
+    pub fn set_pending_limit(&self, bytes: usize) {
+        self.pending_limit.store(bytes.max(1), Ordering::Relaxed);
     }
 
     pub fn generation(&self) -> uuid::Uuid {
@@ -302,11 +315,23 @@ impl Mailbox {
         Ok(())
     }
 
-    /// Queues a batch for the writer and returns its sequence number.
+    /// Queues a batch for the writer and returns its sequence number. Waits while the pending
+    /// limit ([`Mailbox::set_pending_limit`]) is reached, until the writer acknowledges work or
+    /// the mailbox is cancelled.
     pub fn enqueue(&self, mut batch: ListingBatch) -> crate::Result<u64> {
         let sequence = {
             let mut state = self.state.lock();
             self.check_live(&state)?;
+            let limit = self.pending_limit.load(Ordering::Relaxed);
+            if state.bytes >= limit {
+                let waited = Instant::now();
+                while state.bytes >= limit {
+                    // Timed, so a cancelled `Cancellation` (which does not notify) is seen too.
+                    self.changed.wait_for(&mut state, NEXT_WAIT);
+                    self.check_live(&state)?;
+                }
+                state.stats.limited += waited.elapsed();
+            }
             state.sequence += 1;
             batch.sequence = state.sequence;
             state.bytes += batch.byte_count;
@@ -672,5 +697,35 @@ mod tests {
         assert!(m.next(1024).is_empty());
         assert!(m.enqueue(batch("/r/b", 1, 0, true)).is_err());
         assert!(m.is_drained());
+    }
+
+    #[test]
+    fn enqueue_waits_at_the_pending_limit_until_acknowledged_or_cancelled() {
+        let m = mailbox();
+        m.set_pending_limit(1);
+        m.enqueue(batch("/r/a", 3, 0, true)).unwrap();
+        let blocked = std::thread::spawn({
+            let m = m.clone();
+            move || m.enqueue(batch("/r/b", 3, 0, true))
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!blocked.is_finished(), "the backlog is at the limit");
+        assert_eq!(m.stats().sequence, 1);
+        m.acknowledge(1);
+        assert_eq!(blocked.join().unwrap().unwrap(), 2);
+        assert!(m.stats().limited > Duration::ZERO);
+
+        // Cancelling the discovery token releases a waiting worker without a notification.
+        let cancellation = Cancellation::new();
+        let m = Mailbox::new(Arc::from(&b"/r"[..]), id(1), cancellation.clone(), || {}, |_| {});
+        m.set_pending_limit(1);
+        m.enqueue(batch("/r/a", 3, 0, true)).unwrap();
+        let blocked = std::thread::spawn({
+            let m = m.clone();
+            move || m.enqueue(batch("/r/b", 3, 0, true))
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        cancellation.cancel();
+        assert!(blocked.join().unwrap().is_err());
     }
 }

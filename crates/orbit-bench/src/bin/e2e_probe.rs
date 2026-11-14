@@ -28,6 +28,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// One frame at 120 Hz.
+const FRAME: Duration = Duration::from_micros(8_333);
+
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
@@ -157,6 +160,10 @@ fn run(dir: &Path, workers: Option<usize>) {
         prepare_search: false,
         home: std::env::var_os("HOME").map(std::path::PathBuf::from),
         workers: workers.unwrap_or(orbit_core::discovery::DEFAULT_WORKERS),
+        pending_limit: std::env::var("ORBIT_PENDING_LIMIT_MIB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(orbit_core::session::PENDING_LIMIT, |mib| mib << 20),
         ..SessionOptions::default()
     };
     let started = Instant::now();
@@ -183,9 +190,15 @@ fn run(dir: &Path, workers: Option<usize>) {
                 }
             }
         }
-        // A UI repaints at most once per frame.
+        // A UI repaints at most once per frame (120 Hz): wait for a change, then for the next
+        // frame boundary. Changes arrive continuously while mapping, so without the frame wait
+        // the probe would read views thousands of times a second, far more than the app does.
+        let frame = Instant::now();
         seen = session.changes().wait(seen, Duration::from_millis(16));
         session.changes().take();
+        if let Some(rest) = FRAME.checked_sub(frame.elapsed()) {
+            std::thread::sleep(rest);
+        }
     }
     let snapshot = match session.wait(Duration::from_secs(3600)) {
         SessionOutcome::Published(snapshot) => snapshot,
@@ -206,6 +219,8 @@ fn run(dir: &Path, workers: Option<usize>) {
         "discovery_ms": report.elapsed.as_secs_f64() * 1e3,
         "discovery_cancelled": report.cancelled,
         "cache_hits": report.cache_hits,
+        "peak_pending_mib": report.peak_pending_bytes as f64 / (1024.0 * 1024.0),
+        "writer_wait_ms": report.writer_wait.as_secs_f64() * 1e3,
         "total_to_publish_ms": total_ms,
         "peak_rss_mib": rss as f64 / (1024.0 * 1024.0),
         "user_cpu_s": user,
