@@ -2,7 +2,9 @@
 
 A native disk-space explorer for macOS 14 and later, on Apple silicon and Intel Macs, written in Rust with the GPUI framework. Inspired by DaisyDisk's visual exploration and the scan-once, search-an-index architecture of instant file-search tools. This is an independent implementation; it bundles Sparkle for app updates.
 
-Download the [universal disk image](https://github.com/JohnDeved/orbit-disk/releases/latest/download/Orbit-Disk.dmg), open it, and drag **Orbit Disk.app** to Applications before opening it. The current distribution is ad-hoc signed, without an Apple Developer ID signature or notarization. macOS may require initial approval in **System Settings → Privacy & Security**. Version 0.8.3 has no updater: install 0.9.0 or later manually once to enable future in-app updates.
+Install with `curl -fsSL https://raw.githubusercontent.com/JohnDeved/orbit-disk/main/install.sh | sh`. The [script](../install.sh) downloads the latest release's ZIP, checks it against the release's `SHA256SUMS` and the app's code signature, and installs it in `/Applications` (or `~/Applications` when `/Applications` isn't writable). A download made with curl isn't quarantined, so macOS doesn't ask to approve the first launch. `ORBIT_DISK_VERSION=0.11.4` installs a specific release, `ORBIT_DISK_DIR=PATH` another folder, and `ORBIT_DISK_NO_OPEN=1` skips opening the app. It stops if Orbit Disk is running.
+
+Or download the [universal disk image](https://github.com/JohnDeved/orbit-disk/releases/latest/download/Orbit-Disk.dmg), open it, and drag **Orbit Disk.app** to Applications before opening it. The current distribution is ad-hoc signed, without an Apple Developer ID signature or notarization. macOS may require initial approval in **System Settings → Privacy & Security**. Version 0.8.3 has no updater: install 0.9.0 or later manually once to enable future in-app updates.
 
 Choose a folder or a device, then click a map folder to open it. Click the map center to go up. In the file list, click a row to inspect it; click its arrow or double-click the row to open a folder. The file list also exposes items too small to draw individually.
 

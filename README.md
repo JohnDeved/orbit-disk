@@ -94,9 +94,16 @@ Orbit Disk is written in Rust and draws on the GPU with [GPUI](https://gpui.rs),
 
 ## Get started
 
-1. [Download Orbit Disk](https://github.com/JohnDeved/orbit-disk/releases/latest/download/Orbit-Disk.dmg), open the disk image, and drag **Orbit Disk.app** to Applications. To verify it, download `SHA256SUMS` from the [release page](https://github.com/JohnDeved/orbit-disk/releases/latest) into the same folder and run `shasum -a 256 -c SHA256SUMS --ignore-missing`.
-2. Open it. The app is ad-hoc signed and not yet notarized by Apple, so macOS may block the first launch. If it does, go to **System Settings → Privacy & Security** and click **Open Anyway**.
-3. Choose a location to map. Full Disk Access is optional; without it, the app lists what it couldn’t read.
+1. Install it with one command in Terminal:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/JohnDeved/orbit-disk/main/install.sh | sh
+   ```
+
+   The [script](install.sh) downloads the latest release, checks it against the release’s `SHA256SUMS` and its code signature, puts **Orbit Disk.app** in Applications and opens it. Because the download doesn’t come from a browser, macOS doesn’t ask you to approve the first launch.
+
+   Or [download the disk image](https://github.com/JohnDeved/orbit-disk/releases/latest/download/Orbit-Disk.dmg), open it, and drag **Orbit Disk.app** to Applications. The app is ad-hoc signed and not yet notarized by Apple, so macOS may block its first launch. If it does, go to **System Settings → Privacy & Security** and click **Open Anyway**. To verify the download, put `SHA256SUMS` from the [release page](https://github.com/JohnDeved/orbit-disk/releases/latest) in the same folder and run `shasum -a 256 -c SHA256SUMS --ignore-missing`.
+2. Choose a location to map. Full Disk Access is optional; without it, the app lists what it couldn’t read.
 
 Updates arrive in the app. [Installation and updates](docs/GUIDE.md#app-updates)
 
