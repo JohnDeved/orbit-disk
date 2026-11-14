@@ -383,8 +383,9 @@ fn generate(options: &FixtureOptions) -> Tree {
     tree
 }
 
-/// The sample Home of the README screenshots: the Swift app's marketing tree
-/// (`scripts/marketing/Capture.swift` at v0.9.15) under [`HOME`].
+/// The sample Home of the README screenshots under [`HOME`]: the large items a full Mac tends to
+/// have (media, archives, Xcode and Docker data, device backups), plus folders of many small files
+/// so file counts look like a real disk.
 pub mod sample {
     const MB: u64 = 1_000_000;
     const GB: u64 = 1_000 * MB;
@@ -402,14 +403,16 @@ pub mod sample {
         ("Projects/Studio/Exports.zip", 12 * GB),
         ("Projects/Studio/Assets.psd", 6 * GB),
         ("Projects/Archive/2024.zip", 15 * GB),
-        ("Projects/Archive/2023.zip", 9 * GB),
+        ("Projects/Archive/2023.zip", 13 * GB),
         ("Projects/Project backup.zip", 8 * GB),
-        ("Photos/Photo Library.photoslibrary", 58 * GB),
+        ("Projects/web-app/.git/objects/pack/pack-main.pack", 2_400 * MB),
         ("Photos/RAW archive.zip", 12 * GB),
+        ("Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw", 27 * GB),
+        ("Library/Developer/CoreSimulator/Devices/iPhone 16 Pro/data.img", 6 * GB),
+        ("Library/Developer/CoreSimulator/Devices/iPad Air/data.img", 4 * GB),
         ("Downloads/Installer.dmg", 12 * GB),
         ("Downloads/Camera originals.zip", 10 * GB),
         ("Downloads/Archive.zip", 8 * GB),
-        ("Music/Library.musiclibrary", 24 * GB),
         ("Music/Live recordings.wav", 10 * GB),
         ("Documents/Work archive.zip", 16 * GB),
         ("Documents/Presentation.pdf", 4 * GB),
@@ -417,6 +420,22 @@ pub mod sample {
         ("Movies/Family.mov", 8 * GB),
         ("Desktop archive.zip", 9 * GB),
         ("Notes.pdf", 100 * MB),
+    ];
+
+    /// Folders of many similar files: (folder relative to Home, name stem, extension, count,
+    /// typical size in bytes). Sizes vary from 40 % to 160 % of the typical size.
+    pub const BULK: &[(&str, &str, &str, u32, u64)] = &[
+        ("Projects/Studio/Renders", "frame_", "exr", 1_200, 6 * MB),
+        ("Projects/web-app/node_modules", "module-", "js", 21_000, 60_000),
+        ("Photos/Photo Library.photoslibrary/originals", "IMG_", "heic", 9_600, 6 * MB),
+        ("Library/Developer/Xcode/DerivedData", "object-", "o", 3_400, 3 * MB),
+        ("Library/Application Support/MobileSync/Backup", "backup-", "mbdb", 2_600, 3_500_000),
+        ("Library/Caches", "cache-", "db", 4_200, 900_000),
+        ("Library/Caches/com.apple.Safari/fsCachedData", "entry-", "data", 30_000, 600),
+        ("Music/Media", "Track ", "m4a", 3_400, 7 * MB),
+        ("Movies/Clips", "Clip ", "mov", 80, 60 * MB),
+        ("Downloads", "Screenshot ", "png", 260, 6 * MB),
+        ("Documents/Notes", "note-", "md", 1_800, 800_000),
     ];
 
     /// The volume: name, capacity and available bytes.
@@ -445,22 +464,32 @@ fn generate_sample() -> Tree {
     let users = tree.add(root, b"Users", true, 0);
     let home = tree.add(users, b"demo", true, 0);
     for &(relative, size) in sample::FILES {
-        let mut parent = home;
-        let mut components = relative.split('/').peekable();
-        while let Some(name) = components.next() {
-            if components.peek().is_none() {
-                tree.add(parent, name.as_bytes(), false, size);
-                break;
-            }
-            let path = [&tree.nodes[parent as usize].path[..], b"/", name.as_bytes()].concat();
-            parent = match tree.find(&path) {
-                Some(id) => id,
-                None => tree.add(parent, name.as_bytes(), true, 0),
-            };
+        let (folder, name) = relative.rsplit_once('/').unwrap_or(("", relative));
+        let parent = sample_folder(&mut tree, home, folder);
+        tree.add(parent, name.as_bytes(), false, size);
+    }
+    for &(folder, stem, extension, count, typical) in sample::BULK {
+        let parent = sample_folder(&mut tree, home, folder);
+        for i in 0..u64::from(count) {
+            let size = typical * (40 + (i * 37) % 121) / 100;
+            tree.add(parent, format!("{stem}{:05}.{extension}", i + 1).as_bytes(), false, size);
         }
     }
     tree.finish();
     tree
+}
+
+/// The folder at `relative` under `home`, created with its missing ancestors.
+fn sample_folder(tree: &mut Tree, home: u32, relative: &str) -> u32 {
+    let mut parent = home;
+    for name in relative.split('/').filter(|name| !name.is_empty()) {
+        let path = [&tree.nodes[parent as usize].path[..], b"/", name.as_bytes()].concat();
+        parent = match tree.find(&path) {
+            Some(id) => id,
+            None => tree.add(parent, name.as_bytes(), true, 0),
+        };
+    }
+    parent
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -25,10 +25,17 @@ use crate::theme;
 pub enum MarketingState {
     /// The Home map with "Projects" selected (map and list), nothing collected.
     Overview,
+    /// The Home map with "Downloads" selected, nothing collected: the start of a collect drag.
+    Downloads,
     /// "Downloads" selected and collected: marked on map and list, shown in the tray.
     Collection,
+    /// "Downloads" collected, then "Projects" selected: the README hero, with the largest folder
+    /// selected and the collection in use.
+    Hero,
     /// "Projects" opened with its largest folder "Studio" selected.
     Projects,
+    /// "Projects" opened with nothing selected, so the map center describes Projects.
+    ProjectsOpen,
     /// The removal review of the collected "Downloads" (Move to Trash / Delete Permanently).
     Review,
     /// The review with its Move to Trash confirmation open.
@@ -38,14 +45,26 @@ pub enum MarketingState {
 }
 
 impl MarketingState {
-    pub const ALL: [Self; 6] =
-        [Self::Overview, Self::Collection, Self::Projects, Self::Review, Self::TrashConfirm, Self::PermanentDelete];
+    pub const ALL: [Self; 9] = [
+        Self::Overview,
+        Self::Downloads,
+        Self::Collection,
+        Self::Hero,
+        Self::Projects,
+        Self::ProjectsOpen,
+        Self::Review,
+        Self::TrashConfirm,
+        Self::PermanentDelete,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Overview => "overview",
+            Self::Downloads => "downloads",
             Self::Collection => "collection",
+            Self::Hero => "hero",
             Self::Projects => "projects",
+            Self::ProjectsOpen => "projects-open",
             Self::Review => "review",
             Self::TrashConfirm => "trash-confirm",
             Self::PermanentDelete => "permanent-delete",
@@ -59,8 +78,12 @@ impl MarketingState {
     fn steps(self) -> &'static [Step] {
         match self {
             Self::Overview => &[Step::Select(sample::PROJECTS)],
+            Self::Downloads => &[Step::Select(sample::DOWNLOADS)],
             Self::Collection => &[Step::Select(sample::DOWNLOADS), Step::Collect(sample::DOWNLOADS)],
+            // Collecting is by path, so it needs no selection (every step must still hold at the end).
+            Self::Hero => &[Step::Collect(sample::DOWNLOADS), Step::Select(sample::PROJECTS)],
             Self::Projects => &[Step::Open(sample::PROJECTS), Step::Select(sample::STUDIO)],
+            Self::ProjectsOpen => &[Step::Open(sample::PROJECTS)],
             Self::Review => &[Step::Select(sample::DOWNLOADS), Step::Collect(sample::DOWNLOADS), Step::Review],
             Self::TrashConfirm => &[
                 Step::Select(sample::DOWNLOADS),

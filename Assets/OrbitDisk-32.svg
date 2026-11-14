@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-labelledby="title">
+  <title id="title">Orbit Disk</title>
+  <defs>
+    <linearGradient id="tilefill" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse"><stop stop-color="#FFFFFF"/><stop offset="1" stop-color="#EEE9E1"/></linearGradient>
+    <linearGradient id="rim" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse"><stop stop-color="#FFFFFF" stop-opacity=".9"/><stop offset="1" stop-color="#000000" stop-opacity=".06"/></linearGradient>
+    <linearGradient id="ink" x1="0" y1="-328" x2="0" y2="302" gradientUnits="userSpaceOnUse"><stop stop-color="#3C4152"/><stop offset="1" stop-color="#1F222C"/></linearGradient>
+    <linearGradient id="stone" x1="0" y1="-328" x2="0" y2="302" gradientUnits="userSpaceOnUse"><stop stop-color="#5A5F6E"/><stop offset="1" stop-color="#3E4250"/></linearGradient>
+    <linearGradient id="coral" x1="0" y1="-428" x2="0" y2="-68" gradientUnits="userSpaceOnUse"><stop stop-color="#FFA780"/><stop offset="1" stop-color="#F36A40"/></linearGradient>
+    <clipPath id="tileclip"><path d="M372,100 H652 C860.08,100 924,163.92 924,372 V652 C924,860.08 860.08,924 652,924 H372 C163.92,924 100,860.08 100,652 V372 C100,163.92 163.92,100 372,100 Z"/></clipPath>
+    <filter id="drop" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="14"/></filter>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="8"/></filter>
+  </defs>
+  <path d="M372,100 H652 C860.08,100 924,163.92 924,372 V652 C924,860.08 860.08,924 652,924 H372 C163.92,924 100,860.08 100,652 V372 C100,163.92 163.92,100 372,100 Z" transform="translate(0 12)" fill="#000000" opacity=".3" filter="url(#drop)"/>
+  <path d="M372,100 H652 C860.08,100 924,163.92 924,372 V652 C924,860.08 860.08,924 652,924 H372 C163.92,924 100,860.08 100,652 V372 C100,163.92 163.92,100 372,100 Z" fill="url(#tilefill)"/>
+  <path d="M372,100 H652 C860.08,100 924,163.92 924,372 V652 C924,860.08 860.08,924 652,924 H372 C163.92,924 100,860.08 100,652 V372 C100,163.92 163.92,100 372,100 Z" fill="none" stroke="url(#rim)" stroke-width="4" clip-path="url(#tileclip)"/>
+  <g id="mark" transform="translate(512.00 545.41) scale(1.000)">
+    <path id="ring" d="M-224.50,-84.85 A382.00,178.00 -20 1 0 117.44,-209.30 A240.00,240.00 0 0 1 198.59,-134.77 A298.00,94.00 -20 1 1 -238.76,24.41 A240.00,240.00 0 0 1 -224.50,-84.85 Z" fill="url(#stone)"/>
+    <path id="planet" d="M-217.79,100.83 A240.00,240.00 0 0 1 -212.87,-110.85 A10.00,10.00 0 0 1 -199.00,-114.89 L-95.26,-55.00 A110.00,110.00 0 0 1 -0.00,-110.00 L-0.00,-229.78 A10.00,10.00 0 0 1 10.43,-239.77 A240.00,240.00 0 0 1 231.65,-62.75 A258.00,54.00 -20 0 1 -217.79,100.83 Z M181.79,156.69 A240.00,240.00 0 0 1 -38.54,236.89 A422.00,218.00 -20 0 0 181.79,156.69 Z" fill="url(#ink)"/>
+    <path d="M-252.43,-215.53 A240.00,240.00 0 0 1 -60.43,-326.38 A10.00,10.00 0 0 1 -50.00,-316.39 L-50.00,-206.19 A10.00,10.00 0 0 1 -59.17,-196.22 A110.00,110.00 0 0 0 -140.35,-149.35 A10.00,10.00 0 0 1 -153.56,-146.39 L-249.00,-201.49 A10.00,10.00 0 0 1 -252.43,-215.53 Z" transform="translate(0 12)" fill="#B9411F" opacity=".18" filter="url(#soft)"/>
+    <path id="slice" d="M-252.43,-215.53 A240.00,240.00 0 0 1 -60.43,-326.38 A10.00,10.00 0 0 1 -50.00,-316.39 L-50.00,-206.19 A10.00,10.00 0 0 1 -59.17,-196.22 A110.00,110.00 0 0 0 -140.35,-149.35 A10.00,10.00 0 0 1 -153.56,-146.39 L-249.00,-201.49 A10.00,10.00 0 0 1 -252.43,-215.53 Z" fill="url(#coral)"/>
+  </g>
+</svg>

@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="328" viewBox="0 0 760 328" role="img" aria-labelledby="t d">
+  <title id="t">Orbit Disk speed</title>
+  <desc id="d">95,000 files/s found on a whole Mac (Apple M5 · 5.1 million files in 55 s). 60–82 s to a saved map (all 5.1 M indexed); 10 ms to first view (fills in as it scans); 120 Hz smooth UI (p99 interval 6.2 ms). Files are what a scan without Full Disk Access could read; 10 ms is the scan engine’s first view. The p99 frame interval is from the 0.10.0 release measurements; a 120 Hz frame allows 8.3 ms.</desc>
+  <defs>
+    <radialGradient id="coral" cx=".12" cy=".1" r=".9" gradientTransform="translate(.12 .1) scale(.35 1) translate(-.12 -.1)">
+      <stop offset="0" stop-color="#FF8F66" stop-opacity=".34"/><stop offset="1" stop-color="#FF8F66" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="indigo" cx=".92" cy=".95" r=".9" gradientTransform="translate(.92 .95) scale(.35 1) translate(-.92 -.95)">
+      <stop offset="0" stop-color="#6E6BFF" stop-opacity=".30"/><stop offset="1" stop-color="#6E6BFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+    <rect x="0.5" y="0.5" width="759.0" height="159" rx="16" fill="#121318"/>
+    <rect x="0.5" y="0.5" width="759.0" height="159" rx="16" fill="url(#coral)"/>
+    <rect x="0.5" y="0.5" width="759.0" height="159" rx="16" fill="url(#indigo)"/>
+    <rect x="0.5" y="0.5" width="759.0" height="159" rx="16" fill="none" stroke="#FFFFFF" stroke-opacity=".10"/>
+    <rect x="24.0" y="22" width="28" height="4" rx="2" fill="#FF8F66"/>
+    <text x="24.0" y="84" fill="#F0F6FC" font-size="56" font-weight="600" letter-spacing="-.8">95,000 files/s</text>
+    <text x="24.0" y="116" fill="#D1D7E0" font-size="23" font-weight="600">found on a whole Mac</text>
+    <text x="24.0" y="142" fill="#9198A1" font-size="21">Apple M5 · 5.1 million files in 55 s</text>
+    <rect x="0.5" y="172.5" width="244.3" height="155" rx="16" fill="#151B23" fill-opacity="1" stroke="#3D444D" stroke-opacity="1"/>
+    <rect x="24.0" y="194" width="28" height="4" rx="2" fill="#FF8F66"/>
+    <text x="24.0" y="244" fill="#F0F6FC" font-size="36" font-weight="600" letter-spacing="-.8">60–82 s</text>
+    <text x="24.0" y="278" fill="#D1D7E0" font-size="23" font-weight="600">to a saved map</text>
+    <text x="24.0" y="306" fill="#9198A1" font-size="20">all 5.1 M indexed</text>
+    <rect x="257.8" y="172.5" width="244.3" height="155" rx="16" fill="#151B23" fill-opacity="1" stroke="#3D444D" stroke-opacity="1"/>
+    <rect x="281.3" y="194" width="28" height="4" rx="2" fill="#FF8F66"/>
+    <text x="281.3" y="244" fill="#F0F6FC" font-size="36" font-weight="600" letter-spacing="-.8">10 ms</text>
+    <text x="281.3" y="278" fill="#D1D7E0" font-size="23" font-weight="600">to first view</text>
+    <text x="281.3" y="306" fill="#9198A1" font-size="20">fills in as it scans</text>
+    <rect x="515.2" y="172.5" width="244.3" height="155" rx="16" fill="#151B23" fill-opacity="1" stroke="#3D444D" stroke-opacity="1"/>
+    <rect x="538.7" y="194" width="28" height="4" rx="2" fill="#FF8F66"/>
+    <text x="538.7" y="244" fill="#F0F6FC" font-size="36" font-weight="600" letter-spacing="-.8">120 Hz</text>
+    <text x="538.7" y="278" fill="#D1D7E0" font-size="23" font-weight="600">smooth UI</text>
+    <text x="538.7" y="306" fill="#9198A1" font-size="20">p99 interval 6.2 ms</text>
+  </g>
+</svg>

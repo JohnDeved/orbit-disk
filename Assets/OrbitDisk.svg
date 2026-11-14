@@ -1,79 +1,22 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024"
-     viewBox="0 0 1024 1024" role="img" aria-labelledby="title description">
-  <title id="title">Orbit Disk: Night</title>
-  <desc id="description">A satin charcoal tile with a softly bevelled coral disk and an ivory orbital ring.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" role="img" aria-labelledby="title">
+  <title id="title">Orbit Disk</title>
   <defs>
-    <radialGradient id="tile" cx="256" cy="128" r="976" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#3C4655"/>
-      <stop offset=".52" stop-color="#272F3B"/>
-      <stop offset="1" stop-color="#171D26"/>
-    </radialGradient>
-    <linearGradient id="tile-edge" x1="192" y1="96" x2="832" y2="928" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#BBC9D9" stop-opacity=".42"/>
-      <stop offset=".4" stop-color="#68788D" stop-opacity=".12"/>
-      <stop offset="1" stop-color="#090D14" stop-opacity=".72"/>
-    </linearGradient>
-    <radialGradient id="planet" cx="-88" cy="-120" r="416" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFBE91"/>
-      <stop offset=".42" stop-color="#FF996F"/>
-      <stop offset=".78" stop-color="#F47B54"/>
-      <stop offset="1" stop-color="#DF593A"/>
-    </radialGradient>
-    <linearGradient id="planet-edge" x1="-160" y1="-192" x2="160" y2="192" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFE5BD" stop-opacity=".76"/>
-      <stop offset=".45" stop-color="#FFD5A6" stop-opacity=".12"/>
-      <stop offset="1" stop-color="#B8412D" stop-opacity=".62"/>
-    </linearGradient>
-    <linearGradient id="ring" x1="-104" y1="-309" x2="104" y2="309" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFFCEE"/>
-      <stop offset=".44" stop-color="#FFF5DE"/>
-      <stop offset="1" stop-color="#E8D3B1"/>
-    </linearGradient>
-    <linearGradient id="ring-edge" x1="-104" y1="-309" x2="104" y2="309" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFFFF4"/>
-      <stop offset=".4" stop-color="#F9EACA"/>
-      <stop offset="1" stop-color="#B99B73"/>
-    </linearGradient>
-    <pattern id="satin" width="64" height="16" patternUnits="userSpaceOnUse">
-      <path d="M0 2H64M0 9H64" stroke="#DDE8F5" stroke-width=".5" opacity=".022"/>
-      <path d="M0 5H64M0 14H64" stroke="#080D15" stroke-width=".5" opacity=".035"/>
-    </pattern>
-    <ellipse id="orbit-path" rx="360" ry="128" fill="none"/>
-    <g id="orbit">
-      <use href="#orbit-path" stroke="url(#ring-edge)" stroke-width="48"/>
-      <use href="#orbit-path" stroke="url(#ring)" stroke-width="44"/>
-    </g>
-    <clipPath id="front-half" clipPathUnits="userSpaceOnUse">
-      <rect x="-512" width="1024" height="512"/>
-    </clipPath>
-    <clipPath id="planet-clip">
-      <circle r="224"/>
-    </clipPath>
-    <clipPath id="ring-overlap">
-      <circle r="228"/>
-    </clipPath>
-    <filter id="contact-shadow" x="-10%" y="-20%" width="120%" height="140%" color-interpolation-filters="sRGB">
-      <feGaussianBlur stdDeviation="3"/>
-    </filter>
+    <linearGradient id="tilefill" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse"><stop stop-color="#FFFFFF"/><stop offset="1" stop-color="#EEE9E1"/></linearGradient>
+    <linearGradient id="rim" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse"><stop stop-color="#FFFFFF" stop-opacity=".9"/><stop offset="1" stop-color="#000000" stop-opacity=".06"/></linearGradient>
+    <linearGradient id="ink" x1="0" y1="-328" x2="0" y2="302" gradientUnits="userSpaceOnUse"><stop stop-color="#3C4152"/><stop offset="1" stop-color="#1F222C"/></linearGradient>
+    <linearGradient id="stone" x1="0" y1="-328" x2="0" y2="302" gradientUnits="userSpaceOnUse"><stop stop-color="#5A5F6E"/><stop offset="1" stop-color="#3E4250"/></linearGradient>
+    <linearGradient id="coral" x1="0" y1="-428" x2="0" y2="-68" gradientUnits="userSpaceOnUse"><stop stop-color="#FFA780"/><stop offset="1" stop-color="#F36A40"/></linearGradient>
+    <clipPath id="tileclip"><path d="M372,100 H652 C860.08,100 924,163.92 924,372 V652 C924,860.08 860.08,924 652,924 H372 C163.92,924 100,860.08 100,652 V372 C100,163.92 163.92,100 372,100 Z"/></clipPath>
+    <filter id="drop" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="14"/></filter>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="8"/></filter>
   </defs>
-  <rect x="96" y="96" width="832" height="832" rx="192" fill="url(#tile)"/>
-  <rect x="96" y="96" width="832" height="832" rx="192" fill="url(#satin)"/>
-  <rect x="97" y="97" width="830" height="830" rx="191" fill="none" stroke="url(#tile-edge)" stroke-width="2"/>
-  <g transform="translate(512 512)">
-    <g transform="rotate(-24)">
-      <use href="#orbit"/>
-    </g>
-    <circle r="224" fill="url(#planet)"/>
-    <circle r="222" fill="none" stroke="url(#planet-edge)" stroke-width="4"/>
-    <g clip-path="url(#planet-clip)">
-      <g transform="translate(0 8) rotate(-24)" clip-path="url(#front-half)">
-        <use href="#orbit-path" stroke="#612919" stroke-width="48" opacity=".26" filter="url(#contact-shadow)"/>
-      </g>
-    </g>
-    <g clip-path="url(#ring-overlap)">
-      <g transform="rotate(-24)">
-        <use href="#orbit" clip-path="url(#front-half)"/>
-      </g>
-    </g>
+  <path d="M372,100 H652 C860.08,100 924,163.92 924,372 V652 C924,860.08 860.08,924 652,924 H372 C163.92,924 100,860.08 100,652 V372 C100,163.92 163.92,100 372,100 Z" transform="translate(0 12)" fill="#000000" opacity=".3" filter="url(#drop)"/>
+  <path d="M372,100 H652 C860.08,100 924,163.92 924,372 V652 C924,860.08 860.08,924 652,924 H372 C163.92,924 100,860.08 100,652 V372 C100,163.92 163.92,100 372,100 Z" fill="url(#tilefill)"/>
+  <path d="M372,100 H652 C860.08,100 924,163.92 924,372 V652 C924,860.08 860.08,924 652,924 H372 C163.92,924 100,860.08 100,652 V372 C100,163.92 163.92,100 372,100 Z" fill="none" stroke="url(#rim)" stroke-width="4" clip-path="url(#tileclip)"/>
+  <g id="mark" transform="translate(512.00 537.55) scale(0.930)">
+    <path id="ring" d="M-223.40,-62.58 A378.00,156.00 -20 1 0 130.91,-191.54 A232.00,232.00 0 0 1 182.00,-143.88 A322.00,100.00 -20 1 1 -231.90,6.77 A232.00,232.00 0 0 1 -223.40,-62.58 Z" fill="url(#stone)"/>
+    <path id="planet" d="M-197.16,122.27 A232.00,232.00 0 0 1 -205.94,-106.83 A10.00,10.00 0 0 1 -192.06,-110.89 L-95.26,-55.00 A110.00,110.00 0 0 1 -0.00,-110.00 L-0.00,-221.77 A10.00,10.00 0 0 1 10.45,-231.76 A232.00,232.00 0 0 1 229.63,-33.07 A296.00,74.00 -20 0 1 -197.16,122.27 Z M208.52,101.71 A232.00,232.00 0 0 1 -94.35,211.95 A404.00,182.00 -20 0 0 208.52,101.71 Z" fill="url(#ink)"/>
+    <path d="M-239.49,-201.14 A232.00,232.00 0 0 1 -54.45,-307.97 A10.00,10.00 0 0 1 -44.00,-297.98 L-44.00,-195.79 A10.00,10.00 0 0 1 -53.17,-185.83 A110.00,110.00 0 0 0 -134.35,-138.96 A10.00,10.00 0 0 1 -147.56,-136.00 L-236.06,-187.10 A10.00,10.00 0 0 1 -239.49,-201.14 Z" transform="translate(0 12)" fill="#B9411F" opacity=".18" filter="url(#soft)"/>
+    <path id="slice" d="M-239.49,-201.14 A232.00,232.00 0 0 1 -54.45,-307.97 A10.00,10.00 0 0 1 -44.00,-297.98 L-44.00,-195.79 A10.00,10.00 0 0 1 -53.17,-185.83 A110.00,110.00 0 0 0 -134.35,-138.96 A10.00,10.00 0 0 1 -147.56,-136.00 L-236.06,-187.10 A10.00,10.00 0 0 1 -239.49,-201.14 Z" fill="url(#coral)"/>
   </g>
 </svg>

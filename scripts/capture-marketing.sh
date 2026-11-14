@@ -1,14 +1,14 @@
 #!/bin/zsh
-# Renders the README screenshots and flow art from the Rust app.
+# Renders the README hero and feature cards from the Rust app.
 #
 #   scripts/capture-marketing.sh [--app PATH.app] [--raw DIR] [--default-state]
 #
 # Launches `OrbitDisk --fixture` (deterministic generated tree, isolated HOME so no settings or
 # saved maps leak in) once per state, finds its window through CGWindowList (JavaScript for
 # Automation, scripts/marketing/window-id.js; no Swift, no Python modules), captures it with
-# `screencapture -l`, then composes docs/screenshots and docs/art with the standalone
-# scripts/marketing/{Frame,DrawFlow}.swift compositors (AppKit image drawing only; they do not
-# compile the app).
+# `screencapture -l`, then composes docs/screenshots/orbit-hero-*.png and docs/art/card-*.png with
+# the standalone scripts/marketing/{Hero,Cards}.swift compositors (AppKit image drawing only; they
+# do not compile the app). docs/art/perf-*.svg and download-mac.svg are hand-written, not rendered.
 #
 # The app does not yet expose deterministic marketing states. Until it does, this script stops
 # with exit status 3 (the screenshots workflow then skips the commit). `--default-state`
@@ -22,6 +22,11 @@
 #       collection  "Downloads" selected and collected (tray visible)
 #       projects    inside "Projects", its first child selected
 #       review      removal review sheet for the collected "Downloads"
+#       permanent-delete  the review with its permanent-deletion confirmation open
+#       hero        "Downloads" collected, then "Projects" selected (the README hero)
+#       downloads   "Downloads" selected, nothing collected (start of the collect drag)
+#       projects-open  inside "Projects" with nothing selected (the map center describes it)
+#     (the app also has projects and trash-confirm; the README does not use them)
 #     Mapping is already finished (no progress UI), animations are off (reduce motion), the
 #     window is key, and after the first frame showing the state is presented the app prints
 #     `marketing-state: ready` on stderr and stays open until terminated.
@@ -111,15 +116,18 @@ fi
 common=(--appearance dark --window-size 1280x810)
 capture orbit-overview.png "${common[@]}" --marketing-state overview
 capture orbit-collection.png "${common[@]}" --marketing-state collection
-capture orbit-projects.png "${common[@]}" --marketing-state projects
+capture orbit-hero-state.png "${common[@]}" --marketing-state hero
+capture orbit-downloads.png "${common[@]}" --marketing-state downloads
+capture orbit-projects-open.png "${common[@]}" --marketing-state projects-open
 capture orbit-review.png "${common[@]}" --marketing-state review
+capture orbit-permanent-delete.png "${common[@]}" --marketing-state permanent-delete
 
 mkdir -p "$root/docs/screenshots" "$root/docs/art"
 target="$(uname -m)-apple-macosx14.0"
 swiftc -swift-version 5 -target "$target" -module-cache-path "$tmp/module-cache" \
-  scripts/marketing/Frame.swift -o "$tmp/MarketingFrame"
-"$tmp/MarketingFrame" "$raw" "$root/docs/screenshots"
+  scripts/marketing/Hero.swift -o "$tmp/Hero"
+"$tmp/Hero" "$raw" "$root/docs/screenshots"
 swiftc -swift-version 5 -target "$target" -module-cache-path "$tmp/module-cache" \
-  scripts/marketing/DrawFlow.swift -o "$tmp/DrawFlow"
-"$tmp/DrawFlow" "$raw" "$root/docs/art"
-print "Rendered README screenshots and flow images."
+  scripts/marketing/Cards.swift -o "$tmp/Cards"
+"$tmp/Cards" "$raw" "$root/docs/art"
+print "Rendered the README hero and feature cards."
